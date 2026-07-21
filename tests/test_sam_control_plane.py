@@ -176,11 +176,16 @@ class SamControlPlaneTests(unittest.TestCase):
             {"Ref": "WebhookReceiptTable"},
         )
         self.assertEqual(
+            worker["Environment"]["Variables"]["MIGRATION_WORK_QUEUE_URL"],
+            {"Ref": "SubscriptionMigrationWorkQueue"},
+        )
+        self.assertEqual(
             relay["Environment"]["Variables"]["INTEGRATION_EVENTS_TOPIC_ARN"],
             {"Ref": "IntegrationEventsTopic"},
         )
         ingress_role = self._role("StripeWebhookRole")
         worker_role = self._role("WebhookIngressStreamRole")
+        self.assertIn("SubscriptionMigrationWorkQueue", worker_role)
         relay_role = self._role("IntegrationOutgoingStreamRole")
         self.assertIn(
             "/zoolanding/${EnvironmentName}/integrations/stripe/connect-webhook",
@@ -188,11 +193,171 @@ class SamControlPlaneTests(unittest.TestCase):
         )
         self.assertNotIn("sns:Publish", ingress_role)
         self.assertIn("dynamodb:TransactWriteItems", worker_role)
+        self.assertIn("dynamodb:PutItem", worker_role)
+        self.assertIn("dynamodb:UpdateItem", worker_role)
+        self.assertIn("IntegrationRegistryTable", worker_role)
+        self.assertIn("WebhookReceiptTable", worker_role)
         self.assertIn("secretsmanager:GetSecretValue", worker_role)
         self.assertNotIn("sns:Publish", worker_role)
         self.assertIn("sns:Publish", relay_role)
         self.assertNotIn("secretsmanager:GetSecretValue", relay_role)
         self.assertNotIn("handlers.pending_stream", self.text)
+
+    def test_subscription_migration_queue_is_standard_encrypted_and_redrives_after_five_receives(self):
+        self.assertIn("SubscriptionMigrationDeadLetterQueue", self.resources)
+        self.assertIn("SubscriptionMigrationWorkQueue", self.resources)
+        dead_letter_queue = self.resources["SubscriptionMigrationDeadLetterQueue"]
+        work_queue = self.resources["SubscriptionMigrationWorkQueue"]
+
+        self.assertEqual(dead_letter_queue["Type"], "AWS::SQS::Queue")
+        self.assertEqual(work_queue["Type"], "AWS::SQS::Queue")
+        for queue in (dead_letter_queue, work_queue):
+            properties = queue["Properties"]
+            self.assertTrue(properties["SqsManagedSseEnabled"])
+            self.assertEqual(properties["MessageRetentionPeriod"], 1_209_600)
+            self.assertNotIn("FifoQueue", properties)
+        self.assertEqual(work_queue["Properties"]["VisibilityTimeout"], 180)
+        self.assertEqual(
+            work_queue["Properties"]["RedrivePolicy"],
+            {
+                "deadLetterTargetArn": {
+                    "Fn::GetAtt": ["SubscriptionMigrationDeadLetterQueue", "Arn"]
+                },
+                "maxReceiveCount": 5,
+            },
+        )
+
+    def test_subscription_migration_worker_has_bounded_partial_batch_processing(self):
+        self.assertIn("SubscriptionMigrationWorkerFunction", self.resources)
+        worker = self.resources["SubscriptionMigrationWorkerFunction"]["Properties"]
+        self.assertEqual(
+            worker["Handler"], "handlers.subscription_migration_worker.lambda_handler"
+        )
+        self.assertEqual(worker["Timeout"], 30)
+        self.assertEqual(worker["ReservedConcurrentExecutions"], 5)
+        self.assertEqual(
+            worker["Environment"]["Variables"],
+            {
+                "MIGRATION_WORK_QUEUE_URL": {
+                    "Ref": "SubscriptionMigrationWorkQueue"
+                },
+                "WEBHOOK_RECEIPT_TABLE_NAME": {"Ref": "WebhookReceiptTable"},
+            },
+        )
+        event = worker["Events"]["MigrationWork"]
+        self.assertEqual(event["Type"], "SQS")
+        self.assertEqual(
+            event["Properties"],
+            {
+                "Queue": {
+                    "Fn::GetAtt": ["SubscriptionMigrationWorkQueue", "Arn"]
+                },
+                "BatchSize": 1,
+                "FunctionResponseTypes": ["ReportBatchItemFailures"],
+                "ScalingConfig": {"MaximumConcurrency": 5},
+            },
+        )
+
+        role = self._role("SubscriptionMigrationWorkerRole")
+        for action in (
+            "dynamodb:GetItem",
+            "dynamodb:PutItem",
+            "dynamodb:Query",
+            "dynamodb:UpdateItem",
+            "dynamodb:TransactWriteItems",
+            "sqs:ReceiveMessage",
+            "sqs:DeleteMessage",
+            "sqs:GetQueueAttributes",
+            "sqs:SendMessage",
+            "secretsmanager:GetSecretValue",
+        ):
+            self.assertIn(action, role)
+        self.assertIn("IntegrationRegistryTable", role)
+        self.assertIn("WebhookReceiptTable", role)
+        self.assertIn("SubscriptionMigrationWorkQueue", role)
+        self.assertIn(
+            "/zoolanding/${EnvironmentName}/integrations/stripe/connect-platform*",
+            role,
+        )
+        self.assertNotIn("sns:Publish", role)
+
+    def test_migration_work_uses_a_sparse_bounded_dynamodb_index(self):
+        table = self.resources["IntegrationRegistryTable"]["Properties"]
+        self.assertEqual(
+            table["GlobalSecondaryIndexes"],
+            [{
+                "IndexName": "MigrationWorkIndex",
+                "KeySchema": [
+                    {"AttributeName": "migrationWorkPk", "KeyType": "HASH"},
+                    {"AttributeName": "migrationWorkSk", "KeyType": "RANGE"},
+                ],
+                "Projection": {"ProjectionType": "ALL"},
+            }],
+        )
+        attributes = {
+            item["AttributeName"] for item in table["AttributeDefinitions"]
+        }
+        self.assertTrue({"migrationWorkPk", "migrationWorkSk"}.issubset(attributes))
+        self.assertIn("/index/*", self._role("SubscriptionMigrationWorkerRole"))
+
+    def test_migration_apis_have_command_and_read_only_status_roles(self):
+        for logical_id in (
+            "InternalStripeMigrationsPreviewFunction",
+            "InternalStripeMigrationsExecuteFunction",
+            "InternalStripeMigrationsControlFunction",
+        ):
+            function = self.resources[logical_id]["Properties"]
+            self.assertIn("Environment", function)
+            self.assertEqual(
+                function["Role"], {"Fn::GetAtt": ["InternalMigrationBoundaryRole", "Arn"]}
+            )
+            self.assertEqual(
+                function["Environment"]["Variables"],
+                {
+                    "MIGRATION_WORK_QUEUE_URL": {
+                        "Ref": "SubscriptionMigrationWorkQueue"
+                    },
+                    "WEBHOOK_RECEIPT_TABLE_NAME": {"Ref": "WebhookReceiptTable"},
+                },
+            )
+
+        self.assertEqual(
+            self.resources["InternalStripeMigrationsStatusFunction"]["Properties"][
+                "Role"
+            ],
+            {"Fn::GetAtt": ["InternalMigrationStatusRole", "Arn"]},
+        )
+        self.assertNotIn(
+            "Environment",
+            self.resources["InternalStripeMigrationsStatusFunction"]["Properties"],
+        )
+        command_role = self._role("InternalMigrationBoundaryRole")
+        for action in (
+            "dynamodb:GetItem",
+            "dynamodb:PutItem",
+            "dynamodb:Query",
+            "dynamodb:UpdateItem",
+            "dynamodb:TransactWriteItems",
+            "sqs:SendMessage",
+        ):
+            self.assertIn(action, command_role)
+        self.assertIn("IntegrationRegistryTable", command_role)
+        self.assertIn("WebhookReceiptTable", command_role)
+        self.assertIn("SubscriptionMigrationWorkQueue", command_role)
+        self.assertNotIn("secretsmanager:", command_role)
+        self.assertNotIn("sns:Publish", command_role)
+
+        status_role = self._role("InternalMigrationStatusRole")
+        self.assertIn("IntegrationRegistryReadPolicy", status_role)
+        for forbidden in (
+            "dynamodb:PutItem",
+            "dynamodb:UpdateItem",
+            "dynamodb:TransactWriteItems",
+            "sqs:",
+            "secretsmanager:",
+            "sns:",
+        ):
+            self.assertNotIn(forbidden, status_role)
 
     def _api_event(self, logical_id):
         events = self.resources[logical_id]["Properties"]["Events"]

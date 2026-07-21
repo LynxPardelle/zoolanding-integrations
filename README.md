@@ -1,6 +1,6 @@
 # Zoolanding Integrations
 
-Generic, server-only connection, provider-mapping, and confirmed-provider-event service for Zoolanding drafts. Phase 4 is implemented and verified locally; nothing in this repository is deployed or provider-activated.
+Generic, server-only connection, provider-mapping, confirmed-provider-event, and bulk subscription-migration service for Zoolanding drafts. Phase 5 is implemented and verified locally; nothing in this repository is deployed or provider-activated.
 
 ## Implemented local scope
 
@@ -12,6 +12,9 @@ Generic, server-only connection, provider-mapping, and confirmed-provider-event 
 - Stripe Product/Price, presentation, Coupon/PromotionCode lifecycle, hosted Checkout, Checkout status, subscription change/discount/pause-collection, and restricted Customer Portal commands.
 - Signed Connect webhook ingress, immutable hashed account routing, global replay protection, canonical provider re-fetch, exact normalized Commerce events, and a separate outgoing Stream relay.
 - Conditional command receipts, provider-resource mappings, subscription projections, and operation claims scoped to the exact draft, connection, resource, and revision.
+- Bulk subscription dry runs and execution for exact source-to-target offer revisions, using immutable safe snapshots, durable canaries, bounded account concurrency, per-item leases/retries, pause/resume/cancel controls, and paginated status.
+- Exact Stripe migration adapters for next-renewal schedules and immediate prorated changes. Unsupported or ambiguous provider state fails closed to `needs_review` without exposing provider payloads or recovery secrets.
+- Pending-update webhook reconciliation for migration state, alongside the existing Commerce event projection. The closed Stripe ingress allowlist contains eleven Commerce-facing events, two migration pending-update events, and one Connect deauthorization event.
 
 The implemented Stripe capability vocabulary is closed to `connect-onboarding`, `checkout`, `one-time-payments`, `subscriptions`, `prices`, `coupons`, and `customer-portal`. The generic SMTP binding exposes only `send`.
 
@@ -46,7 +49,18 @@ AWS_IAM internal routes:
 - `POST /internal/v1/stripe/migrations/control`
 - `GET /internal/v1/stripe/migrations/status`
 
-The four migration routes are intentional typed, fail-closed boundaries. They make no provider or job mutation until the Phase 5 migration engine is implemented.
+The four migration routes are implemented typed boundaries. Preview is provider-read-only and creates an expiring immutable dry run. Execute requires the exact dry-run revision/hash plus server-owned tax authorization. Control is optimistic-revision-bound; status is read-only and paginated.
+
+## Bulk migration boundaries
+
+- Discovery reads at most 100 subscriptions per provider page and rejects empty, repeated, or more than 1,000 continuation pages. This bounds one job to 100,000 discovered candidates.
+- Worker and cancellation batches are capped at 25. Draft configuration may select a canary from 1 through 25 and provider-account concurrency from 1 through 5.
+- Sparse DynamoDB work indexes select only bounded actionable states. A durable, replay-safe preview commitment and job counters finish dry runs, execution, and cancellation without loading every item; the status route remains the only paginated item-detail read.
+- Provider mutation retries stop after five attempts. Transient failures are delayed; permanent, ambiguous, ownership-mismatched, or exhausted items become `needs_review` without stopping unrelated items.
+- Next-renewal migration preserves the supported subscription, schedule, phase, invoice, threshold, item, quantity, tax-rate, and discount fields represented by the closed snapshot contract. Snapshots are capped at 300 KiB and reject metadata, customer identity, payment credentials, and unsupported provider fields.
+- Immediate migration revalidates the exact dry-run timestamp and proration amount before mutation. Customer-action recovery remains on Stripe-hosted HTTPS invoice pages; URLs and PaymentIntent client secrets are neither persisted nor returned by this service.
+- Cancel before mutation skips pending work. Cancel after a next-renewal migration releases or restores only the exact schedule proved to belong to that item. Completed next-renewal jobs may be rolled back through the same bounded workflow; immediate prorated jobs have no global rollback.
+- Active authorization overlays are lifecycle-scoped: target offers are removed after rollback/cancel and review states do not broaden checkout authorization.
 
 ## Credential, account, and tax boundaries
 
@@ -62,25 +76,27 @@ Hosted Checkout and Customer Portal URLs are validated ephemeral `no-store` resp
 
 - `boto3==1.39.13` matches the approved Zoolanding Python service baseline.
 - `stripe==15.3.1` is the official Stripe Python SDK and the sole new runtime dependency. It is isolated behind the Stripe adapter; provider-neutral domain code does not import it.
+- `PyYAML==6.0.2` is confined to `requirements-dev.txt` for template contract tests and is not packaged into Lambda runtime dependencies.
 
 ## Local verification
 
-The final Phase 4 commit passed 182 unit and contract tests, dependency audit, Python compilation, SAM lint/build, and import verification for all 22 packaged handlers.
+The current Phase 5 tree passed 266 unit/contract tests on Python 3.13, dependency audit, Python compilation, SAM lint, and an uncached SAM build of all 23 functions. No deployment or provider-backed proof is claimed.
 
 ```powershell
+python -m pip install --requirement requirements-dev.txt
 python -m unittest discover -s tests -p "test_*.py" -v
-python -m pip_audit --requirement requirements.txt
+python -m pip_audit --requirement requirements-dev.txt
 python -m compileall -q src tests
 sam validate --lint
 sam build --no-cached
 ```
 
-A local SAM build requires Python 3.13 on `PATH`; the declared production runtime is not relaxed to match another workstation interpreter.
+A local SAM build requires the official Python 3.13 installation, including its `DLLs` and `Scripts` directories, ahead of Windows app aliases on `PATH`. Remove the local `uv` shim from `PATH` for this command if it shadows that interpreter; the declared production runtime is not relaxed to match another workstation interpreter.
 
 ## Closed rollout boundary
 
-- Phase 5 owns bulk subscription migration and replacement of the four fail-closed migration seams.
+- Phase 5 bulk subscription migration is locally implemented. Provider-backed behavior and operational scale remain unproven until deployment and controlled environment testing.
 - Phase 8 owns AWS deployment, exact cross-service IAM identities, queues/tables/topics, alarms, quotas, environment credentials, webhook configuration, and provider-backed end-to-end/failure testing.
 - Phase 9 owns per-draft pilot configuration, production tax/live approval, and activation.
 
-There is no AWS `dev` stack, deployment workflow/profile, live credential, connected account, webhook endpoint, provider call, browser QA, end-to-end Stripe proof, or pilot activation recorded by Phase 4. Deployment and live activation remain NO-GO until their later gates are explicitly approved and verified.
+There is no AWS `dev` stack, deployment workflow/profile, live credential, connected account, webhook endpoint, provider call, browser QA, end-to-end Stripe proof, or pilot activation recorded through Phase 5. Deployment and live activation remain NO-GO until their later gates are explicitly approved and verified.

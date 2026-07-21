@@ -25,6 +25,17 @@ class RepositoryContractTests(unittest.TestCase):
         self.assertIn("official Stripe Python SDK", readme)
         self.assertIn("sole new runtime dependency", readme)
 
+        development_requirements = (
+            (ROOT / "requirements-dev.txt")
+            .read_text(encoding="utf-8")
+            .splitlines()
+        )
+        self.assertEqual(
+            development_requirements,
+            ["-r requirements.txt", "PyYAML==6.0.2"],
+        )
+        self.assertIn("requirements-dev.txt", readme)
+
     def test_sam_foundation_has_exact_storage_stream_and_topic_boundaries(self):
         template = (ROOT / "template.yaml").read_text(encoding="utf-8")
         for resource in (
@@ -34,6 +45,9 @@ class RepositoryContractTests(unittest.TestCase):
             "IntegrationOutgoingStreamFunction",
             "WebhookIngressFailureQueue",
             "IntegrationOutgoingFailureQueue",
+            "SubscriptionMigrationDeadLetterQueue",
+            "SubscriptionMigrationWorkQueue",
+            "SubscriptionMigrationWorkerFunction",
             "IntegrationEventsTopic",
         ):
             self.assertIn(f"  {resource}:", template)
@@ -43,7 +57,7 @@ class RepositoryContractTests(unittest.TestCase):
         self.assertEqual(template.count("SSEEnabled: true"), 2)
         self.assertIn("AttributeName: expiresAt", template)
         self.assertIn("StreamViewType: NEW_IMAGE", template)
-        self.assertEqual(template.count("ReportBatchItemFailures"), 2)
+        self.assertEqual(template.count("ReportBatchItemFailures"), 3)
         self.assertIn("dynamodb:ListStreams", template)
         self.assertIn('itemType":{"S":["WebhookIngressOutbox"]}', template)
         self.assertIn('itemType":{"S":["IntegrationEventOutbox"]}', template)

@@ -60,11 +60,24 @@ Resources:
           AttributeType: S
         - AttributeName: sk
           AttributeType: S
+        - AttributeName: migrationWorkPk
+          AttributeType: S
+        - AttributeName: migrationWorkSk
+          AttributeType: S
       KeySchema:
         - AttributeName: pk
           KeyType: HASH
         - AttributeName: sk
           KeyType: RANGE
+      GlobalSecondaryIndexes:
+        - IndexName: MigrationWorkIndex
+          KeySchema:
+            - AttributeName: migrationWorkPk
+              KeyType: HASH
+            - AttributeName: migrationWorkSk
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
       PointInTimeRecoverySpecification:
         PointInTimeRecoveryEnabled: true
       SSESpecification:
@@ -126,6 +139,23 @@ Resources:
     Properties:
       MessageRetentionPeriod: 1209600
       SqsManagedSseEnabled: true
+
+  SubscriptionMigrationDeadLetterQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      MessageRetentionPeriod: 1209600
+      SqsManagedSseEnabled: true
+
+  SubscriptionMigrationWorkQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      MessageRetentionPeriod: 1209600
+      SqsManagedSseEnabled: true
+      VisibilityTimeout: 180
+      RedrivePolicy:
+        deadLetterTargetArn:
+          Fn::GetAtt: [SubscriptionMigrationDeadLetterQueue, Arn]
+        maxReceiveCount: 5
 
   IntegrationEventsTopic:
     Type: AWS::SNS::Topic
@@ -206,9 +236,10 @@ Resources:
               - dynamodb:GetItem
               - dynamodb:Query
             Resource:
-              Fn::GetAtt:
-                - IntegrationRegistryTable
-                - Arn
+              - Fn::GetAtt:
+                  - IntegrationRegistryTable
+                  - Arn
+              - Fn::Sub: ${IntegrationRegistryTable.Arn}/index/*
 
   BrowserReadRole:
     Type: AWS::IAM::Role
@@ -379,6 +410,89 @@ Resources:
             Action: sts:AssumeRole
       ManagedPolicyArns:
         - Ref: ControlPlaneLoggingPolicy
+        - Ref: PublishedPolicyReadPolicy
+      Policies:
+        - PolicyName: ScopedMigrationCommands
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                  - dynamodb:PutItem
+                  - dynamodb:UpdateItem
+                  - dynamodb:TransactWriteItems
+                Resource:
+                  - Fn::GetAtt: [IntegrationRegistryTable, Arn]
+                  - Fn::GetAtt: [WebhookReceiptTable, Arn]
+              - Effect: Allow
+                Action: dynamodb:Query
+                Resource:
+                  - Fn::GetAtt: [IntegrationRegistryTable, Arn]
+                  - Fn::Sub: ${IntegrationRegistryTable.Arn}/index/*
+              - Effect: Allow
+                Action: sqs:SendMessage
+                Resource:
+                  Fn::GetAtt: [SubscriptionMigrationWorkQueue, Arn]
+
+  InternalMigrationStatusRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - Ref: ControlPlaneLoggingPolicy
+        - Ref: IntegrationRegistryReadPolicy
+
+  SubscriptionMigrationWorkerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - Ref: ControlPlaneLoggingPolicy
+        - Ref: PublishedPolicyReadPolicy
+      Policies:
+        - PolicyName: ScopedSubscriptionMigrationWork
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                  - dynamodb:PutItem
+                  - dynamodb:UpdateItem
+                  - dynamodb:TransactWriteItems
+                Resource:
+                  - Fn::GetAtt: [IntegrationRegistryTable, Arn]
+                  - Fn::GetAtt: [WebhookReceiptTable, Arn]
+              - Effect: Allow
+                Action: dynamodb:Query
+                Resource:
+                  - Fn::GetAtt: [IntegrationRegistryTable, Arn]
+                  - Fn::Sub: ${IntegrationRegistryTable.Arn}/index/*
+              - Effect: Allow
+                Action:
+                  - sqs:ReceiveMessage
+                  - sqs:DeleteMessage
+                  - sqs:GetQueueAttributes
+                  - sqs:SendMessage
+                Resource:
+                  Fn::GetAtt: [SubscriptionMigrationWorkQueue, Arn]
+              - Effect: Allow
+                Action: secretsmanager:GetSecretValue
+                Resource:
+                  Fn::Sub: arn:${AWS::Partition}:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:/zoolanding/${EnvironmentName}/integrations/stripe/connect-platform*
 
   WebhookIngressLogGroup:
     Type: AWS::Logs::LogGroup
@@ -471,9 +585,12 @@ Resources:
               - Effect: Allow
                 Action: sqs:SendMessage
                 Resource:
-                  Fn::GetAtt:
-                    - WebhookIngressFailureQueue
-                    - Arn
+                  - Fn::GetAtt:
+                      - WebhookIngressFailureQueue
+                      - Arn
+                  - Fn::GetAtt:
+                      - SubscriptionMigrationWorkQueue
+                      - Arn
               - Effect: Allow
                 Action:
                   - dynamodb:GetItem
@@ -808,6 +925,12 @@ Resources:
       Handler: handlers.internal_stripe_migrations_preview.lambda_handler
       Role:
         Fn::GetAtt: [InternalMigrationBoundaryRole, Arn]
+      Environment: &MigrationCommandEnvironment
+        Variables:
+          MIGRATION_WORK_QUEUE_URL:
+            Ref: SubscriptionMigrationWorkQueue
+          WEBHOOK_RECEIPT_TABLE_NAME:
+            Ref: WebhookReceiptTable
       LoggingConfig: *ControlPlaneLogging
       Events:
         InternalCommand:
@@ -827,6 +950,7 @@ Resources:
       Handler: handlers.internal_stripe_migrations_execute.lambda_handler
       Role:
         Fn::GetAtt: [InternalMigrationBoundaryRole, Arn]
+      Environment: *MigrationCommandEnvironment
       LoggingConfig: *ControlPlaneLogging
       Events:
         InternalCommand:
@@ -846,6 +970,7 @@ Resources:
       Handler: handlers.internal_stripe_migrations_control.lambda_handler
       Role:
         Fn::GetAtt: [InternalMigrationBoundaryRole, Arn]
+      Environment: *MigrationCommandEnvironment
       LoggingConfig: *ControlPlaneLogging
       Events:
         InternalCommand:
@@ -864,7 +989,7 @@ Resources:
       CodeUri: src/
       Handler: handlers.internal_stripe_migrations_status.lambda_handler
       Role:
-        Fn::GetAtt: [InternalMigrationBoundaryRole, Arn]
+        Fn::GetAtt: [InternalMigrationStatusRole, Arn]
       LoggingConfig: *ControlPlaneLogging
       Events:
         InternalCommand:
@@ -942,6 +1067,35 @@ Resources:
             Path: /webhooks/stripe/connect
             Method: post
 
+  SubscriptionMigrationWorkerFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src/
+      Handler: handlers.subscription_migration_worker.lambda_handler
+      Description: Applies claimed draft-scoped subscription migration work.
+      Role:
+        Fn::GetAtt: [SubscriptionMigrationWorkerRole, Arn]
+      Timeout: 30
+      ReservedConcurrentExecutions: 5
+      Environment:
+        Variables:
+          MIGRATION_WORK_QUEUE_URL:
+            Ref: SubscriptionMigrationWorkQueue
+          WEBHOOK_RECEIPT_TABLE_NAME:
+            Ref: WebhookReceiptTable
+      LoggingConfig: *ControlPlaneLogging
+      Events:
+        MigrationWork:
+          Type: SQS
+          Properties:
+            Queue:
+              Fn::GetAtt: [SubscriptionMigrationWorkQueue, Arn]
+            BatchSize: 1
+            FunctionResponseTypes:
+              - ReportBatchItemFailures
+            ScalingConfig:
+              MaximumConcurrency: 5
+
   WebhookIngressStreamFunction:
     Type: AWS::Serverless::Function
     Properties:
@@ -958,6 +1112,8 @@ Resources:
         Variables:
           WEBHOOK_RECEIPT_TABLE_NAME:
             Ref: WebhookReceiptTable
+          MIGRATION_WORK_QUEUE_URL:
+            Ref: SubscriptionMigrationWorkQueue
       LoggingConfig:
         LogFormat: JSON
         LogGroup:

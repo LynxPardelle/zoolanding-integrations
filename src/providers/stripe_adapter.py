@@ -14,9 +14,17 @@ from urllib.parse import urlencode, urlsplit, urlunsplit
 try:
     from domain.integrations import IntegrationBinding, IntegrationConnection
     from domain.operations import STRIPE_WEBHOOK_EVENT_TYPES
+    from subscription_migrations import (
+        MigrationNeedsReview,
+        canonical_migration_snapshot,
+    )
 except ModuleNotFoundError:
     from src.domain.integrations import IntegrationBinding, IntegrationConnection
     from src.domain.operations import STRIPE_WEBHOOK_EVENT_TYPES
+    from src.subscription_migrations import (
+        MigrationNeedsReview,
+        canonical_migration_snapshot,
+    )
 
 
 _DOMAIN = re.compile(
@@ -33,6 +41,21 @@ _RETURN_PATH = "/admin/integrations/stripe/return"
 
 class StripeAdapterError(RuntimeError):
     pass
+
+
+class StripeAdapterRetryable(StripeAdapterError):
+    """A transient Stripe failure that is safe to retry with the same key."""
+
+    retryable = True
+
+
+class StripeMigrationPartialError(StripeAdapterError):
+    """A Schedule was created and its exact ID must survive the failed update."""
+
+    def __init__(self, schedule_id: str, *, retryable: bool):
+        super().__init__("Stripe migration requires reconciliation")
+        self.schedule_id = schedule_id
+        self.retryable = retryable
 
 
 class StripeWebhookVerifier:
@@ -514,6 +537,116 @@ class StripeAdapter:
         )
         if response is not None:
             raise StripeAdapterError("Stripe subscription is unavailable")
+
+    def list_migration_candidates(self, resolved, source_price_id, cursor):
+        client, account = self._commerce_context(resolved, "subscriptions")
+        _reference(source_price_id)
+        if cursor is not None:
+            _reference(cursor)
+        response = _provider_call(
+            client.list_migration_candidates,
+            stripe_account=account,
+            source_price_id=source_price_id,
+            cursor=cursor,
+        )
+        if (
+            not isinstance(response, Mapping)
+            or set(response) != {"subscriptionIds", "nextCursor"}
+            or not isinstance(response["subscriptionIds"], list)
+            or len(response["subscriptionIds"]) > 100
+            or len(set(response["subscriptionIds"]))
+            != len(response["subscriptionIds"])
+        ):
+            raise StripeAdapterError("Stripe migration is unavailable")
+        for subscription_id in response["subscriptionIds"]:
+            _reference(subscription_id)
+        if response["nextCursor"] is not None:
+            _reference(response["nextCursor"])
+        return {
+            "subscriptionIds": list(response["subscriptionIds"]),
+            "nextCursor": response["nextCursor"],
+        }
+
+    def retrieve_migration_snapshot(self, resolved, subscription_id):
+        client, account = self._commerce_context(resolved, "subscriptions")
+        _reference(subscription_id)
+        response = _provider_call(
+            client.retrieve_migration_snapshot,
+            stripe_account=account,
+            subscription_id=subscription_id,
+        )
+        try:
+            return canonical_migration_snapshot(response)
+        except MigrationNeedsReview:
+            raise StripeAdapterError("Stripe migration requires review") from None
+
+    def preview_migration_proration(self, resolved, **kwargs):
+        client, account = self._commerce_context(resolved, "subscriptions")
+        response = _provider_call(
+            client.preview_migration_proration,
+            stripe_account=account,
+            **kwargs,
+        )
+        if (
+            not isinstance(response, Mapping)
+            or set(response) != {"prorationTimestamp", "amountMinor"}
+            or response.get("prorationTimestamp") != kwargs.get("proration_timestamp")
+            or type(response.get("amountMinor")) is not int
+            or response["amountMinor"] <= 0
+        ):
+            raise StripeAdapterError("Stripe migration is unavailable")
+        return dict(response)
+
+    def apply_next_renewal_migration(self, resolved, **kwargs):
+        client, account = self._commerce_context(resolved, "subscriptions")
+        response = _provider_call(
+            client.apply_next_renewal_migration,
+            stripe_account=account,
+            subscription_id=kwargs["subscription_id"],
+            plan=kwargs["plan"],
+            existing_schedule_id=kwargs.get("existing_schedule_id"),
+            idempotency_key=kwargs["idempotency_key"],
+        )
+        if (
+            not isinstance(response, Mapping)
+            or set(response) != {"status", "scheduleId"}
+            or response.get("status") != "applied"
+        ):
+            raise StripeAdapterError("Stripe migration is unavailable")
+        _reference(response.get("scheduleId"))
+        return dict(response)
+
+    def apply_immediate_migration(self, resolved, **kwargs):
+        client, account = self._commerce_context(resolved, "subscriptions")
+        response = _provider_call(
+            client.apply_immediate_migration,
+            stripe_account=account,
+            plan=kwargs["plan"],
+            idempotency_key=kwargs["idempotency_key"],
+        )
+        if (
+            not isinstance(response, Mapping)
+            or set(response) != {"status"}
+            or response.get("status")
+            not in {"applied", "pending_payment", "pending_customer_action"}
+        ):
+            raise StripeAdapterError("Stripe migration is unavailable")
+        return dict(response)
+
+    def release_migration_schedule(self, resolved, **kwargs):
+        client, account = self._commerce_context(resolved, "subscriptions")
+        response = _provider_call(
+            client.release_migration_schedule,
+            stripe_account=account,
+            schedule_id=kwargs["schedule_id"],
+            subscription_id=kwargs["subscription_id"],
+            original_schedule=kwargs.get("original_schedule"),
+            current_phase_anchor=kwargs.get("current_phase_anchor"),
+            idempotency_key=kwargs["idempotency_key"],
+        )
+        if response != {"status": "reverted"}:
+            raise StripeAdapterError("Stripe migration is unavailable")
+        return dict(response)
 
     def create_portal_configuration(self, resolved, idempotency_key):
         client, account = self._commerce_context(resolved, "customer-portal")
@@ -1163,6 +1296,288 @@ class StripeSdkClient:
             "defaultTaxRateIds": [_reference_value(rate) for rate in tax_rates],
         }
 
+    def list_migration_candidates(self, **kwargs: Any) -> dict[str, Any]:
+        params = {
+            "price": kwargs["source_price_id"],
+            "limit": 100,
+        }
+        if kwargs["cursor"] is not None:
+            params["starting_after"] = kwargs["cursor"]
+        response = self.client.v1.subscriptions.list(
+            params, {"stripe_account": kwargs["stripe_account"]}
+        )
+        data = _mapping_value(response, "data")
+        has_more = _mapping_value(response, "has_more")
+        if (
+            not isinstance(data, list)
+            or type(has_more) is not bool
+            or len(data) > 100
+            or (has_more and not data)
+        ):
+            raise StripeAdapterError("Stripe migration is unavailable")
+        identifiers = [_reference_value(value) for value in data]
+        if (
+            any(type(value) is not str for value in identifiers)
+            or len(set(identifiers)) != len(identifiers)
+            or (has_more and identifiers[-1] == kwargs["cursor"])
+        ):
+            raise StripeAdapterError("Stripe migration is unavailable")
+        return {
+            "subscriptionIds": identifiers,
+            "nextCursor": identifiers[-1] if has_more and identifiers else None,
+        }
+
+    def retrieve_migration_snapshot(self, **kwargs: Any) -> dict[str, Any]:
+        subscription = self.client.v1.subscriptions.retrieve(
+            kwargs["subscription_id"],
+            {
+                "expand": [
+                    "default_payment_method",
+                    "items.data.price",
+                    "latest_invoice.payments",
+                ]
+            },
+            {"stripe_account": kwargs["stripe_account"]},
+        )
+        schedule_reference = _reference_value(_mapping_value(subscription, "schedule"))
+        schedule = None
+        if schedule_reference is not None:
+            schedule = self.client.v1.subscription_schedules.retrieve(
+                schedule_reference,
+                {"expand": ["phases.items.price"]},
+                {"stripe_account": kwargs["stripe_account"]},
+            )
+        customer_reference = _reference_value(_mapping_value(subscription, "customer"))
+        pending_items = self.client.v1.invoice_items.list(
+            {"customer": customer_reference, "pending": True, "limit": 2},
+            {"stripe_account": kwargs["stripe_account"]},
+        )
+        return _migration_snapshot_from_stripe(
+            subscription,
+            schedule=schedule,
+            pending_invoice_items=pending_items,
+        )
+
+    def preview_migration_proration(self, **kwargs: Any) -> dict[str, Any]:
+        response = self.client.v1.invoices.create_preview(
+            {
+                "subscription": kwargs["subscription_id"],
+                "subscription_details": {
+                    "items": [
+                        {
+                            "id": kwargs["item_id"],
+                            "price": kwargs["target_price_id"],
+                            "quantity": kwargs["quantity"],
+                        }
+                    ],
+                    "proration_date": kwargs["proration_timestamp"],
+                    "proration_behavior": "always_invoice",
+                },
+            },
+            {"stripe_account": kwargs["stripe_account"]},
+        )
+        lines = _mapping_value(response, "lines")
+        data = _mapping_value(lines, "data")
+        if not isinstance(data, list) or _mapping_value(lines, "has_more") is True:
+            raise StripeAdapterError("Stripe migration is unavailable")
+        amount = 0
+        for line in data:
+            parent = _mapping_value(line, "parent")
+            details = _mapping_value(parent, "subscription_item_details")
+            is_proration = _mapping_value(line, "proration") is True or (
+                _mapping_value(details, "proration") is True
+            )
+            if not is_proration:
+                continue
+            subscription_item = _reference_value(
+                _mapping_value(line, "subscription_item")
+            ) or _reference_value(_mapping_value(details, "subscription_item"))
+            line_amount = _mapping_value(line, "amount")
+            if subscription_item != kwargs["item_id"] or type(line_amount) is not int:
+                raise StripeAdapterError("Stripe migration is unavailable")
+            amount += line_amount
+        return {
+            "prorationTimestamp": kwargs["proration_timestamp"],
+            "amountMinor": amount,
+        }
+
+    def apply_next_renewal_migration(self, **kwargs: Any) -> dict[str, Any]:
+        plan = kwargs["plan"]
+        schedule_id = plan["scheduleId"] or kwargs.get("existing_schedule_id")
+        if schedule_id is None:
+            created = self.client.v1.subscription_schedules.create(
+                {"from_subscription": kwargs["subscription_id"]},
+                _request_options(kwargs, suffix="migration-schedule-create"),
+            )
+            schedule_id = _mapping_value(created, "id")
+            linked = _reference_value(_mapping_value(created, "subscription"))
+            if type(schedule_id) is not str:
+                raise StripeAdapterError("Stripe migration is unavailable")
+            if linked != kwargs["subscription_id"]:
+                raise StripeMigrationPartialError(
+                    schedule_id, retryable=False
+                ) from None
+        elif type(schedule_id) is not str:
+            raise StripeAdapterError("Stripe migration is unavailable")
+        try:
+            updated = self.client.v1.subscription_schedules.update(
+                schedule_id,
+                {
+                    "end_behavior": plan["endBehavior"],
+                    "proration_behavior": plan["prorationBehavior"],
+                    "phases": [
+                        _stripe_migration_phase(phase) for phase in plan["phases"]
+                    ],
+                    **(
+                        {
+                            "default_settings": _stripe_migration_default_settings(
+                                plan["defaultSettings"]
+                            )
+                        }
+                        if plan.get("defaultSettings") is not None
+                        else {}
+                    ),
+                },
+                _request_options(kwargs, suffix="migration-schedule-update"),
+            )
+            if _mapping_value(updated, "id") != schedule_id:
+                raise StripeAdapterError("Stripe migration is unavailable")
+            linked = _reference_value(_mapping_value(updated, "subscription"))
+            if linked != kwargs["subscription_id"]:
+                raise StripeAdapterError("Stripe migration is unavailable")
+        except StripeMigrationPartialError:
+            raise
+        except Exception as error:
+            if plan["scheduleId"] is None:
+                raise StripeMigrationPartialError(
+                    schedule_id, retryable=_provider_error_is_retryable(error)
+                ) from None
+            raise
+        return {"status": "applied", "scheduleId": schedule_id}
+
+    def apply_immediate_migration(self, **kwargs: Any) -> dict[str, Any]:
+        plan = kwargs["plan"]
+        response = self.client.v1.subscriptions.update(
+            plan["subscriptionId"],
+            {
+                "items": [
+                    {
+                        "id": plan["itemId"],
+                        "price": plan["priceId"],
+                        "quantity": plan["quantity"],
+                    }
+                ],
+                "proration_behavior": plan["prorationBehavior"],
+                "proration_date": plan["prorationTimestamp"],
+                "payment_behavior": plan["paymentBehavior"],
+                "expand": [
+                    "latest_invoice.payments.data.payment.payment_intent"
+                ],
+            },
+            _request_options(kwargs, suffix="migration-subscription-update"),
+        )
+        if _reference_value(_mapping_value(response, "id")) != plan["subscriptionId"]:
+            raise StripeAdapterError("Stripe migration is unavailable")
+        pending = _mapping_value(response, "pending_update")
+        if pending is None:
+            return {"status": "applied"}
+        latest = _mapping_value(response, "latest_invoice")
+        payments_container = _mapping_value(latest, "payments")
+        payments = _mapping_value(payments_container, "data")
+        if (
+            not isinstance(payments, list)
+            or _mapping_value(payments_container, "has_more") is True
+        ):
+            return {"status": "pending_payment"}
+        defaults = [
+            payment
+            for payment in payments
+            if _mapping_value(payment, "is_default") is True
+        ]
+        if any(
+            _mapping_value(payment, "status") not in {"open", "paid", "canceled"}
+            for payment in payments
+        ):
+            raise StripeAdapterError("Stripe migration is unavailable")
+        requires_action = False
+        for payment in defaults:
+            payment_reference = _mapping_value(payment, "payment")
+            if _mapping_value(payment_reference, "type") != "payment_intent":
+                continue
+            intent = _mapping_value(payment_reference, "payment_intent")
+            if not isinstance(intent, Mapping):
+                continue
+            if (
+                _mapping_value(intent, "status") == "requires_action"
+                and _mapping_value(intent, "next_action") is not None
+            ):
+                requires_action = True
+        if requires_action and not _safe_stripe_hosted_invoice(
+            _mapping_value(latest, "hosted_invoice_url")
+        ):
+            raise MigrationNeedsReview("payment-failed")
+        return {
+            "status": (
+                "pending_customer_action" if requires_action else "pending_payment"
+            )
+        }
+
+    def release_migration_schedule(self, **kwargs: Any) -> dict[str, Any]:
+        schedule_id = kwargs["schedule_id"]
+        subscription_id = kwargs["subscription_id"]
+        original = kwargs["original_schedule"]
+        if original is None:
+            response = self.client.v1.subscription_schedules.release(
+                schedule_id,
+                {},
+                _request_options(kwargs, suffix="migration-schedule-release"),
+            )
+            released = _reference_value(
+                _mapping_value(response, "released_subscription")
+            )
+            if (
+                _mapping_value(response, "id") != schedule_id
+                or released != subscription_id
+            ):
+                raise StripeAdapterError("Stripe migration is unavailable")
+        else:
+            if _mapping_value(original, "scheduleId") != schedule_id:
+                raise StripeAdapterError("Stripe migration is unavailable")
+            anchor = kwargs.get("current_phase_anchor")
+            phases = original["phases"]
+            matches = [
+                index
+                for index, phase in enumerate(phases)
+                if phase.get("startDate") == anchor
+            ]
+            if (
+                type(anchor) is not int
+                or len(matches) != 1
+                or matches[0] < original["currentPhaseIndex"]
+            ):
+                raise MigrationNeedsReview("source-drift")
+            response = self.client.v1.subscription_schedules.update(
+                schedule_id,
+                {
+                    "end_behavior": original["endBehavior"],
+                    "proration_behavior": "none",
+                    "phases": [
+                        _stripe_migration_phase(phase)
+                        for phase in phases[matches[0] :]
+                    ],
+                    "default_settings": _stripe_migration_default_settings(
+                        original["defaultSettings"]
+                    ),
+                },
+                _request_options(kwargs, suffix="migration-schedule-restore"),
+            )
+            if _mapping_value(response, "id") != schedule_id:
+                raise StripeAdapterError("Stripe migration is unavailable")
+            linked = _reference_value(_mapping_value(response, "subscription"))
+            if linked != subscription_id:
+                raise StripeAdapterError("Stripe migration is unavailable")
+        return {"status": "reverted"}
+
     def preview_subscription_change(self, **kwargs: Any) -> dict[str, Any]:
         self.client.v1.invoices.create_preview(
             {
@@ -1412,14 +1827,30 @@ class StripeSdkClient:
             {},
             {"stripe_account": kwargs["stripe_account"]},
         )
-        items = _mapping_value(_mapping_value(response, "items"), "data")
-        if not isinstance(items, list) or len(items) != 1:
+        items_container = _mapping_value(response, "items")
+        items = _mapping_value(items_container, "data")
+        if (
+            not isinstance(items, list)
+            or not 1 <= len(items) <= 20
+            or _mapping_value(items_container, "has_more") is True
+        ):
             raise StripeAdapterError("Stripe event is unavailable")
-        item = items[0]
-        price_id = _reference_value(_mapping_value(item, "price"))
-        period_end = _mapping_value(response, "current_period_end")
-        if type(period_end) is not int:
-            period_end = _mapping_value(item, "current_period_end")
+        canonical_items = [
+            {
+                "itemId": _mapping_value(item, "id"),
+                "priceId": _reference_value(_mapping_value(item, "price")),
+                "currentPeriodStart": _mapping_value(item, "current_period_start"),
+                "currentPeriodEnd": _mapping_value(item, "current_period_end"),
+            }
+            for item in items
+        ]
+        periods = {
+            (item["currentPeriodStart"], item["currentPeriodEnd"])
+            for item in canonical_items
+        }
+        if len(periods) != 1:
+            raise StripeAdapterError("Stripe event is unavailable")
+        _, period_end = next(iter(periods))
         pause = _mapping_value(response, "pause_collection")
         sanitized_pause = None
         if pause is not None:
@@ -1435,8 +1866,17 @@ class StripeSdkClient:
             "latestInvoiceId": _reference_value(
                 _mapping_value(response, "latest_invoice")
             ),
-            "priceId": price_id,
+            "items": canonical_items,
             "pauseCollection": sanitized_pause,
+            "pendingUpdate": (
+                None
+                if _mapping_value(response, "pending_update") is None
+                else {
+                    "expiresAt": _mapping_value(
+                        _mapping_value(response, "pending_update"), "expires_at"
+                    )
+                }
+            ),
             "mappingHint": _metadata_mapping_hint(response),
         }
 
@@ -1457,10 +1897,592 @@ class StripeSdkClient:
 def _provider_call(operation, **kwargs):
     try:
         return operation(**kwargs)
-    except StripeAdapterError:
+    except (StripeAdapterError, MigrationNeedsReview):
         raise
-    except Exception:
+    except Exception as error:
+        if _provider_error_is_retryable(error):
+            raise StripeAdapterRetryable("Stripe operation is unavailable") from None
         raise StripeAdapterError("Stripe operation is unavailable") from None
+
+
+def _provider_error_is_retryable(error: BaseException) -> bool:
+    status = next(
+        (
+            getattr(error, name, None)
+            for name in ("http_status", "status_code", "status")
+            if type(getattr(error, name, None)) is int
+        ),
+        None,
+    )
+    if getattr(error, "should_retry", None) is True:
+        return True
+    if isinstance(error, (TimeoutError, ConnectionError)) or status == 429 or (
+        type(status) is int and status >= 500
+    ):
+        return True
+    try:
+        import stripe  # type: ignore
+
+        retryable_types = tuple(
+            selected
+            for selected in (
+                getattr(stripe, "APIConnectionError", None),
+                getattr(stripe, "RateLimitError", None),
+                getattr(stripe, "APIError", None),
+            )
+            if isinstance(selected, type)
+        )
+        return bool(retryable_types) and isinstance(error, retryable_types)
+    except Exception:
+        return False
+
+
+def _safe_stripe_hosted_invoice(value: object) -> bool:
+    if type(value) is not str:
+        return False
+    try:
+        parsed = urlsplit(value)
+        return (
+            parsed.scheme == "https"
+            and parsed.hostname == "invoice.stripe.com"
+            and parsed.port in {None, 443}
+            and parsed.username is None
+            and parsed.password is None
+            and bool(parsed.path)
+        )
+    except ValueError:
+        return False
+
+
+def _migration_snapshot_from_stripe(
+    subscription: object, *, schedule: object, pending_invoice_items: object
+) -> dict[str, Any]:
+    """Reduce Stripe responses to the exact non-PII migration contract."""
+
+    _reject_migration_features(
+        subscription,
+        {
+            "application_fee_percent",
+            "billing_cycle_anchor_config",
+            "cancel_at",
+            "cancel_at_period_end",
+            "description",
+            "on_behalf_of",
+            "pause_collection",
+            "pending_invoice_item_interval",
+            "transfer_data",
+            "trial_end",
+            "trial_settings",
+        },
+    )
+    billing_mode = _mapping_value(subscription, "billing_mode")
+    if billing_mode is not None and _mapping_value(billing_mode, "type") != "classic":
+        raise MigrationNeedsReview("unsupported-schedule")
+    _validate_default_payment_settings(_mapping_value(subscription, "payment_settings"))
+    if _mapping_value(subscription, "default_source") is not None:
+        raise MigrationNeedsReview("unsupported-payment-method")
+    collection_method = _mapping_value(subscription, "collection_method")
+    if collection_method not in {"charge_automatically", "send_invoice"}:
+        raise MigrationNeedsReview("unsupported-collection-mode")
+    items_container = _mapping_value(subscription, "items")
+    raw_items = _mapping_value(items_container, "data")
+    if (
+        not isinstance(raw_items, list)
+        or _mapping_value(items_container, "has_more") is True
+    ):
+        raise MigrationNeedsReview("source-drift")
+    items = [_migration_item_from_stripe(item, phase=False) for item in raw_items]
+    period_values = {
+        (
+            _mapping_value(item, "current_period_start"),
+            _mapping_value(item, "current_period_end"),
+        )
+        for item in raw_items
+    }
+    if len(period_values) != 1:
+        raise MigrationNeedsReview("source-drift")
+    period_start, period_end = next(iter(period_values))
+    currency_values = {item["priceConfiguration"]["currency"] for item in items}
+    if len(currency_values) != 1:
+        raise MigrationNeedsReview("source-drift")
+
+    default_payment = _mapping_value(subscription, "default_payment_method")
+    payment_id = _reference_value(default_payment)
+    payment_type = _mapping_value(default_payment, "type")
+    if payment_id is not None and payment_type is None:
+        raise MigrationNeedsReview("unsupported-payment-method")
+
+    discounts_value = _mapping_value(subscription, "discounts")
+    if not isinstance(discounts_value, list):
+        raise MigrationNeedsReview("unsupported-schedule")
+    discount_ids = []
+    for discount in discounts_value:
+        reference = _reference_value(_mapping_value(discount, "promotion_code"))
+        if reference is None:
+            reference = _reference_value(discount)
+        if type(reference) is not str:
+            raise MigrationNeedsReview("unsupported-schedule")
+        discount_ids.append(reference)
+
+    tax_rates = _mapping_value(subscription, "default_tax_rates")
+    metadata = _mapping_value(subscription, "metadata")
+    if not isinstance(tax_rates, list) or not isinstance(metadata, Mapping):
+        raise MigrationNeedsReview("unsupported-schedule")
+    invoice_settings = _mapping_value(subscription, "invoice_settings") or {}
+    issuer = _mapping_value(invoice_settings, "issuer") or {"type": "self"}
+    account_tax_ids = _mapping_value(invoice_settings, "account_tax_ids")
+    if account_tax_ids is not None and account_tax_ids != []:
+        raise MigrationNeedsReview("unsupported-schedule")
+    automatic_tax = _mapping_value(subscription, "automatic_tax") or {}
+    _validate_automatic_tax(automatic_tax)
+    pending_update = _mapping_value(subscription, "pending_update")
+    latest = _mapping_value(subscription, "latest_invoice")
+
+    pending_data = _mapping_value(pending_invoice_items, "data")
+    pending_has_more = _mapping_value(pending_invoice_items, "has_more")
+    if not isinstance(pending_data, list) or pending_has_more is True:
+        raise MigrationNeedsReview("pending-invoice-items")
+
+    selected_invoice_settings = _migration_invoice_settings(invoice_settings)
+    selected_invoice_settings["daysUntilDue"] = _mapping_value(
+        subscription, "days_until_due"
+    )
+    selected = {
+        "subscriptionId": _mapping_value(subscription, "id"),
+        "providerRevision": "0" * 64,
+        "status": _mapping_value(subscription, "status"),
+        "currency": next(iter(currency_values)).upper(),
+        "currentPeriodStart": period_start,
+        "currentPeriodEnd": period_end,
+        "collectionMethod": collection_method,
+        "defaultPaymentMethodId": payment_id,
+        "defaultPaymentMethodType": payment_type,
+        "items": items,
+        "discountIds": discount_ids,
+        "automaticTax": {"enabled": _mapping_value(automatic_tax, "enabled")},
+        "billingThresholds": _migration_subscription_billing_thresholds(
+            _mapping_value(subscription, "billing_thresholds")
+        ),
+        "defaultTaxRateIds": [_reference_value(rate) for rate in tax_rates],
+        "invoiceSettings": selected_invoice_settings,
+        "metadata": dict(metadata),
+        "schedule": _migration_schedule_from_stripe(schedule),
+        "pendingUpdate": (
+            None
+            if pending_update is None
+            else {"expiresAt": _mapping_value(pending_update, "expires_at")}
+        ),
+        "latestInvoice": _migration_invoice_from_stripe(latest),
+        "pendingInvoiceItemCount": len(pending_data),
+    }
+    selected["providerRevision"] = hashlib.sha256(
+        json.dumps(
+            {key: value for key, value in selected.items() if key != "providerRevision"},
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=True,
+            allow_nan=False,
+        ).encode("ascii")
+    ).hexdigest()
+    return canonical_migration_snapshot(selected)
+
+
+def _migration_item_from_stripe(value: object, *, phase: bool) -> dict[str, Any]:
+    price = _mapping_value(value, "price")
+    recurring = _mapping_value(price, "recurring")
+    tax_rates = _mapping_value(value, "tax_rates")
+    metadata = _mapping_value(value, "metadata") or {}
+    if not isinstance(recurring, Mapping) or not isinstance(tax_rates, list):
+        raise MigrationNeedsReview("source-drift")
+    selected = {
+        "priceId": _reference_value(price),
+        "quantity": _mapping_value(value, "quantity"),
+        "taxRateIds": [_reference_value(rate) for rate in tax_rates],
+        "billingThresholds": _migration_item_billing_thresholds(
+            _mapping_value(value, "billing_thresholds")
+        ),
+        "discountIds": _migration_discount_ids(
+            _mapping_value(value, "discounts") or []
+        ),
+        "metadata": dict(metadata) if isinstance(metadata, Mapping) else metadata,
+        "priceConfiguration": {
+            "currency": str(_mapping_value(price, "currency") or "").upper(),
+            "recurring": {
+                "interval": _mapping_value(recurring, "interval"),
+                "intervalCount": _mapping_value(recurring, "interval_count"),
+                "usageType": _mapping_value(recurring, "usage_type"),
+            },
+        },
+    }
+    if not phase:
+        selected["itemId"] = _mapping_value(value, "id")
+    return selected
+
+
+def _migration_schedule_from_stripe(value: object) -> dict[str, Any] | None:
+    if value is None:
+        return None
+    _reject_migration_features(value, {"application_fee_percent", "transfer_data"})
+    default_settings = _migration_default_settings_from_stripe(
+        _mapping_value(value, "default_settings")
+    )
+    phases = _stripe_list(_mapping_value(value, "phases"))
+    converted = []
+    for phase in phases:
+        _reject_migration_features(
+            phase,
+            {
+                "add_invoice_items",
+                "application_fee_percent",
+                "billing_cycle_anchor",
+                "description",
+                "on_behalf_of",
+                "transfer_data",
+                "trial_end",
+            },
+        )
+        end = _mapping_value(phase, "end_date")
+        if type(end) is not int:
+            raise MigrationNeedsReview("unsupported-schedule")
+        phase_items = _stripe_list(_mapping_value(phase, "items"))
+        discounts = _mapping_value(phase, "discounts")
+        tax_rates = _mapping_value(phase, "default_tax_rates")
+        metadata = _mapping_value(phase, "metadata") or {}
+        if (
+            not isinstance(discounts, list)
+            or not isinstance(tax_rates, list)
+            or not isinstance(metadata, Mapping)
+        ):
+            raise MigrationNeedsReview("unsupported-schedule")
+        invoice_settings = _mapping_value(phase, "invoice_settings")
+        if invoice_settings is None:
+            invoice_settings = {
+                "issuer": {"type": default_settings["invoiceSettings"]["issuerType"]},
+                "days_until_due": default_settings["invoiceSettings"]["daysUntilDue"],
+            }
+        issuer = _mapping_value(invoice_settings, "issuer") or {"type": "self"}
+        account_tax_ids = _mapping_value(invoice_settings, "account_tax_ids")
+        if account_tax_ids is not None and account_tax_ids != []:
+            raise MigrationNeedsReview("unsupported-schedule")
+        automatic_tax = _mapping_value(phase, "automatic_tax")
+        if automatic_tax is None:
+            automatic_tax = default_settings["automaticTax"]
+        _validate_automatic_tax(automatic_tax)
+        collection_method = _mapping_value(phase, "collection_method")
+        if collection_method is None:
+            collection_method = default_settings["collectionMethod"]
+        default_payment_method = _reference_value(
+            _mapping_value(phase, "default_payment_method")
+        )
+        if default_payment_method is None:
+            default_payment_method = default_settings["defaultPaymentMethodId"]
+        raw_billing_thresholds = _mapping_value(phase, "billing_thresholds")
+        billing_thresholds = (
+            default_settings["billingThresholds"]
+            if raw_billing_thresholds is None
+            else _migration_subscription_billing_thresholds(raw_billing_thresholds)
+        )
+        converted.append(
+            {
+                "startDate": _mapping_value(phase, "start_date"),
+                "endDate": end,
+                "items": [
+                    _migration_item_from_stripe(item, phase=True)
+                    for item in phase_items
+                ],
+                "discountIds": [
+                    _reference_value(_mapping_value(discount, "promotion_code"))
+                    or _reference_value(discount)
+                    for discount in discounts
+                ],
+                "automaticTax": {
+                    "enabled": _mapping_value(automatic_tax, "enabled")
+                },
+                "billingThresholds": billing_thresholds,
+                "defaultTaxRateIds": [_reference_value(rate) for rate in tax_rates],
+                "collectionMethod": collection_method,
+                "defaultPaymentMethodId": default_payment_method,
+                "invoiceSettings": _migration_invoice_settings(invoice_settings),
+                "metadata": dict(metadata),
+                "prorationBehavior": _mapping_value(phase, "proration_behavior"),
+            }
+        )
+    if _mapping_value(value, "status") == "not_started":
+        current_index = 0
+    else:
+        current_phase = _mapping_value(value, "current_phase")
+        current_start = _mapping_value(current_phase, "start_date")
+        indices = [
+            index
+            for index, phase in enumerate(converted)
+            if phase["startDate"] == current_start
+        ]
+        if len(indices) != 1:
+            raise MigrationNeedsReview("unsupported-schedule")
+        current_index = indices[0]
+    return {
+        "scheduleId": _mapping_value(value, "id"),
+        "status": _mapping_value(value, "status"),
+        "endBehavior": _mapping_value(value, "end_behavior"),
+        "currentPhaseIndex": current_index,
+        "defaultSettings": default_settings,
+        "phases": converted,
+    }
+
+
+def _migration_discount_ids(value: object) -> list[str]:
+    discounts = _stripe_list(value)
+    result = []
+    for discount in discounts:
+        reference = _reference_value(_mapping_value(discount, "promotion_code"))
+        if reference is None:
+            reference = _reference_value(discount)
+        if type(reference) is not str:
+            raise MigrationNeedsReview("unsupported-schedule")
+        result.append(reference)
+    return result
+
+
+def _migration_item_billing_thresholds(value: object) -> dict[str, int] | None:
+    if value is None:
+        return None
+    usage_gte = _mapping_value(value, "usage_gte")
+    if type(usage_gte) is not int:
+        raise MigrationNeedsReview("unsupported-schedule")
+    return {"usageGte": usage_gte}
+
+
+def _migration_subscription_billing_thresholds(
+    value: object,
+) -> dict[str, Any] | None:
+    if value is None:
+        return None
+    amount_gte = _mapping_value(value, "amount_gte")
+    reset_anchor = _mapping_value(value, "reset_billing_cycle_anchor")
+    if type(amount_gte) is not int or type(reset_anchor) is not bool:
+        raise MigrationNeedsReview("unsupported-schedule")
+    return {
+        "amountGte": amount_gte,
+        "resetBillingCycleAnchor": reset_anchor,
+    }
+
+
+def _migration_invoice_settings(value: object) -> dict[str, Any]:
+    if not isinstance(value, Mapping):
+        raise MigrationNeedsReview("unsupported-schedule")
+    account_tax_ids = _mapping_value(value, "account_tax_ids")
+    if account_tax_ids not in (None, []):
+        raise MigrationNeedsReview("unsupported-schedule")
+    issuer = _mapping_value(value, "issuer") or {"type": "self"}
+    if _mapping_value(issuer, "type") != "self":
+        raise MigrationNeedsReview("unsupported-schedule")
+    return {
+        "issuerType": "self",
+        "daysUntilDue": _mapping_value(value, "days_until_due"),
+    }
+
+
+def _migration_default_settings_from_stripe(value: object) -> dict[str, Any]:
+    if not isinstance(value, Mapping):
+        raise MigrationNeedsReview("unsupported-schedule")
+    _reject_migration_features(
+        value,
+        {
+            "application_fee_percent",
+            "default_source",
+            "description",
+            "on_behalf_of",
+            "transfer_data",
+        },
+    )
+    automatic_tax = _mapping_value(value, "automatic_tax")
+    _validate_automatic_tax(automatic_tax)
+    collection_method = _mapping_value(value, "collection_method")
+    if collection_method not in {"charge_automatically", "send_invoice"}:
+        raise MigrationNeedsReview("unsupported-schedule")
+    invoice_settings = _migration_invoice_settings(
+        _mapping_value(value, "invoice_settings")
+    )
+    billing_cycle_anchor = _mapping_value(value, "billing_cycle_anchor")
+    if billing_cycle_anchor not in {"automatic", "phase_start"}:
+        raise MigrationNeedsReview("unsupported-schedule")
+    return {
+        "automaticTax": {"enabled": _mapping_value(automatic_tax, "enabled")},
+        "billingCycleAnchor": billing_cycle_anchor,
+        "billingThresholds": _migration_subscription_billing_thresholds(
+            _mapping_value(value, "billing_thresholds")
+        ),
+        "collectionMethod": collection_method,
+        "defaultPaymentMethodId": _reference_value(
+            _mapping_value(value, "default_payment_method")
+        ),
+        "invoiceSettings": invoice_settings,
+    }
+
+
+def _migration_invoice_from_stripe(value: object) -> dict[str, Any] | None:
+    if value is None:
+        return None
+    payments_container = _mapping_value(value, "payments")
+    payments = _mapping_value(payments_container, "data")
+    if (
+        not isinstance(payments, list)
+        or _mapping_value(payments_container, "has_more") is True
+    ):
+        raise MigrationNeedsReview("unpaid-invoice")
+    defaults = [item for item in payments if _mapping_value(item, "is_default") is True]
+    if len(defaults) > 1:
+        raise MigrationNeedsReview("unpaid-invoice")
+    return {
+        "invoiceId": _mapping_value(value, "id"),
+        "status": _mapping_value(value, "status"),
+        "paymentStatus": (
+            None if not defaults else _mapping_value(defaults[0], "status")
+        ),
+    }
+
+
+def _reject_migration_features(value: object, keys: set[str]) -> None:
+    for key in keys:
+        selected = _mapping_value(value, key)
+        if (
+            selected is not None
+            and selected is not False
+            and selected != ""
+            and selected != []
+            and selected != {}
+        ):
+            raise MigrationNeedsReview("unsupported-schedule")
+
+
+def _stripe_list(value: object) -> list[Any]:
+    if isinstance(value, list):
+        return value
+    data = _mapping_value(value, "data")
+    if isinstance(data, list) and _mapping_value(value, "has_more") is not True:
+        return data
+    raise MigrationNeedsReview("unsupported-schedule")
+
+
+def _validate_automatic_tax(value: object) -> None:
+    if (
+        not isinstance(value, Mapping)
+        or type(_mapping_value(value, "enabled")) is not bool
+        or _mapping_value(value, "liability") is not None
+        or _mapping_value(value, "disabled_reason") is not None
+    ):
+        raise MigrationNeedsReview("tax-approval")
+
+
+def _validate_default_payment_settings(value: object) -> None:
+    if value is None:
+        return
+    if not isinstance(value, Mapping):
+        raise MigrationNeedsReview("unsupported-payment-method")
+    method_types = _mapping_value(value, "payment_method_types")
+    save_default = _mapping_value(value, "save_default_payment_method")
+    options = _mapping_value(value, "payment_method_options")
+    if (
+        (method_types is not None and method_types != [])
+        or save_default not in (None, "off")
+        or (options is not None and options != {})
+    ):
+        raise MigrationNeedsReview("unsupported-payment-method")
+
+
+def _stripe_discount(identifier: object) -> dict[str, str]:
+    if type(identifier) is not str:
+        raise StripeAdapterError("Stripe migration is unavailable")
+    if identifier.startswith("promo_"):
+        return {"promotion_code": identifier}
+    if identifier.startswith("di_"):
+        return {"discount": identifier}
+    raise StripeAdapterError("Stripe migration is unavailable")
+
+
+def _stripe_migration_subscription_thresholds(
+    value: Mapping[str, Any]
+) -> dict[str, Any]:
+    return {
+        "amount_gte": value["amountGte"],
+        "reset_billing_cycle_anchor": value["resetBillingCycleAnchor"],
+    }
+
+
+def _stripe_migration_invoice_settings(value: Mapping[str, Any]) -> dict[str, Any]:
+    result = {"issuer": {"type": value["issuerType"]}}
+    if value["daysUntilDue"] is not None:
+        result["days_until_due"] = value["daysUntilDue"]
+    return result
+
+
+def _stripe_migration_default_settings(value: Mapping[str, Any]) -> dict[str, Any]:
+    result = {
+        "automatic_tax": dict(value["automaticTax"]),
+        "billing_cycle_anchor": value["billingCycleAnchor"],
+        "collection_method": value["collectionMethod"],
+        "invoice_settings": _stripe_migration_invoice_settings(
+            value["invoiceSettings"]
+        ),
+    }
+    if value["billingThresholds"] is not None:
+        result["billing_thresholds"] = _stripe_migration_subscription_thresholds(
+            value["billingThresholds"]
+        )
+    if value["defaultPaymentMethodId"] is not None:
+        result["default_payment_method"] = value["defaultPaymentMethodId"]
+    return result
+
+
+def _stripe_migration_phase(value: Mapping[str, Any]) -> dict[str, Any]:
+    result = {
+        "start_date": value["startDate"],
+        "items": [
+            {
+                "price": item["priceId"],
+                "quantity": item["quantity"],
+                "tax_rates": list(item["taxRateIds"]),
+                "metadata": dict(item["metadata"]),
+                "discounts": [
+                    _stripe_discount(identifier)
+                    for identifier in item["discountIds"]
+                ],
+                **(
+                    {
+                        "billing_thresholds": {
+                            "usage_gte": item["billingThresholds"]["usageGte"]
+                        }
+                    }
+                    if item["billingThresholds"] is not None
+                    else {}
+                ),
+            }
+            for item in value["items"]
+        ],
+        "discounts": [_stripe_discount(identifier) for identifier in value["discountIds"]],
+        "automatic_tax": dict(value["automaticTax"]),
+        "default_tax_rates": list(value["defaultTaxRateIds"]),
+        "collection_method": value["collectionMethod"],
+        "invoice_settings": _stripe_migration_invoice_settings(
+            value["invoiceSettings"]
+        ),
+        "metadata": dict(value["metadata"]),
+        "proration_behavior": value["prorationBehavior"],
+    }
+    if value["billingThresholds"] is not None:
+        result["billing_thresholds"] = _stripe_migration_subscription_thresholds(
+            value["billingThresholds"]
+        )
+    if value["defaultPaymentMethodId"] is not None:
+        result["default_payment_method"] = value["defaultPaymentMethodId"]
+    if "endDate" in value:
+        result["end_date"] = value["endDate"]
+    elif "duration" in value:
+        result["duration"] = {
+            "interval": value["duration"]["interval"],
+            "interval_count": value["duration"]["intervalCount"],
+        }
+    return result
 
 
 def _canonical_event(value, *, event_id, event_type, account, mode):
@@ -1578,8 +2600,9 @@ def _subscription_canonical(value, expected_id):
         "status",
         "currentPeriodEnd",
         "latestInvoiceId",
-        "priceId",
+        "items",
         "pauseCollection",
+        "pendingUpdate",
         "mappingHint",
     }
     if (
@@ -1599,9 +2622,31 @@ def _subscription_canonical(value, expected_id):
         }
         or type(value.get("currentPeriodEnd")) is not int
         or not 0 <= value["currentPeriodEnd"] <= 9_999_999_999
+        or not isinstance(value.get("items"), list)
+        or not 1 <= len(value["items"]) <= 20
     ):
         raise StripeAdapterError("Stripe event is unavailable")
-    _reference(value.get("priceId"))
+    periods = set()
+    item_ids = set()
+    for item in value["items"]:
+        if (
+            not isinstance(item, dict)
+            or set(item)
+            != {"itemId", "priceId", "currentPeriodStart", "currentPeriodEnd"}
+            or type(item.get("currentPeriodStart")) is not int
+            or type(item.get("currentPeriodEnd")) is not int
+            or item["currentPeriodStart"] >= item["currentPeriodEnd"]
+            or item["currentPeriodEnd"] != value["currentPeriodEnd"]
+        ):
+            raise StripeAdapterError("Stripe event is unavailable")
+        _reference(item.get("itemId"))
+        _reference(item.get("priceId"))
+        if item["itemId"] in item_ids:
+            raise StripeAdapterError("Stripe event is unavailable")
+        item_ids.add(item["itemId"])
+        periods.add((item["currentPeriodStart"], item["currentPeriodEnd"]))
+    if len(periods) != 1:
+        raise StripeAdapterError("Stripe event is unavailable")
     if value["latestInvoiceId"] is not None:
         _reference(value["latestInvoiceId"])
     pause = value["pauseCollection"]
@@ -1616,6 +2661,14 @@ def _subscription_canonical(value, expected_id):
                 or not 0 <= pause["resumesAt"] <= 9_999_999_999
             )
         )
+    ):
+        raise StripeAdapterError("Stripe event is unavailable")
+    pending = value["pendingUpdate"]
+    if pending is not None and (
+        not isinstance(pending, dict)
+        or set(pending) != {"expiresAt"}
+        or type(pending.get("expiresAt")) is not int
+        or not 1 <= pending["expiresAt"] <= 9_999_999_999
     ):
         raise StripeAdapterError("Stripe event is unavailable")
     return {
@@ -1649,6 +2702,10 @@ def _subscription_operation_state(value, expected_id):
         "scheduleId",
         "discounts",
         "pauseCollection",
+        "latestInvoice",
+        "pendingUpdate",
+        "automaticTax",
+        "defaultTaxRateIds",
     }
     if (
         not isinstance(value, dict)
@@ -1661,11 +2718,14 @@ def _subscription_operation_state(value, expected_id):
         or not 1 <= len(value["items"]) <= 20
         or any(
             not isinstance(item, dict)
-            or set(item) != {"itemId", "priceId", "quantity"}
+            or set(item) != {"itemId", "priceId", "quantity", "taxRateIds"}
             or type(item["itemId"]) is not str
             or type(item["priceId"]) is not str
             or type(item["quantity"]) is not int
             or item["quantity"] < 1
+            or not isinstance(item["taxRateIds"], list)
+            or len(item["taxRateIds"]) > 20
+            or any(type(rate_id) is not str for rate_id in item["taxRateIds"])
             for item in value["items"]
         )
         or (
@@ -1678,8 +2738,42 @@ def _subscription_operation_state(value, expected_id):
             value.get("pauseCollection") is not None
             and not isinstance(value["pauseCollection"], dict)
         )
+        or (
+            value.get("latestInvoice") is not None
+            and (
+                not isinstance(value["latestInvoice"], dict)
+                or set(value["latestInvoice"])
+                != {"invoiceId", "status", "paymentStatus"}
+                or type(value["latestInvoice"]["invoiceId"]) is not str
+                or value["latestInvoice"]["status"]
+                not in {"draft", "open", "paid", "uncollectible", "void"}
+                or value["latestInvoice"]["paymentStatus"]
+                not in {None, "open", "paid", "canceled"}
+            )
+        )
+        or type(value.get("pendingUpdate")) is not bool
+        or not isinstance(value.get("automaticTax"), dict)
+        or set(value["automaticTax"]) != {"enabled"}
+        or type(value["automaticTax"]["enabled"]) is not bool
+        or not isinstance(value.get("defaultTaxRateIds"), list)
+        or len(value["defaultTaxRateIds"]) > 20
+        or any(type(rate_id) is not str for rate_id in value["defaultTaxRateIds"])
     ):
         raise StripeAdapterError("Stripe subscription is unavailable")
+    for item in value["items"]:
+        _reference(item["itemId"])
+        _reference(item["priceId"])
+        for rate_id in item["taxRateIds"]:
+            _reference(rate_id)
+    _reference(value["customerId"])
+    if value["scheduleId"] is not None:
+        _reference(value["scheduleId"])
+    for discount_id in value["discounts"]:
+        _reference(discount_id)
+    if value["latestInvoice"] is not None:
+        _reference(value["latestInvoice"]["invoiceId"])
+    for rate_id in value["defaultTaxRateIds"]:
+        _reference(rate_id)
     return value
 
 

@@ -29,6 +29,12 @@ try:
     )
     from onboarding import StripeOnboardingService
     from onboarding_state import DynamoOnboardingStateStore, OnboardingStateManager
+    from migration_store import (
+        DynamoMigrationStore,
+        DynamoMigrationStatusStore,
+        DynamoOfferReferenceGuard,
+        SqsMigrationQueue,
+    )
     from providers.stripe_adapter import (
         SecretsManagerStripeClientFactory,
         StripeAdapter,
@@ -36,6 +42,10 @@ try:
     )
     from stripe_commands import StripeCommandService
     from stripe_store import DynamoStripeCommandStore, DynamoStripeWebhookStore
+    from subscription_migrations import (
+        SubscriptionMigrationService,
+        SubscriptionMigrationStatusService,
+    )
 except ModuleNotFoundError:
     from src.common.auth_admin import DynamoAuthStore
     from src.common.published_policy import (
@@ -56,6 +66,12 @@ except ModuleNotFoundError:
     )
     from src.onboarding import StripeOnboardingService
     from src.onboarding_state import DynamoOnboardingStateStore, OnboardingStateManager
+    from src.migration_store import (
+        DynamoMigrationStore,
+        DynamoMigrationStatusStore,
+        DynamoOfferReferenceGuard,
+        SqsMigrationQueue,
+    )
     from src.providers.stripe_adapter import (
         SecretsManagerStripeClientFactory,
         StripeAdapter,
@@ -63,6 +79,10 @@ except ModuleNotFoundError:
     )
     from src.stripe_commands import StripeCommandService
     from src.stripe_store import DynamoStripeCommandStore, DynamoStripeWebhookStore
+    from src.subscription_migrations import (
+        SubscriptionMigrationService,
+        SubscriptionMigrationStatusService,
+    )
 
 
 class RuntimeCompositionError(RuntimeError):
@@ -346,8 +366,89 @@ def stripe_command_runtime() -> dict[str, Any]:
             tax_verifier=PublishedTaxPolicyVerifier(
                 registry_table_name, client=dynamodb_client
             ),
+            reference_guard=DynamoOfferReferenceGuard(
+                registry_table_name, client=dynamodb_client
+            ),
         )
     }
+
+
+def subscription_migration_runtime() -> dict[str, Any]:
+    boto3 = _boto3()
+    registry_table_name = _required("INTEGRATION_REGISTRY_TABLE_NAME")
+    technical_table_name = _required("WEBHOOK_RECEIPT_TABLE_NAME")
+    client = boto3.client("dynamodb")
+    registry = _registry(boto3)
+    return {
+        "service": SubscriptionMigrationService(
+            BindingResolver(registry),
+            DynamoStripeCommandStore(registry_table_name, client=client),
+            DynamoMigrationStore(
+                registry_table_name,
+                technical_table_name,
+                client=client,
+                now_epoch=lambda: int(time.time()),
+            ),
+            SqsMigrationQueue(
+                _required("MIGRATION_WORK_QUEUE_URL"), client=boto3.client("sqs")
+            ),
+            tax_verifier=PublishedTaxPolicyVerifier(
+                registry_table_name, client=client
+            ),
+            now_epoch=lambda: int(time.time()),
+        )
+    }
+
+
+def subscription_migration_status_runtime() -> dict[str, Any]:
+    boto3 = _boto3()
+    registry_table_name = _required("INTEGRATION_REGISTRY_TABLE_NAME")
+    return {
+        "service": SubscriptionMigrationStatusService(
+            BindingResolver(_registry(boto3)),
+            DynamoMigrationStatusStore(
+                registry_table_name, client=boto3.client("dynamodb")
+            ),
+        )
+    }
+
+
+def subscription_migration_worker_runtime() -> Any:
+    try:
+        from handlers.subscription_migration_worker import SubscriptionMigrationWorker
+    except ModuleNotFoundError:
+        from src.handlers.subscription_migration_worker import (
+            SubscriptionMigrationWorker,
+        )
+    import secrets
+
+    boto3 = _boto3()
+    registry_table_name = _required("INTEGRATION_REGISTRY_TABLE_NAME")
+    technical_table_name = _required("WEBHOOK_RECEIPT_TABLE_NAME")
+    client = boto3.client("dynamodb")
+    registry = _registry(boto3)
+    return SubscriptionMigrationWorker(
+        BindingResolver(registry),
+        DynamoStripeCommandStore(registry_table_name, client=client),
+        DynamoMigrationStore(
+            registry_table_name,
+            technical_table_name,
+            client=client,
+            now_epoch=lambda: int(time.time()),
+        ),
+        StripeAdapter(
+            accounts_v2_verified=False,
+            client_factory=SecretsManagerStripeClientFactory(
+                boto3.client("secretsmanager")
+            ),
+        ),
+        SqsMigrationQueue(
+            _required("MIGRATION_WORK_QUEUE_URL"), client=boto3.client("sqs")
+        ),
+        PublishedTaxPolicyVerifier(registry_table_name, client=client),
+        now_epoch=lambda: int(time.time()),
+        jitter=lambda attempt: secrets.randbelow(min(31, max(1, 2**attempt))),
+    )
 
 
 def stripe_webhook_runtime() -> dict[str, Any]:
@@ -383,17 +484,30 @@ def stripe_event_worker_runtime() -> Any:
             boto3.client("secretsmanager")
         ),
     )
+    registry_table_name = _required("INTEGRATION_REGISTRY_TABLE_NAME")
+    technical_table_name = _required("WEBHOOK_RECEIPT_TABLE_NAME")
+    client = boto3.client("dynamodb")
     return StripeEventWorker(
         _registry(boto3),
         DynamoStripeWebhookStore(
-            _required("WEBHOOK_RECEIPT_TABLE_NAME"),
-            client=boto3.client("dynamodb"),
+            technical_table_name,
+            projection_table_name=registry_table_name,
+            client=client,
         ),
         DynamoStripeCommandStore(
-            _required("INTEGRATION_REGISTRY_TABLE_NAME"),
-            client=boto3.client("dynamodb"),
+            registry_table_name,
+            client=client,
         ),
         provider,
+        DynamoMigrationStore(
+            registry_table_name,
+            technical_table_name,
+            client=client,
+            now_epoch=lambda: int(time.time()),
+        ),
+        SqsMigrationQueue(
+            _required("MIGRATION_WORK_QUEUE_URL"), client=boto3.client("sqs")
+        ),
     )
 
 

@@ -10,12 +10,12 @@ PATH = "/internal/v1/stripe/migrations/preview"
 KIND = "migration-preview"
 
 
-def handle_request(event, *, allowed_callers=None):
+def handle_request(event, *, service=None, allowed_callers=None):
     return handle_internal_command(
         event,
         path=PATH,
         kind=KIND,
-        service=UnavailableCommandService(),
+        service=service or UnavailableCommandService(),
         allowed_callers=(
             allowed_callers if allowed_callers is not None else configured_callers()
         ),
@@ -24,4 +24,16 @@ def handle_request(event, *, allowed_callers=None):
 
 def lambda_handler(event, context):
     del context
-    return handle_request(event)
+    try:
+        dependencies = _runtime_dependencies()
+    except Exception:
+        return handle_request(event)
+    return handle_request(event, **dependencies)
+
+
+def _runtime_dependencies():
+    try:
+        from runtime import subscription_migration_runtime
+    except ModuleNotFoundError:
+        from src.runtime import subscription_migration_runtime
+    return subscription_migration_runtime()

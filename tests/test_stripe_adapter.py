@@ -1,3 +1,4 @@
+import copy
 import importlib
 import importlib.util
 import json
@@ -71,6 +72,651 @@ class StripeClient:
 
 
 class StripeAdapterTests(unittest.TestCase):
+    def test_schedule_restore_uses_unique_current_anchor_suffix(self):
+        stripe = stripe_module(self)
+        from tests.test_subscription_migration_domain import snapshot
+
+        class Schedules:
+            def __init__(self):
+                self.calls = []
+
+            def update(self, *args):
+                self.calls.append(args)
+                return {
+                    "id": "sub_sched_synthetic",
+                    "subscription": "sub_synthetic",
+                }
+
+        schedules = Schedules()
+        sdk = stripe.StripeSdkClient(
+            SimpleNamespace(v1=SimpleNamespace(subscription_schedules=schedules))
+        )
+        original = snapshot()["schedule"]
+        anchor = original["phases"][1]["startDate"]
+
+        result = sdk.release_migration_schedule(
+            stripe_account="acct_synthetic",
+            schedule_id="sub_sched_synthetic",
+            subscription_id="sub_synthetic",
+            original_schedule=original,
+            current_phase_anchor=anchor,
+            idempotency_key="migration-key",
+        )
+
+        self.assertEqual(result, {"status": "reverted"})
+        payload = schedules.calls[0][1]
+        self.assertEqual(len(payload["phases"]), 1)
+        self.assertEqual(payload["phases"][0]["start_date"], anchor)
+
+        ambiguous = copy.deepcopy(original)
+        ambiguous["phases"][0]["startDate"] = anchor
+        call_count = len(schedules.calls)
+        with self.assertRaisesRegex(stripe.MigrationNeedsReview, "source-drift"):
+            sdk.release_migration_schedule(
+                stripe_account="acct_synthetic",
+                schedule_id="sub_sched_synthetic",
+                subscription_id="sub_synthetic",
+                original_schedule=ambiguous,
+                current_phase_anchor=anchor,
+                idempotency_key="migration-key-ambiguous",
+            )
+        self.assertEqual(len(schedules.calls), call_count)
+
+    def test_subscription_send_invoice_reads_days_until_due_from_subscription(self):
+        stripe = stripe_module(self)
+        raw = {
+            "id": "sub_send_invoice",
+            "status": "active",
+            "current_period_start": 1_800_000_000,
+            "current_period_end": 1_802_678_400,
+            "collection_method": "send_invoice",
+            "days_until_due": 21,
+            "default_payment_method": None,
+            "items": {
+                "data": [{
+                    "id": "si_send_invoice",
+                    "price": {
+                        "id": "price_old",
+                        "currency": "mxn",
+                        "recurring": {
+                            "interval": "month",
+                            "interval_count": 1,
+                            "usage_type": "licensed",
+                        },
+                    },
+                    "quantity": 1,
+                    "current_period_start": 1_800_000_000,
+                    "current_period_end": 1_802_678_400,
+                    "tax_rates": [],
+                    "billing_thresholds": None,
+                    "discounts": [],
+                    "metadata": {},
+                }],
+                "has_more": False,
+            },
+            "discounts": [],
+            "automatic_tax": {
+                "enabled": False,
+                "liability": None,
+                "disabled_reason": None,
+            },
+            "billing_thresholds": None,
+            "default_tax_rates": [],
+            "invoice_settings": {"issuer": {"type": "self"}},
+            "metadata": {},
+            "pending_update": None,
+            "latest_invoice": None,
+        }
+
+        try:
+            selected = stripe._migration_snapshot_from_stripe(
+                raw,
+                schedule=None,
+                pending_invoice_items={"data": [], "has_more": False},
+            )
+        except stripe.MigrationNeedsReview as error:
+            self.fail(f"top-level days_until_due was not preserved: {error}")
+
+        self.assertEqual(selected["collectionMethod"], "send_invoice")
+        self.assertEqual(selected["invoiceSettings"]["daysUntilDue"], 21)
+
+        legacy = dict(raw)
+        legacy["default_source"] = "src_legacy"
+        with self.assertRaisesRegex(
+            stripe.MigrationNeedsReview, "unsupported-payment-method"
+        ):
+            stripe._migration_snapshot_from_stripe(
+                legacy,
+                schedule=None,
+                pending_invoice_items={"data": [], "has_more": False},
+            )
+
+    def test_schedule_round_trip_preserves_safe_defaults_thresholds_invoice_terms_and_item_discounts(self):
+        stripe = stripe_module(self)
+        raw = {
+            "id": "sub_sched_synthetic",
+            "status": "active",
+            "end_behavior": "release",
+            "current_phase": {
+                "start_date": 1_800_000_000,
+                "end_date": 1_800_001_000,
+            },
+            "default_settings": {
+                "application_fee_percent": None,
+                "automatic_tax": {
+                    "enabled": False,
+                    "liability": None,
+                    "disabled_reason": None,
+                },
+                "billing_cycle_anchor": "automatic",
+                "billing_thresholds": {
+                    "amount_gte": 50_000,
+                    "reset_billing_cycle_anchor": False,
+                },
+                "collection_method": "send_invoice",
+                "default_payment_method": "pm_synthetic",
+                "default_source": None,
+                "description": None,
+                "invoice_settings": {
+                    "issuer": {"type": "self"},
+                    "days_until_due": 15,
+                },
+                "on_behalf_of": None,
+                "transfer_data": None,
+            },
+            "phases": [{
+                "start_date": 1_800_000_000,
+                "end_date": 1_800_001_000,
+                "items": [{
+                    "price": {
+                        "id": "price_old",
+                        "currency": "mxn",
+                        "recurring": {
+                            "interval": "month",
+                            "interval_count": 1,
+                            "usage_type": "licensed",
+                        },
+                    },
+                    "quantity": 2,
+                    "tax_rates": [],
+                    "billing_thresholds": {"usage_gte": 25},
+                    "discounts": [{"id": "di_item_synthetic"}],
+                    "metadata": {},
+                }],
+                "discounts": [],
+                "automatic_tax": None,
+                "billing_cycle_anchor": None,
+                "billing_thresholds": None,
+                "collection_method": None,
+                "default_payment_method": None,
+                "default_tax_rates": [],
+                "description": None,
+                "invoice_settings": None,
+                "metadata": {},
+                "proration_behavior": "none",
+            }],
+        }
+
+        selected = stripe._migration_schedule_from_stripe(raw)
+
+        self.assertEqual(selected["defaultSettings"]["collectionMethod"], "send_invoice")
+        self.assertEqual(selected["defaultSettings"]["invoiceSettings"]["daysUntilDue"], 15)
+        self.assertEqual(selected["phases"][0]["billingThresholds"]["amountGte"], 50_000)
+        self.assertEqual(selected["phases"][0]["items"][0]["billingThresholds"], {"usageGte": 25})
+        self.assertEqual(selected["phases"][0]["items"][0]["discountIds"], ["di_item_synthetic"])
+        encoded_phase = stripe._stripe_migration_phase(selected["phases"][0])
+        self.assertEqual(encoded_phase["invoice_settings"]["days_until_due"], 15)
+        self.assertEqual(encoded_phase["billing_thresholds"]["amount_gte"], 50_000)
+        self.assertEqual(encoded_phase["items"][0]["billing_thresholds"], {"usage_gte": 25})
+        self.assertEqual(encoded_phase["items"][0]["discounts"], [{"discount": "di_item_synthetic"}])
+        encoded_defaults = stripe._stripe_migration_default_settings(
+            selected["defaultSettings"]
+        )
+        self.assertEqual(encoded_defaults["collection_method"], "send_invoice")
+        self.assertEqual(encoded_defaults["invoice_settings"]["days_until_due"], 15)
+
+        raw["phases"][0]["description"] = "customer content"
+        with self.assertRaises(stripe.MigrationNeedsReview):
+            stripe._migration_schedule_from_stripe(raw)
+
+    def test_schedule_create_update_partial_failure_preserves_id_for_safe_restart(self):
+        stripe = stripe_module(self)
+        from src.subscription_migrations import build_next_renewal_plan
+        from tests.test_subscription_migration_domain import snapshot
+
+        class Throttled(RuntimeError):
+            http_status = 503
+
+        class Schedules:
+            def __init__(self):
+                self.create_calls = []
+                self.update_calls = []
+                self.fail = True
+                self.invalid_response = False
+
+            def create(self, *args):
+                self.create_calls.append(args)
+                return {
+                    "id": "sub_sched_partial",
+                    "subscription": "sub_synthetic",
+                }
+
+            def update(self, *args):
+                self.update_calls.append(args)
+                if self.fail:
+                    raise Throttled("synthetic")
+                if self.invalid_response:
+                    return {"id": "sub_sched_unexpected", "subscription": "sub_synthetic"}
+                return {
+                    "id": "sub_sched_partial",
+                    "subscription": "sub_synthetic",
+                }
+
+        schedules = Schedules()
+        sdk = stripe.StripeSdkClient(
+            SimpleNamespace(v1=SimpleNamespace(subscription_schedules=schedules))
+        )
+        selected = snapshot()
+        selected["schedule"] = None
+        plan = build_next_renewal_plan(selected, "price_old", "price_new")
+
+        with self.assertRaises(stripe.StripeMigrationPartialError) as caught:
+            sdk.apply_next_renewal_migration(
+                stripe_account="acct_synthetic",
+                subscription_id="sub_synthetic",
+                plan=plan,
+                existing_schedule_id=None,
+                idempotency_key="migration-key",
+            )
+        self.assertEqual(caught.exception.schedule_id, "sub_sched_partial")
+        self.assertTrue(caught.exception.retryable)
+
+        schedules.fail = False
+        result = sdk.apply_next_renewal_migration(
+            stripe_account="acct_synthetic",
+            subscription_id="sub_synthetic",
+            plan=plan,
+            existing_schedule_id=caught.exception.schedule_id,
+            idempotency_key="migration-key",
+        )
+        self.assertEqual(result["scheduleId"], "sub_sched_partial")
+        self.assertEqual(len(schedules.create_calls), 1)
+        self.assertEqual(len(schedules.update_calls), 2)
+
+        schedules.invalid_response = True
+        with self.assertRaises(stripe.StripeMigrationPartialError) as invalid:
+            sdk.apply_next_renewal_migration(
+                stripe_account="acct_synthetic",
+                subscription_id="sub_synthetic",
+                plan=plan,
+                existing_schedule_id="sub_sched_partial",
+                idempotency_key="migration-key-invalid-response",
+            )
+        self.assertEqual(invalid.exception.schedule_id, "sub_sched_partial")
+        self.assertFalse(invalid.exception.retryable)
+
+    def test_migration_sdk_uses_real_invoice_items_surface_and_exact_mutations(self):
+        stripe = stripe_module(self)
+
+        class Resource:
+            def __init__(self, *, retrieved=None, listed=None, created=None, updated=None, preview=None, released=None):
+                self.retrieved = retrieved
+                self.listed = listed
+                self.created = created
+                self.updated = updated
+                self.preview = preview
+                self.released = released
+                self.calls = []
+
+            def retrieve(self, *args):
+                self.calls.append(("retrieve", args))
+                return self.retrieved
+
+            def list(self, *args):
+                self.calls.append(("list", args))
+                return self.listed
+
+            def create(self, *args):
+                self.calls.append(("create", args))
+                return self.created
+
+            def update(self, *args):
+                self.calls.append(("update", args))
+                return self.updated
+
+            def create_preview(self, *args):
+                self.calls.append(("create_preview", args))
+                return self.preview
+
+            def release(self, *args):
+                self.calls.append(("release", args))
+                return self.released
+
+        raw_subscription = {
+            "id": "sub_synthetic01",
+            "customer": "cus_synthetic01",
+            "status": "active",
+            "current_period_start": 1_800_000_000,
+            "current_period_end": 1_802_678_400,
+            "collection_method": "charge_automatically",
+            "default_payment_method": {"id": "pm_synthetic01", "type": "card"},
+            "items": {
+                "data": [{
+                    "id": "si_synthetic01",
+                    "price": {
+                        "id": "price_old",
+                        "currency": "mxn",
+                        "recurring": {
+                            "interval": "month",
+                            "interval_count": 1,
+                            "usage_type": "licensed",
+                        },
+                    },
+                    "quantity": 2,
+                    "current_period_start": 1_800_000_000,
+                    "current_period_end": 1_802_678_400,
+                    "tax_rates": [],
+                    "billing_thresholds": {"usage_gte": 25},
+                    "discounts": [{"id": "di_item_synthetic"}],
+                    "metadata": {"resource_id": "offer-old"},
+                }],
+                "has_more": False,
+            },
+            "schedule": None,
+            "discounts": [],
+            "automatic_tax": {"enabled": True},
+            "default_tax_rates": [],
+            "invoice_settings": {"issuer": {"type": "self"}},
+            "metadata": {"order_id": "order-1"},
+            "pending_update": None,
+            "latest_invoice": {
+                "id": "in_synthetic01",
+                "status": "paid",
+                "payments": {
+                    "data": [{"is_default": True, "status": "paid"}],
+                    "has_more": False,
+                },
+            },
+        }
+        subscriptions = Resource(
+            retrieved=raw_subscription,
+            listed={"data": [raw_subscription], "has_more": False},
+            updated={
+                "id": "sub_synthetic01",
+                "pending_update": {"expires_at": 1_800_001_000},
+                "latest_invoice": {
+                    "hosted_invoice_url": "https://invoice.stripe.com/i/synthetic",
+                    "payments": {
+                        "data": [{
+                            "is_default": True,
+                            "status": "open",
+                            "payment": {
+                                "type": "payment_intent",
+                                "payment_intent": {
+                                    "id": "pi_synthetic01",
+                                    "status": "requires_action",
+                                    "next_action": {"type": "use_stripe_sdk"},
+                                    "client_secret": "must-never-be-returned",
+                                },
+                            },
+                        }],
+                        "has_more": False,
+                    }
+                },
+            },
+        )
+        invoice_items = Resource(listed={"data": [], "has_more": False})
+        invoices = Resource(
+            preview={
+                "lines": {
+                    "data": [
+                        {"amount": -500, "proration": True, "subscription_item": "si_synthetic01"},
+                        {"amount": 1500, "parent": {"subscription_item_details": {"proration": True, "subscription_item": "si_synthetic01"}}},
+                        {"amount": 100_000, "proration": False},
+                    ],
+                    "has_more": False,
+                }
+            }
+        )
+        schedules = Resource(
+            created={"id": "sub_sched_synthetic01", "subscription": "sub_synthetic01"},
+            updated={"id": "sub_sched_synthetic01", "subscription": "sub_synthetic01"},
+            released={"id": "sub_sched_synthetic01", "released_subscription": "sub_synthetic01"},
+        )
+        client = SimpleNamespace(
+            v1=SimpleNamespace(
+                subscriptions=subscriptions,
+                invoice_items=invoice_items,
+                invoices=invoices,
+                subscription_schedules=schedules,
+            )
+        )
+        sdk = stripe.StripeSdkClient(client)
+
+        listed = sdk.list_migration_candidates(
+            stripe_account="acct_synthetic",
+            source_price_id="price_old",
+            cursor=None,
+        )
+        self.assertEqual(listed, {"subscriptionIds": ["sub_synthetic01"], "nextCursor": None})
+        selected = sdk.retrieve_migration_snapshot(
+            stripe_account="acct_synthetic", subscription_id="sub_synthetic01"
+        )
+        self.assertEqual(selected["items"][0]["priceId"], "price_old")
+        self.assertEqual(selected["items"][0]["billingThresholds"], {"usageGte": 25})
+        self.assertEqual(selected["items"][0]["discountIds"], ["di_item_synthetic"])
+        self.assertEqual(invoice_items.calls[0][0], "list")
+
+        preview = sdk.preview_migration_proration(
+            stripe_account="acct_synthetic",
+            subscription_id="sub_synthetic01",
+            item_id="si_synthetic01",
+            quantity=2,
+            source_price_id="price_old",
+            target_price_id="price_new",
+            proration_timestamp=1_800_000_100,
+        )
+        self.assertEqual(preview["amountMinor"], 1000)
+        preview_params = invoices.calls[-1][1][0]["subscription_details"]
+        self.assertEqual(
+            preview_params["items"],
+            [{"id": "si_synthetic01", "price": "price_new", "quantity": 2}],
+        )
+
+        immediate = sdk.apply_immediate_migration(
+            stripe_account="acct_synthetic",
+            plan={
+                "subscriptionId": "sub_synthetic01",
+                "itemId": "si_synthetic01",
+                "priceId": "price_new",
+                "quantity": 2,
+                "prorationTimestamp": 1_800_000_100,
+                "prorationBehavior": "always_invoice",
+                "paymentBehavior": "pending_if_incomplete",
+            },
+            idempotency_key="migration-key",
+        )
+        self.assertEqual(immediate, {"status": "pending_customer_action"})
+        self.assertNotIn("must-never-be-returned", repr(immediate))
+        immediate_params = subscriptions.calls[-1][1][1]
+        self.assertEqual(immediate_params["proration_date"], 1_800_000_100)
+        self.assertEqual(
+            immediate_params["expand"],
+            ["latest_invoice.payments.data.payment.payment_intent"],
+        )
+
+        subscriptions.updated["latest_invoice"]["hosted_invoice_url"] = None
+        with self.assertRaisesRegex(stripe.MigrationNeedsReview, "payment-failed"):
+            sdk.apply_immediate_migration(
+                stripe_account="acct_synthetic",
+                plan={
+                    "subscriptionId": "sub_synthetic01",
+                    "itemId": "si_synthetic01",
+                    "priceId": "price_new",
+                    "quantity": 2,
+                    "prorationTimestamp": 1_800_000_100,
+                    "prorationBehavior": "always_invoice",
+                    "paymentBehavior": "pending_if_incomplete",
+                },
+                idempotency_key="migration-key-recovery-missing",
+            )
+        subscriptions.updated["latest_invoice"]["hosted_invoice_url"] = (
+            "https://invoice.stripe.com/i/synthetic"
+        )
+
+        plan = {
+            "scheduleId": None,
+            "defaultSettings": None,
+            "endBehavior": "release",
+            "prorationBehavior": "none",
+            "phases": [{
+                "startDate": 1_800_000_000,
+                "endDate": 1_802_678_400,
+                "items": [{
+                    "priceId": "price_old",
+                    "quantity": 2,
+                    "taxRateIds": [],
+                    "billingThresholds": None,
+                    "discountIds": [],
+                    "metadata": {},
+                    "priceConfiguration": {"currency": "MXN", "recurring": {"interval": "month", "intervalCount": 1, "usageType": "licensed"}},
+                }],
+                "discountIds": [],
+                "automaticTax": {"enabled": True},
+                "billingThresholds": None,
+                "defaultTaxRateIds": [],
+                "collectionMethod": "charge_automatically",
+                "defaultPaymentMethodId": "pm_synthetic01",
+                "invoiceSettings": {"issuerType": "self", "daysUntilDue": None},
+                "metadata": {},
+                "prorationBehavior": "none",
+            }],
+        }
+        scheduled = sdk.apply_next_renewal_migration(
+            stripe_account="acct_synthetic",
+            subscription_id="sub_synthetic01",
+            plan=plan,
+            idempotency_key="migration-key",
+        )
+        self.assertEqual(scheduled["scheduleId"], "sub_sched_synthetic01")
+        create_key = schedules.calls[-2][1][-1]["idempotency_key"]
+        update_key = schedules.calls[-1][1][-1]["idempotency_key"]
+        self.assertNotEqual(create_key, update_key)
+        self.assertNotIn("priceConfiguration", repr(schedules.calls[-1]))
+        self.assertEqual(schedules.calls[-1][1][1]["proration_behavior"], "none")
+
+        self.assertEqual(
+            sdk.release_migration_schedule(
+                stripe_account="acct_synthetic",
+                schedule_id="sub_sched_synthetic01",
+                subscription_id="sub_synthetic01",
+                original_schedule=None,
+                idempotency_key="migration-key",
+            ),
+            {"status": "reverted"},
+        )
+
+    def test_migration_provider_retryability_and_unsupported_data_fail_closed(self):
+        stripe = stripe_module(self)
+
+        class Throttled(RuntimeError):
+            http_status = 429
+
+        class Client(StripeClient):
+            def list_migration_candidates(self, **kwargs):
+                del kwargs
+                raise Throttled("synthetic")
+
+        with self.assertRaises(stripe.StripeAdapterRetryable):
+            stripe.StripeAdapter(Client(), accounts_v2_verified=False).list_migration_candidates(
+                resolved(), "price_old", None
+            )
+
+        raw = {
+            "transfer_data": {"destination": "acct_other"},
+            "items": {"data": [], "has_more": False},
+            "collection_method": "charge_automatically",
+        }
+        with self.assertRaises(stripe.MigrationNeedsReview):
+            stripe._migration_snapshot_from_stripe(
+                raw, schedule=None, pending_invoice_items={"data": [], "has_more": False}
+            )
+
+        class InvalidPages:
+            def __init__(self, response):
+                self.response = response
+
+            def list(self, *args):
+                return self.response
+
+        sdk = stripe.StripeSdkClient(
+            SimpleNamespace(
+                v1=SimpleNamespace(
+                    subscriptions=InvalidPages({"data": [], "has_more": True})
+                )
+            )
+        )
+        with self.assertRaises(stripe.StripeAdapterError):
+            sdk.list_migration_candidates(
+                stripe_account="acct_synthetic",
+                source_price_id="price_old",
+                cursor="sub_same",
+            )
+        sdk.client.v1.subscriptions.response = {
+            "data": [{"id": "sub_same"}],
+            "has_more": True,
+        }
+        with self.assertRaises(stripe.StripeAdapterError):
+            sdk.list_migration_candidates(
+                stripe_account="acct_synthetic",
+                source_price_id="price_old",
+                cursor="sub_same",
+            )
+
+    def test_subscription_facade_accepts_the_complete_sdk_operation_state(self):
+        stripe = stripe_module(self)
+
+        class Client(StripeClient):
+            def retrieve_subscription_operation_state(self, **kwargs):
+                self.calls.append(("subscription-state", kwargs))
+                return {
+                    "subscriptionId": "sub_synthetic01",
+                    "customerId": "cus_synthetic01",
+                    "status": "active",
+                    "items": [{
+                        "itemId": "si_synthetic01",
+                        "priceId": "price_synthetic01",
+                        "quantity": 2,
+                        "taxRateIds": ["txr_synthetic01"],
+                    }],
+                    "scheduleId": None,
+                    "discounts": [],
+                    "pauseCollection": None,
+                    "latestInvoice": {
+                        "invoiceId": "in_synthetic01",
+                        "status": "paid",
+                        "paymentStatus": "paid",
+                    },
+                    "pendingUpdate": False,
+                    "automaticTax": {"enabled": True},
+                    "defaultTaxRateIds": [],
+                }
+
+        client = Client()
+        state = stripe.StripeAdapter(
+            client, accounts_v2_verified=False
+        ).retrieve_subscription_operation_state(resolved(), "sub_synthetic01")
+
+        self.assertEqual(state["items"][0]["taxRateIds"], ["txr_synthetic01"])
+        self.assertEqual(state["latestInvoice"]["paymentStatus"], "paid")
+        self.assertEqual(
+            client.calls,
+            [("subscription-state", {
+                "stripe_account": "acct_synthetic",
+                "subscription_id": "sub_synthetic01",
+            })],
+        )
+
     def test_client_factory_accepts_only_structured_platform_secret_and_bounded_retry_client(
         self,
     ):
@@ -283,8 +929,14 @@ class StripeAdapterTests(unittest.TestCase):
                     "status": "active",
                     "currentPeriodEnd": 1_900_000_000,
                     "latestInvoiceId": "in_synthetic01",
-                    "priceId": "price_synthetic01",
+                    "items": [{
+                        "itemId": "si_synthetic01",
+                        "priceId": "price_synthetic01",
+                        "currentPeriodStart": 1_800_000_000,
+                        "currentPeriodEnd": 1_900_000_000,
+                    }],
                     "pauseCollection": None,
+                    "pendingUpdate": None,
                     "mappingHint": "attempt-1",
                 }
 
@@ -618,6 +1270,8 @@ class StripeAdapterTests(unittest.TestCase):
                                 "id": "si_synthetic01",
                                 "price": "price_synthetic01",
                                 "quantity": 2,
+                                "current_period_start": 1_800_000_000,
+                                "current_period_end": 1_900_000_000,
                                 "tax_rates": [],
                             }
                         ]

@@ -5,6 +5,15 @@ from src.registry import _serialize
 from tests.test_registry import connection, scope
 
 
+def subscription_items(price_id="price_synthetic01"):
+    return [{
+        "itemId": "si_synthetic01",
+        "priceId": price_id,
+        "currentPeriodStart": 1_800_000_000,
+        "currentPeriodEnd": 1_900_000_000,
+    }]
+
+
 def stream_record(sequence, *, event_id=None):
     item = {
         "pk": "ENV#test#TENANT#tenant-example#DRAFT#draft-example",
@@ -58,7 +67,6 @@ class StripeEventWorkerTests(unittest.TestCase):
             },
             worker=worker,
         )
-
         self.assertEqual(worker.calls, [("evt-101", "101"), ("evt-102", "102")])
         self.assertEqual(
             response,
@@ -69,6 +77,111 @@ class StripeEventWorkerTests(unittest.TestCase):
                 ]
             },
         )
+
+    def test_pending_update_event_reconciles_imported_migration_without_checkout_projection(self):
+        module = self.module()
+
+        class Store:
+            def __init__(self):
+                self.completed = []
+
+            def claim_ingress(self, **kwargs):
+                return {"processingRevision": 2}
+
+            def receipt(self, selected_scope, receipt_id):
+                return {
+                    "scope": selected_scope,
+                    "receiptId": receipt_id,
+                    "connectionId": "stripe-primary",
+                    "provider": "stripe",
+                    "mode": "test",
+                    "eventType": "customer.subscription.pending_update_applied",
+                    "accountHash": hashlib.sha256(b"acct_synthetic").hexdigest(),
+                    "payloadHash": "b" * 64,
+                    "status": "processing",
+                    "revision": 2,
+                    "decisionCode": "processing",
+                    "eventCreatedAt": 1_799_999_995,
+                    "receivedAt": 1_800_000_000,
+                    "expiresAt": 1_800_000_000 + 90 * 24 * 60 * 60,
+                }
+
+            def complete_ingress(self, **kwargs):
+                self.completed.append(kwargs)
+
+        class Registry:
+            def connection(self, selected_scope, connection_id):
+                return connection()
+
+        class Provider:
+            def retrieve_webhook_state(self, *args):
+                return {
+                    "eventId": "evt-pending-applied",
+                    "eventType": "customer.subscription.pending_update_applied",
+                    "eventCreatedAt": 1_799_999_995,
+                    "mode": "test",
+                    "accountHash": hashlib.sha256(b"acct_synthetic").hexdigest(),
+                    "objectType": "subscription",
+                    "objectId": "sub_synthetic01",
+                    "mappingHint": None,
+                    "canonical": {
+                        "subscriptionId": "sub_synthetic01",
+                        "status": "active",
+                        "currentPeriodEnd": 1_900_000_000,
+                        "latestInvoiceId": "in_synthetic01",
+                        "items": subscription_items("price_new"),
+                        "pauseCollection": None,
+                        "pendingUpdate": None,
+                    },
+                }
+
+        class Mappings:
+            def object_owner(self, selected_scope, connection_id, object_type, provider_id):
+                if object_type == "subscription":
+                    return {
+                        "resourceType": "migration-subscription",
+                        "resourceId": "migration-subscription-synthetic",
+                    }
+                raise AssertionError("price projection is forbidden for imported migration")
+
+        class MigrationStore:
+            def __init__(self):
+                self.calls = []
+
+            def reconcile_migration_webhook(self, **kwargs):
+                self.calls.append(kwargs)
+                return {
+                    "jobId": "migration-job-1",
+                    "revision": 4,
+                    "state": "applied",
+                    "enqueue": True,
+                    "workDelaySeconds": 0,
+                }
+
+        class Queue:
+            def __init__(self):
+                self.calls = []
+
+            def send(self, message, *, delay_seconds=0):
+                self.calls.append((message, delay_seconds))
+
+        store, migration_store, queue = Store(), MigrationStore(), Queue()
+        worker = module.StripeEventWorker(
+            Registry(), store, Mappings(), Provider(), migration_store, queue
+        )
+        record = module._ingress_record(
+            stream_record("101", event_id="evt-pending-applied")
+        )
+
+        worker.process(record, "101")
+
+        self.assertEqual(
+            migration_store.calls[0]["priceIds"], ["price_new"]
+        )
+        self.assertEqual(queue.calls[0][0]["action"], "reconcile")
+        self.assertEqual(queue.calls[0][0]["revision"], 4)
+        self.assertEqual(store.completed[0]["decision_code"], "processed")
+        self.assertEqual(store.completed[0]["envelopes"], [])
 
     def test_successful_batch_returns_no_failures(self):
         worker = Worker()
@@ -328,8 +441,9 @@ class StripeEventWorkerTests(unittest.TestCase):
                         "status": "active",
                         "currentPeriodEnd": 1_900_000_000,
                         "latestInvoiceId": "in_synthetic01",
-                        "priceId": "price_synthetic01",
+                        "items": subscription_items(),
                         "pauseCollection": None,
+                        "pendingUpdate": None,
                     },
                 }
 
@@ -345,6 +459,7 @@ class StripeEventWorkerTests(unittest.TestCase):
                         "resourceType": "offer",
                         "resourceId": self.offer_id,
                         "priceId": "price_synthetic01",
+                        "status": "active",
                     }
                 return None
 
@@ -449,6 +564,89 @@ class StripeEventWorkerTests(unittest.TestCase):
         )
         self.assertEqual(mapping["paymentAttemptId"], "attempt-1")
         self.assertEqual(mappings.lookup[2:], ("checkout", "attempt-1"))
+
+    def test_migration_overlay_never_authorizes_target_after_rollback_or_review(self):
+        module = self.module()
+
+        class Mappings:
+            owners = {
+                "price_old": "offer-old",
+                "price_new": "offer-new",
+                "price_addon": "offer-addon",
+            }
+
+            def object_owner(self, selected_scope, connection_id, kind, price_id):
+                del selected_scope, connection_id
+                if kind != "price" or price_id not in self.owners:
+                    return None
+                return {
+                    "resourceType": "offer",
+                    "resourceId": self.owners[price_id],
+                    "priceId": price_id,
+                    "status": "active",
+                }
+
+        class MigrationStore:
+            def __init__(self):
+                self.allowed = ["offer-old", "offer-addon"]
+
+            def active_migration(self, *args):
+                del args
+                return {
+                    "sourcePriceId": "price_old",
+                    "targetPriceId": "price_new",
+                    "sourceOfferVersionId": "offer-old",
+                    "targetOfferVersionId": "offer-new",
+                    "offerVersionIds": self.allowed,
+                }
+
+        migration_store = MigrationStore()
+        worker = module.StripeEventWorker(
+            object(), object(), Mappings(), object(), migration_store
+        )
+        checkout = {
+            "offerVersionIds": ["offer-old", "offer-addon"],
+            "primaryOfferVersionId": "offer-old",
+        }
+        state = {
+            "objectType": "subscription",
+            "canonical": {
+                "subscriptionId": "sub_synthetic01",
+                "items": [
+                    {"priceId": "price_new"},
+                    {"priceId": "price_addon"},
+                ],
+            },
+        }
+
+        self.assertIsNone(
+            worker._subscription_primary_offer(
+                scope(), "stripe-primary", state, checkout
+            )
+        )
+        migration_store.allowed = ["offer-old", "offer-addon", "offer-new"]
+        self.assertEqual(
+            worker._subscription_primary_offer(
+                scope(), "stripe-primary", state, checkout
+            ),
+            "offer-new",
+        )
+        migration_store.allowed = ["offer-addon", "offer-new"]
+        source_state = {
+            **state,
+            "canonical": {
+                **state["canonical"],
+                "items": [
+                    {"priceId": "price_old"},
+                    {"priceId": "price_addon"},
+                ],
+            },
+        }
+        self.assertIsNone(
+            worker._subscription_primary_offer(
+                scope(), "stripe-primary", source_state, checkout
+            )
+        )
 
     def test_pause_collection_does_not_invent_a_paused_commerce_status(self):
         normalized = self.module()._subscription_status(
@@ -561,8 +759,9 @@ class StripeEventWorkerTests(unittest.TestCase):
                     "status": "active",
                     "currentPeriodEnd": 1_900_000_000,
                     "latestInvoiceId": "in_synthetic01",
-                    "priceId": "price_synthetic01",
+                    "items": subscription_items(),
                     "pauseCollection": {"behavior": "void"},
+                    "pendingUpdate": None,
                 },
             },
             mapping,
@@ -609,8 +808,9 @@ class StripeEventWorkerTests(unittest.TestCase):
             "status": "active",
             "currentPeriodEnd": 1_900_000_000,
             "latestInvoiceId": "in_synthetic01",
-            "priceId": "price_synthetic01",
+            "items": subscription_items(),
             "pauseCollection": None,
+            "pendingUpdate": None,
         }
 
         events, decision, _ = module._normalized_events(
@@ -641,7 +841,7 @@ class StripeEventWorkerTests(unittest.TestCase):
             ["commerce.subscription.updated.v1"],
         )
 
-    def test_all_eleven_allowed_stripe_events_map_only_to_four_commerce_contracts(self):
+    def test_all_eleven_commerce_facing_events_map_only_to_four_contracts(self):
         module = self.module()
         selected_scope = scope()
         mapping = {
@@ -696,8 +896,9 @@ class StripeEventWorkerTests(unittest.TestCase):
             "status": "active",
             "currentPeriodEnd": 1_900_000_000,
             "latestInvoiceId": "in_synthetic01",
-            "priceId": "price_synthetic01",
+            "items": subscription_items(),
             "pauseCollection": None,
+            "pendingUpdate": None,
         }
         subscription_past_due = {
             **subscription_active,

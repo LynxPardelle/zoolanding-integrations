@@ -577,6 +577,16 @@ class Provider:
         }
 
 
+class ReferenceGuard:
+    def __init__(self, decision=True):
+        self.decision = decision
+        self.calls = []
+
+    def can_deactivate(self, scope, connection_id, offer_version_id, price_id):
+        self.calls.append((scope, connection_id, offer_version_id, price_id))
+        return self.decision
+
+
 class Routes:
     def resolve(self, scope):
         self.scope = scope
@@ -610,6 +620,7 @@ class StripeCommandTests(unittest.TestCase):
         self.resolver = Resolver()
         self.routes = Routes()
         self.tax_verifier = TaxVerifier()
+        self.reference_guard = ReferenceGuard()
         self.service = StripeCommandService(
             self.resolver,
             self.store,
@@ -617,6 +628,7 @@ class StripeCommandTests(unittest.TestCase):
             self.routes,
             now_epoch=lambda: self.now,
             tax_verifier=self.tax_verifier,
+            reference_guard=self.reference_guard,
         )
 
     def seed_subscription(self):
@@ -1484,6 +1496,33 @@ class StripeCommandTests(unittest.TestCase):
         )
         self.assertEqual(mapping["presentationRevision"], 1)
         self.assertEqual(mapping["status"], "inactive")
+
+    def test_offer_deactivation_keeps_provider_price_for_existing_and_reverse_migrations(self):
+        self.provision_offer()
+        self.reference_guard.decision = False
+        payload = offer_command()
+        lifecycle = {"targetState": "retired"}
+        content_hash = canonical_hash(1, lifecycle)
+        payload["input"] = {
+            "operation": "deactivate",
+            "resourceId": "offer-v1",
+            "revision": 2,
+            "schemaVersion": 1,
+            "snapshot": lifecycle,
+            "contentHash": content_hash,
+        }
+        payload["idempotencyKey"] = integration_key(
+            payload["scope"], "stripe-primary", "deactivate", "offer-v1", 2, content_hash
+        )
+
+        result = self.service.execute("offer", command("offer", payload))
+
+        self.assertEqual(result["status"], "accepted")
+        self.assertFalse(any(call[0] == "deactivate-offer" for call in self.provider.calls))
+        mapping = self.store.get_mapping(
+            resolved().connection.scope, "stripe-primary", "offer", "offer-v1"
+        )
+        self.assertEqual(mapping["status"], "existing_only")
 
     def test_discount_maps_coupon_and_promotion_code_and_casefolds_active_uniqueness(
         self,

@@ -18,6 +18,7 @@ except ModuleNotFoundError:
 
 _SAFE_ID = re.compile(r"[a-z0-9][a-z0-9._-]{0,63}", re.ASCII)
 _HASH = re.compile(r"[a-f0-9]{64}", re.ASCII)
+_MIGRATION_ITEM_ID = re.compile(r"migration-item-[a-f0-9]{40}", re.ASCII)
 _CURRENCY = re.compile(r"[A-Z]{3}", re.ASCII)
 _COUPON_CODE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}", re.ASCII)
 _COUNTRY = re.compile(r"[A-Z]{2}", re.ASCII)
@@ -51,6 +52,62 @@ _DERIVED_IDEMPOTENCY_KINDS = frozenset(
         "subscription-discount",
         "subscription-pause",
         "customer-portal",
+        "migration-preview",
+        "migration-execute",
+        "migration-control",
+    }
+)
+_MIGRATION_JOB_STATES = frozenset(
+    {
+        "draft",
+        "previewing",
+        "awaiting_approval",
+        "scheduled",
+        "running",
+        "paused",
+        "cancel_requested",
+        "canceling",
+        "completed",
+        "completed_with_errors",
+        "canceled",
+    }
+)
+_MIGRATION_ITEM_STATES = frozenset(
+    {
+        "pending",
+        "applying",
+        "pending_payment",
+        "pending_customer_action",
+        "pending_update_applied",
+        "pending_update_expired",
+        "applied",
+        "reverted",
+        "skipped",
+        "retryable_failure",
+        "needs_review",
+        "permanent_failure",
+    }
+)
+_MIGRATION_REASON_CODES = frozenset(
+    {
+        "ambiguous-price",
+        "near-term-schedule",
+        "nonpositive-proration",
+        "payment-failed",
+        "pending-invoice-items",
+        "pending-update",
+        "phase-limit",
+        "provider-unknown",
+        "retry-exhausted",
+        "scope-mismatch",
+        "snapshot-too-large",
+        "source-drift",
+        "tax-approval",
+        "unmapped-price",
+        "unpaid-invoice",
+        "unsupported-collection-mode",
+        "unsupported-payment-method",
+        "unsupported-schedule",
     }
 )
 
@@ -178,6 +235,19 @@ def validate_service_result(
 ) -> dict[str, Any]:
     command = expected if type(expected) is InternalCommand else None
     expected_command_id = command.command_id if command is not None else expected
+    if command is not None and command.kind == "migration-status":
+        return _migration_status_result(value, command)
+    if command is not None and command.kind.startswith("migration-"):
+        result = _closed(value, {"commandId", "status", "jobId", "revision"})
+        if (
+            result["commandId"] != expected_command_id
+            or result["status"] not in {"accepted", "pending", "needs_review"}
+            or result["jobId"] != command.input.get("jobId", result["jobId"])
+        ):
+            raise ContractError("command result is invalid")
+        _id(result["jobId"])
+        _positive_int(result["revision"])
+        return dict(result)
     if command is not None and command.kind == "checkout-status":
         result = _closed(value, {"orderId", "paymentAttemptId", "revision", "status"})
         if (
@@ -496,15 +566,35 @@ def _operation_input(kind: str, value: object) -> dict[str, Any]:
             set(),
         ),
         "migration-preview": (
-            {"sourceOfferVersionId", "targetOfferVersionId", "commercialRequestId"},
+            {
+                "commercialRequestId",
+                "sourceOffer",
+                "targetOffer",
+                "requestedPolicy",
+                "candidateScope",
+                "canarySize",
+                "accountConcurrency",
+            },
             set(),
         ),
         "migration-execute": (
-            {"jobId", "dryRunRevision", "dryRunHash", "confirmation"},
+            {
+                "commercialRequestId",
+                "jobId",
+                "dryRunRevision",
+                "dryRunHash",
+                "confirmation",
+            },
             set(),
         ),
-        "migration-control": ({"jobId", "expectedRevision", "action"}, set()),
-        "migration-status": ({"jobId"}, set()),
+        "migration-control": (
+            {"commercialRequestId", "jobId", "expectedRevision", "action"},
+            set(),
+        ),
+        "migration-status": (
+            {"commercialRequestId", "jobId"},
+            {"limit", "cursor"},
+        ),
         "connection-resolve": ({"provider", "capability"}, set()),
     }
     if kind not in specifications:
@@ -536,6 +626,36 @@ def _operation_input(kind: str, value: object) -> dict[str, Any]:
         if item["action"] not in {"pause", "resume"}:
             raise ContractError("subscription pause action is invalid")
         _pause_policy(item["pausePolicy"])
+    elif kind == "migration-preview":
+        source = _migration_offer(item["sourceOffer"])
+        target = _migration_offer(item["targetOffer"])
+        if (
+            source["offerVersionId"] == target["offerVersionId"]
+            or source["snapshot"]["currency"] != target["snapshot"]["currency"]
+            or source["snapshot"]["recurrence"] != target["snapshot"]["recurrence"]
+        ):
+            raise ContractError("migration offer pair is invalid")
+        item["sourceOffer"] = source
+        item["targetOffer"] = target
+        policy = _closed(item["requestedPolicy"], {"mode"})
+        if policy["mode"] not in {"next_renewal", "immediate_prorated"}:
+            raise ContractError("migration policy is invalid")
+        candidate_scope = _closed(item["candidateScope"], {"kind"})
+        if candidate_scope["kind"] != "all_matching_source_price":
+            raise ContractError("migration scope is invalid")
+        if not 1 <= _positive_int(item["canarySize"]) <= 25:
+            raise ContractError("migration canary is invalid")
+        if not 1 <= _positive_int(item["accountConcurrency"]) <= 5:
+            raise ContractError("migration concurrency is invalid")
+    elif kind == "migration-control":
+        action = item["action"]
+        if action not in {"pause", "resume", "cancel"}:
+            raise ContractError("migration control is invalid")
+    elif kind == "migration-status":
+        if "limit" in item and not 1 <= _positive_int(item["limit"]) <= 100:
+            raise ContractError("migration status limit is invalid")
+        if "cursor" in item:
+            _id(item["cursor"])
     if kind == "connection-resolve":
         provider = item["provider"]
         capability = item["capability"]
@@ -554,6 +674,108 @@ def _operation_input(kind: str, value: object) -> dict[str, Any]:
         ):
             raise ContractError("command option is invalid")
     return item
+
+
+def _migration_offer(value: object) -> dict[str, Any]:
+    item = _closed(
+        value,
+        {"offerVersionId", "revision", "schemaVersion", "snapshot", "contentHash"},
+    )
+    _id(item["offerVersionId"])
+    _positive_int(item["revision"])
+    if item["schemaVersion"] != 1:
+        raise ContractError("migration offer is invalid")
+    snapshot = _snapshot("offer", item["snapshot"])
+    if snapshot["saleType"] != "recurring":
+        raise ContractError("migration offer is invalid")
+    content_hash = item["contentHash"]
+    if (
+        type(content_hash) is not str
+        or _HASH.fullmatch(content_hash) is None
+        or _canonical_hash({"schemaVersion": 1, "snapshot": snapshot}) != content_hash
+    ):
+        raise ContractError("migration offer is invalid")
+    return dict(item)
+
+
+def _migration_counts(value: object) -> dict[str, int]:
+    item = _closed(value, {"total", "pending", "applied", "needsReview", "failed"})
+    if any(type(item[key]) is not int or item[key] < 0 for key in item):
+        raise ContractError("migration counts are invalid")
+    if item["pending"] + item["applied"] + item["needsReview"] + item["failed"] != item["total"]:
+        raise ContractError("migration counts are invalid")
+    return dict(item)
+
+
+def _migration_status_result(value: object, command: InternalCommand) -> dict[str, Any]:
+    result = _closed(
+        value,
+        {
+            "commercialRequestId",
+            "jobId",
+            "connectionId",
+            "revision",
+            "state",
+            "dryRunRevision",
+            "dryRunHash",
+            "expiresAt",
+            "counts",
+            "items",
+            "nextCursor",
+        },
+    )
+    if (
+        result["commercialRequestId"] != command.input["commercialRequestId"]
+        or result["jobId"] != command.input["jobId"]
+        or result["connectionId"] != command.connection_id
+        or result["state"] not in _MIGRATION_JOB_STATES
+    ):
+        raise ContractError("command result is invalid")
+    for field in ("commercialRequestId", "jobId", "connectionId"):
+        _id(result[field])
+    _positive_int(result["revision"])
+    for field in ("dryRunRevision", "expiresAt"):
+        if result[field] is not None:
+            _positive_int(result[field])
+    if result["dryRunHash"] is not None and (
+        type(result["dryRunHash"]) is not str or _HASH.fullmatch(result["dryRunHash"]) is None
+    ):
+        raise ContractError("command result is invalid")
+    result["counts"] = _migration_counts(result["counts"])
+    if not isinstance(result["items"], list) or len(result["items"]) > 100:
+        raise ContractError("command result is invalid")
+    normalized_items = []
+    for value in result["items"]:
+        selected = _closed(value, {"itemId", "state", "reasonCode", "attempts"})
+        if (
+            type(selected["itemId"]) is not str
+            or _MIGRATION_ITEM_ID.fullmatch(selected["itemId"]) is None
+        ):
+            raise ContractError("command result is invalid")
+        if selected["state"] not in _MIGRATION_ITEM_STATES:
+            raise ContractError("command result is invalid")
+        if (
+            selected["reasonCode"] is not None
+            and selected["reasonCode"] not in _MIGRATION_REASON_CODES
+        ):
+            raise ContractError("command result is invalid")
+        if (
+            selected["state"]
+            in {
+                "retryable_failure",
+                "pending_update_expired",
+                "needs_review",
+                "permanent_failure",
+            }
+        ) != (selected["reasonCode"] is not None):
+            raise ContractError("command result is invalid")
+        if type(selected["attempts"]) is not int or not 0 <= selected["attempts"] <= 5:
+            raise ContractError("command result is invalid")
+        normalized_items.append(dict(selected))
+    result["items"] = normalized_items
+    if result["nextCursor"] is not None:
+        _id(result["nextCursor"])
+    return dict(result)
 
 
 def _validate_operation_ids(item: Mapping[str, Any]) -> None:
@@ -723,15 +945,26 @@ def _command_identity(kind: str, item: Mapping[str, Any]) -> tuple[str, str, int
         operation = item["snapshot"]["targetState"]
     elif kind in {"subscription-discount", "subscription-pause"}:
         operation = item["action"]
+    elif kind == "migration-control":
+        operation = item["action"]
     resource_id = (
         item.get("resourceId")
         or item.get("paymentAttemptId")
         or item.get("subscriptionId")
+        or item.get("jobId")
+        or item.get("commercialRequestId")
     )
     revision = (
         1
         if kind == "customer-portal"
-        else item.get("revision") or item.get("expectedRevision")
+        else item.get("revision")
+        or item.get("expectedRevision")
+        or item.get("dryRunRevision")
+        or (
+            item.get("targetOffer", {}).get("revision")
+            if isinstance(item.get("targetOffer"), Mapping)
+            else None
+        )
     )
     if type(resource_id) is not str or type(revision) is not int:
         raise ContractError("idempotency key is invalid")

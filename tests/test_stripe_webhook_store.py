@@ -269,6 +269,77 @@ class StripeWebhookStoreTests(unittest.TestCase):
         self.assertEqual(stale["sourceRevision"], 2)
         self.assertNotIn("expiresAt", projection)
 
+    def test_subscription_projection_is_written_to_the_registry_table(self):
+        class Client:
+            def __init__(self):
+                self.transactions = []
+                self.receipt = {
+                    "pk": scope().partition_key,
+                    "sk": "WEBHOOK_RECEIPT#evt-1",
+                    "itemType": "WebhookReceipt",
+                    **scope().fields(),
+                    "receiptId": "evt-1",
+                    "status": "processing",
+                    "revision": 2,
+                    "receivedAt": NOW,
+                    "expiresAt": TTL,
+                }
+
+            def get_item(self, **kwargs):
+                return {"Item": _serialize(self.receipt)}
+
+            def transact_write_items(self, **kwargs):
+                self.transactions.append(kwargs)
+
+        client = Client()
+        store = DynamoStripeWebhookStore(
+            "receipts", projection_table_name="registry", client=client
+        )
+        store.complete_ingress(
+            scope=scope(),
+            outbox_id="evt-1",
+            receipt_id="evt-1",
+            claimed_revision=2,
+            sequence="101",
+            decision_code="processed",
+            envelopes=[
+                IntegrationEventEnvelope(
+                    scope=scope(),
+                    event_id="integration-event-1",
+                    event_type="commerce.subscription.updated.v1",
+                    occurred_at=NOW,
+                    data={
+                        "subscriptionId": "attempt-1",
+                        "offerVersionId": "offer-v1",
+                        "status": "active",
+                        "currentPeriodEnd": NOW + 100,
+                        "sourceRevision": 1,
+                    },
+                ).to_dict()
+            ],
+            projection={
+                "subscriptionId": "attempt-1",
+                "offerVersionId": "offer-v1",
+                "status": "active",
+                "currentPeriodEnd": NOW + 100,
+                "sourceRevision": 1,
+                "expectedRevision": 0,
+                "lastEventId": "evt-1",
+                "lastEventCreatedAt": NOW,
+                "stateHash": "d" * 64,
+                "stale": False,
+            },
+        )
+
+        projection_put = next(
+            operation["Put"]
+            for operation in client.transactions[0]["TransactItems"]
+            if "Put" in operation
+            and _deserialize(operation["Put"]["Item"])["itemType"]
+            == "StripeSubscriptionProjection"
+        )
+        self.assertEqual(projection_put["TableName"], "registry")
+
     def test_subscription_completion_atomically_commits_projection_without_technical_ttl(
         self,
     ):

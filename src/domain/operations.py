@@ -20,6 +20,15 @@ COMMERCE_EVENT_TYPES = frozenset(
         "commerce.subscription.updated.v1",
     }
 )
+MIGRATION_EVENT_TYPES = frozenset(
+    {
+        "migration.preview_ready.v1",
+        "migration.progressed.v1",
+        "migration.item_needs_review.v1",
+        "migration.completed.v1",
+    }
+)
+INTEGRATION_EVENT_TYPES = COMMERCE_EVENT_TYPES | MIGRATION_EVENT_TYPES
 STRIPE_WEBHOOK_EVENT_TYPES = frozenset(
     {
         "checkout.session.completed",
@@ -31,6 +40,8 @@ STRIPE_WEBHOOK_EVENT_TYPES = frozenset(
         "customer.subscription.created",
         "customer.subscription.updated",
         "customer.subscription.deleted",
+        "customer.subscription.pending_update_applied",
+        "customer.subscription.pending_update_expired",
         "invoice.paid",
         "invoice.payment_failed",
         "account.application.deauthorized",
@@ -40,11 +51,57 @@ _SAFE_ID = re.compile(r"[a-z0-9][a-z0-9._-]{0,127}", re.ASCII)
 _COMMERCE_ID = re.compile(r"[a-z0-9][a-z0-9._-]{0,63}", re.ASCII)
 _EVENT_TYPE = re.compile(r"[a-z0-9][a-z0-9._-]{0,127}", re.ASCII)
 _HASH = re.compile(r"[a-f0-9]{64}", re.ASCII)
+_MIGRATION_ITEM_ID = re.compile(r"migration-item-[a-f0-9]{40}", re.ASCII)
 _CURRENCY = re.compile(r"[A-Z]{3}", re.ASCII)
 _PAYMENT_KEYS = frozenset({"reservationId", "orderId", "paymentAttemptId"})
 _REFUND_KEYS = frozenset({"orderId", "refundId", "amountMinor", "currency"})
 _SUBSCRIPTION_KEYS = frozenset(
     {"subscriptionId", "offerVersionId", "status", "currentPeriodEnd", "sourceRevision"}
+)
+_MIGRATION_COMMON_KEYS = frozenset(
+    {"commercialRequestId", "jobId", "connectionId", "revision", "dedupeKey"}
+)
+_MIGRATION_COUNTS_KEYS = frozenset(
+    {"total", "pending", "applied", "needsReview", "failed"}
+)
+_MIGRATION_JOB_STATES = frozenset(
+    {
+        "previewing",
+        "awaiting_approval",
+        "scheduled",
+        "running",
+        "paused",
+        "cancel_requested",
+        "canceling",
+        "completed",
+        "completed_with_errors",
+        "canceled",
+    }
+)
+_MIGRATION_TERMINAL_STATES = frozenset(
+    {"completed", "completed_with_errors", "canceled"}
+)
+_MIGRATION_REASON_CODES = frozenset(
+    {
+        "ambiguous-price",
+        "near-term-schedule",
+        "nonpositive-proration",
+        "payment-failed",
+        "pending-invoice-items",
+        "pending-update",
+        "phase-limit",
+        "provider-unknown",
+        "retry-exhausted",
+        "scope-mismatch",
+        "snapshot-too-large",
+        "source-drift",
+        "tax-approval",
+        "unmapped-price",
+        "unpaid-invoice",
+        "unsupported-collection-mode",
+        "unsupported-payment-method",
+        "unsupported-schedule",
+    }
 )
 _ENVELOPE_KEYS = frozenset(
     {
@@ -246,13 +303,17 @@ class IntegrationEventEnvelope:
     def __post_init__(self) -> None:
         _scope(self.scope)
         _commerce_id(self.event_id)
-        if self.event_type not in COMMERCE_EVENT_TYPES:
+        if self.event_type not in INTEGRATION_EVENT_TYPES:
             raise ValueError("integration event type is invalid")
         _epoch(self.occurred_at, "integration event timestamp")
         object.__setattr__(
             self,
             "data",
-            MappingProxyType(_commerce_data(self.event_type, self.data)),
+            MappingProxyType(
+                _migration_data(self.event_type, self.data)
+                if self.event_type in MIGRATION_EVENT_TYPES
+                else _commerce_data(self.event_type, self.data)
+            ),
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -435,6 +496,77 @@ def _commerce_data(event_type: str, value: object) -> dict[str, Any]:
             value["sourceRevision"], "subscription source revision"
         ),
     }
+
+
+def _migration_data(event_type: str, value: object) -> dict[str, Any]:
+    if not isinstance(value, Mapping):
+        raise ValueError("integration event data is invalid")
+    required = set(_MIGRATION_COMMON_KEYS)
+    if event_type == "migration.preview_ready.v1":
+        required.update({"dryRunRevision", "dryRunHash", "expiresAt", "counts"})
+    elif event_type in {"migration.progressed.v1", "migration.completed.v1"}:
+        required.update({"state", "counts"})
+    else:
+        required.update({"itemId", "reasonCode"})
+    if set(value) != required:
+        raise ValueError("integration event data is invalid")
+    output = {
+        field: _commerce_id(value[field])
+        for field in sorted(_MIGRATION_COMMON_KEYS - {"revision"})
+    }
+    output["revision"] = _positive_int(value["revision"], "migration revision")
+    if event_type == "migration.preview_ready.v1":
+        output.update(
+            {
+                "dryRunRevision": _positive_int(
+                    value["dryRunRevision"], "migration dry-run revision"
+                ),
+                "dryRunHash": _migration_hash(value["dryRunHash"]),
+                "expiresAt": _positive_int(value["expiresAt"], "migration expiry"),
+                "counts": _migration_counts(value["counts"]),
+            }
+        )
+    elif event_type in {"migration.progressed.v1", "migration.completed.v1"}:
+        terminal = value["state"] in _MIGRATION_TERMINAL_STATES
+        if (
+            value["state"] not in _MIGRATION_JOB_STATES
+            or (event_type == "migration.completed.v1") != terminal
+        ):
+            raise ValueError("integration event data is invalid")
+        output.update(
+            {"state": value["state"], "counts": _migration_counts(value["counts"])}
+        )
+    else:
+        reason = value["reasonCode"]
+        if reason not in _MIGRATION_REASON_CODES:
+            raise ValueError("integration event data is invalid")
+        item_id = value["itemId"]
+        if type(item_id) is not str or _MIGRATION_ITEM_ID.fullmatch(item_id) is None:
+            raise ValueError("integration event data is invalid")
+        output.update({"itemId": item_id, "reasonCode": reason})
+    return {key: output[key] for key in value}
+
+
+def _migration_counts(value: object) -> dict[str, int]:
+    if not isinstance(value, Mapping) or set(value) != _MIGRATION_COUNTS_KEYS:
+        raise ValueError("integration event data is invalid")
+    counts = dict(value)
+    if any(type(count) is not int or count < 0 for count in counts.values()):
+        raise ValueError("integration event data is invalid")
+    if (
+        counts["pending"]
+        + counts["applied"]
+        + counts["needsReview"]
+        + counts["failed"]
+        != counts["total"]
+    ):
+        raise ValueError("integration event data is invalid")
+    return counts
+
+
+def _migration_hash(value: object) -> str:
+    _hash(value)
+    return value
 
 
 def _parse_envelope(value: object) -> dict[str, Any]:

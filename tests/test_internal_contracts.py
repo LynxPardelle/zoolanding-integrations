@@ -9,6 +9,8 @@ from unittest.mock import patch
 from src.domain.operations import COMMERCE_EVENT_TYPES
 from src.common.published_policy import ResolvedIntegrationPolicy
 from src.registry import ResolvedBinding
+from tests.test_migration_contracts import envelope as migration_envelope
+from tests.test_migration_contracts import offer as migration_offer
 from tests.test_registry import binding, connection
 
 
@@ -821,7 +823,7 @@ class InternalContractTests(unittest.TestCase):
             module = handler_module(self, name)
             self.assertTrue(hasattr(module, "_runtime_dependencies"), name)
 
-    def test_all_task_040_seams_exist_with_literal_paths_and_migrations_fail_closed(
+    def test_all_internal_seams_exist_with_literal_paths_and_migrations_are_typed(
         self,
     ):
         expected = {
@@ -847,12 +849,18 @@ class InternalContractTests(unittest.TestCase):
             {name: module.PATH for name, module in modules.items()}, expected
         )
 
-        preview = offer_command()
-        preview["input"] = {
-            "sourceOfferVersionId": "offer-source",
-            "targetOfferVersionId": "offer-target",
+        preview = migration_envelope(
+            "migration-preview",
+            {
+            "sourceOffer": migration_offer("offer-source", 90_000),
+            "targetOffer": migration_offer("offer-target", 100_000),
             "commercialRequestId": "commercial-request-1",
-        }
+            "requestedPolicy": {"mode": "next_renewal"},
+            "candidateScope": {"kind": "all_matching_source_price"},
+            "canarySize": 5,
+            "accountConcurrency": 2,
+            },
+        )
         result = modules["internal_stripe_migrations_preview"].handle_request(
             request(expected["internal_stripe_migrations_preview"], preview),
             allowed_callers={ALLOWED_CALLER},

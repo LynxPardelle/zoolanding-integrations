@@ -67,8 +67,15 @@ class WebhookReplayConflict(StripeStoreError):
 class DynamoStripeWebhookStore:
     """Atomic receipt/outbox persistence without retaining provider payloads."""
 
-    def __init__(self, table_name: str, *, client=None):
+    def __init__(self, table_name: str, *, projection_table_name=None, client=None):
         if type(table_name) is not str or not table_name.strip():
+            raise StripeStoreError("Stripe webhook store is unavailable")
+        if projection_table_name is None:
+            projection_table_name = table_name
+        if (
+            type(projection_table_name) is not str
+            or not projection_table_name.strip()
+        ):
             raise StripeStoreError("Stripe webhook store is unavailable")
         if client is None:
             try:
@@ -78,6 +85,7 @@ class DynamoStripeWebhookStore:
             except Exception:
                 raise StripeStoreError("Stripe webhook store is unavailable") from None
         self._table_name = table_name
+        self._projection_table_name = projection_table_name
         self._client = client
 
     def accept_supported(
@@ -601,7 +609,8 @@ class DynamoStripeWebhookStore:
             or not 0 <= event_created_at <= 9_999_999_999
         ):
             raise StripeStoreError("Stripe subscription projection is unavailable")
-        current = self._get(
+        current = self._get_from(
+            self._projection_table_name,
             scope.partition_key,
             f"STRIPE_SUBSCRIPTION_PROJECTION#{subscription_id}",
         )
@@ -795,7 +804,7 @@ class DynamoStripeWebhookStore:
                 },
             }
             put = {
-                "TableName": self._table_name,
+                "TableName": self._projection_table_name,
                 "Item": _serialize(projection_record),
             }
             if projection["expectedRevision"] == 0:
@@ -1085,9 +1094,12 @@ class DynamoStripeWebhookStore:
             ) from None
 
     def _get(self, pk: str, sk: str) -> dict[str, Any] | None:
+        return self._get_from(self._table_name, pk, sk)
+
+    def _get_from(self, table_name: str, pk: str, sk: str) -> dict[str, Any] | None:
         try:
             response = self._client.get_item(
-                TableName=self._table_name,
+                TableName=table_name,
                 Key=_serialize({"pk": pk, "sk": sk}),
                 ConsistentRead=True,
             )

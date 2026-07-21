@@ -56,7 +56,15 @@ _PORTAL_CONFIGURATION_ID = re.compile(r"bpc_[A-Za-z0-9]{8,64}", re.ASCII)
 
 class StripeCommandService:
     def __init__(
-        self, resolver, store, provider, routes, *, now_epoch, tax_verifier=None
+        self,
+        resolver,
+        store,
+        provider,
+        routes,
+        *,
+        now_epoch,
+        tax_verifier=None,
+        reference_guard=None,
     ):
         if any(
             value is None for value in (resolver, store, provider, routes, now_epoch)
@@ -68,6 +76,7 @@ class StripeCommandService:
         self._routes = routes
         self._now_epoch = now_epoch
         self._tax_verifier = tax_verifier
+        self._reference_guard = reference_guard
 
     def execute(self, kind: str, command: InternalCommand) -> dict[str, Any]:
         capability = _CAPABILITIES.get(kind)
@@ -233,10 +242,37 @@ class StripeCommandService:
                 mapping is not None
                 and mapping.get("lifecycleRevision") == value["revision"]
                 and mapping.get("lifecycleHash") == value["contentHash"]
-                and mapping.get("status") == "inactive"
+                and mapping.get("status") in {"inactive", "existing_only"}
             ):
                 return None, [], None
             mapping = _current_mapping(mapping, value["revision"])
+            can_deactivate = getattr(self._reference_guard, "can_deactivate", None)
+            try:
+                decision = (
+                    can_deactivate(
+                        command.scope,
+                        command.connection_id,
+                        value["resourceId"],
+                        mapping["priceId"],
+                    )
+                    if callable(can_deactivate)
+                    else None
+                )
+            except Exception:
+                decision = None
+            if decision is not True:
+                return (
+                    None,
+                    [
+                        {
+                            **mapping,
+                            "status": "existing_only",
+                            "lifecycleRevision": value["revision"],
+                            "lifecycleHash": value["contentHash"],
+                        }
+                    ],
+                    None,
+                )
             self._provider.deactivate_offer(
                 resolved,
                 mapping["productId"],
