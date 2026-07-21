@@ -5,7 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 from typing import Any
-from urllib.parse import urlsplit
+from urllib.parse import urlencode, urlsplit, urlunsplit
 
 try:
     from contracts.internal import InternalCommand
@@ -20,6 +20,10 @@ class StripeCommandError(RuntimeError):
 
 
 class StripeCommandConflict(StripeCommandError):
+    pass
+
+
+class StripeCommandNotFound(StripeCommandError):
     pass
 
 
@@ -145,6 +149,14 @@ class StripeCommandService:
             )
             return {"commandId": command.command_id, "status": "needs_review"}
         except StripeCommandConflict:
+            self._store.mark_rejected(
+                command.scope,
+                command.connection_id,
+                command.idempotency_key,
+                request_hash,
+            )
+            raise
+        except StripeCommandNotFound:
             self._store.mark_rejected(
                 command.scope,
                 command.connection_id,
@@ -569,7 +581,31 @@ class StripeCommandService:
             "status": status,
         }
 
-    def _subscription_context(self, command, resolved):
+    def _subscription_context(
+        self, command, resolved, *, enforce_revision=True, mutation=True
+    ):
+        try:
+            projection = self._store.get_subscription_projection(
+                command.scope,
+                command.connection_id,
+                command.input["subscriptionId"],
+            )
+        except Exception:
+            raise StripeNeedsReview("Stripe subscription needs review") from None
+        if projection is None:
+            raise StripeCommandNotFound("Stripe subscription was not found")
+        if (
+            not isinstance(projection, dict)
+            or set(projection)
+            != {"subscriptionId", "offerVersionId", "status", "sourceRevision"}
+            or projection.get("subscriptionId") != command.input["subscriptionId"]
+            or type(projection.get("sourceRevision")) is not int
+        ):
+            raise StripeNeedsReview("Stripe subscription needs review")
+        if enforce_revision and projection["sourceRevision"] != command.input.get(
+            "expectedRevision"
+        ):
+            raise StripeCommandConflict("Stripe command conflicted")
         mapping = self._mapping(command, "checkout", command.input["subscriptionId"])
         if (
             mapping is None
@@ -590,6 +626,10 @@ class StripeCommandService:
             "scheduleId",
             "discounts",
             "pauseCollection",
+            "latestInvoice",
+            "pendingUpdate",
+            "automaticTax",
+            "defaultTaxRateIds",
         }
         if (
             not isinstance(state, dict)
@@ -597,9 +637,44 @@ class StripeCommandService:
             or state["subscriptionId"] != mapping["providerSubscriptionId"]
             or type(state["customerId"]) is not str
             or state["status"]
-            not in {"active", "trialing", "past_due", "unpaid", "incomplete"}
+            not in {
+                "active",
+                "trialing",
+                "past_due",
+                "unpaid",
+                "incomplete",
+                "canceled",
+            }
             or not isinstance(state["items"], list)
             or not isinstance(state["discounts"], list)
+            or type(state["pendingUpdate"]) is not bool
+            or not isinstance(state["automaticTax"], dict)
+            or set(state["automaticTax"]) != {"enabled"}
+            or type(state["automaticTax"]["enabled"]) is not bool
+            or not isinstance(state["defaultTaxRateIds"], list)
+            or any(type(item) is not str for item in state["defaultTaxRateIds"])
+        ):
+            raise StripeNeedsReview("Stripe subscription needs review")
+        invoice = state["latestInvoice"]
+        if invoice is not None and (
+            not isinstance(invoice, dict)
+            or set(invoice) != {"invoiceId", "status", "paymentStatus"}
+            or type(invoice["invoiceId"]) is not str
+            or invoice["status"]
+            not in {"draft", "open", "paid", "uncollectible", "void"}
+            or invoice["paymentStatus"] not in {None, "open", "paid", "canceled"}
+        ):
+            raise StripeNeedsReview("Stripe subscription needs review")
+        if mutation and (
+            state["status"] not in {"active", "trialing"}
+            or state["pendingUpdate"]
+            or (
+                invoice is not None
+                and (
+                    invoice["status"] not in {"paid", "void"}
+                    or invoice["paymentStatus"] not in {None, "paid"}
+                )
+            )
         ):
             raise StripeNeedsReview("Stripe subscription needs review")
         return mapping, state
@@ -619,18 +694,20 @@ class StripeCommandService:
         item = state["items"][0]
         if (
             not isinstance(item, dict)
-            or set(item) != {"itemId", "priceId", "quantity"}
+            or set(item) != {"itemId", "priceId", "quantity", "taxRateIds"}
             or type(item["itemId"]) is not str
             or type(item["priceId"]) is not str
             or type(item["quantity"]) is not int
             or item["quantity"] < 1
+            or not isinstance(item["taxRateIds"], list)
+            or any(type(rate) is not str for rate in item["taxRateIds"])
         ):
             raise StripeNeedsReview("Stripe subscription needs review")
         mode = value["planChangePolicy"]["mode"]
         if mode == "disabled":
             raise StripeNeedsReview("Stripe subscription needs review")
         if mode == "next-renewal":
-            if state["scheduleId"] is not None:
+            if state["scheduleId"] is not None or state["pauseCollection"] is not None:
                 raise StripeNeedsReview("Stripe subscription needs review")
             self._provider.schedule_subscription_change(
                 resolved,
@@ -639,6 +716,12 @@ class StripeCommandService:
                 current_price_id=item["priceId"],
                 price_id=target["priceId"],
                 quantity=item["quantity"],
+                preserved_settings={
+                    "automaticTax": state["automaticTax"],
+                    "defaultTaxRateIds": state["defaultTaxRateIds"],
+                    "discounts": state["discounts"],
+                    "itemTaxRateIds": item["taxRateIds"],
+                },
                 idempotency_key=command.idempotency_key,
             )
             return None, [], None
@@ -730,7 +813,9 @@ class StripeCommandService:
         return None, [], None
 
     def _customer_portal(self, command, resolved):
-        _, state = self._subscription_context(command, resolved)
+        _, state = self._subscription_context(
+            command, resolved, enforce_revision=False, mutation=False
+        )
         configuration = self._mapping(
             command, "portal-configuration", "restricted-default"
         )
@@ -760,13 +845,64 @@ class StripeCommandService:
             resolved,
             customer_id=state["customerId"],
             configuration_id=configuration["configurationId"],
+            return_url=_portal_return_url(command.scope, resolved.binding),
             idempotency_key=command.idempotency_key,
         )
         _portal_redirect(result)
+        if result["expiresAt"] <= self._now_epoch():
+            raise StripeNeedsReview("Stripe subscription needs review")
+        mappings.append(
+            {
+                "resourceType": "customer-portal",
+                "resourceId": command.input["portalAttemptId"],
+                "revision": 1,
+                "contentHash": command.content_hash,
+                "subscriptionId": command.input["subscriptionId"],
+                "expiresAt": result["expiresAt"],
+                "status": "active",
+            }
+        )
         return result, mappings, None
 
     def _replay_portal(self, command, resolved):
-        result, _, _ = self._customer_portal(command, resolved)
+        mapping = self._mapping(
+            command, "customer-portal", command.input["portalAttemptId"]
+        )
+        if (
+            not isinstance(mapping, dict)
+            or mapping.get("subscriptionId") != command.input["subscriptionId"]
+            or mapping.get("revision") != 1
+            or mapping.get("contentHash") != command.content_hash
+            or type(mapping.get("expiresAt")) is not int
+            or mapping["expiresAt"] <= self._now_epoch()
+        ):
+            return {"commandId": command.command_id, "status": "needs_review"}
+        configuration = self._mapping(
+            command, "portal-configuration", "restricted-default"
+        )
+        if (
+            not isinstance(configuration, dict)
+            or configuration.get("status") != "active"
+            or type(configuration.get("configurationId")) is not str
+        ):
+            return {"commandId": command.command_id, "status": "needs_review"}
+        try:
+            projection, state = self._subscription_context(
+                command, resolved, enforce_revision=False, mutation=False
+            )
+            del projection
+            result = self._provider.create_portal_session(
+                resolved,
+                customer_id=state["customerId"],
+                configuration_id=configuration["configurationId"],
+                return_url=_portal_return_url(command.scope, resolved.binding),
+                idempotency_key=command.idempotency_key,
+            )
+            _portal_redirect(result)
+        except Exception:
+            return {"commandId": command.command_id, "status": "needs_review"}
+        if result["expiresAt"] != mapping["expiresAt"]:
+            return {"commandId": command.command_id, "status": "needs_review"}
         return {
             "commandId": command.command_id,
             "status": "accepted",
@@ -836,14 +972,16 @@ def _operation_claim(command: InternalCommand) -> dict[str, Any]:
         "subscription-pause",
         "customer-portal",
     }:
-        resource_type = "subscription"
-        resource_id = value["subscriptionId"]
-        dimension = (
-            "portal"
-            if command.kind == "customer-portal"
-            else command.kind.removeprefix("subscription-")
-        )
-        revision = value.get("expectedRevision", 1)
+        if command.kind == "customer-portal":
+            resource_type = "customer-portal"
+            resource_id = value["portalAttemptId"]
+            dimension = "immutable"
+            revision = 1
+        else:
+            resource_type = "subscription"
+            resource_id = value["subscriptionId"]
+            dimension = command.kind.removeprefix("subscription-")
+            revision = value["expectedRevision"]
     else:
         raise StripeCommandError("Stripe command is unavailable")
     if type(command.content_hash) is not str:
@@ -911,3 +1049,19 @@ def _portal_redirect(value):
         or value["expiresAt"] < 1
     ):
         raise StripeCommandError("Stripe portal is unavailable")
+
+
+def _portal_return_url(scope: IntegrationScope, binding: Any) -> str:
+    path = binding.provider_metadata.get("customerPortalReturnPath")
+    if type(path) is not str:
+        raise StripeNeedsReview("Stripe subscription needs review")
+    parsed = urlsplit(path)
+    if parsed.scheme or parsed.netloc or not parsed.path.startswith("/"):
+        raise StripeNeedsReview("Stripe subscription needs review")
+    if scope.environment == "production":
+        host = scope.domain
+        query = ""
+    else:
+        host = "test.zoolandingpage.com.mx"
+        query = urlencode({"draftDomain": scope.domain})
+    return urlunsplit(("https", host, parsed.path, query, ""))

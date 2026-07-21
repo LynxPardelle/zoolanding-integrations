@@ -76,7 +76,6 @@ class ConnectionRegistration:
     connection_id: str
     command_id: str
     idempotency_key: str
-    credential_reference: str
     provider: str
     mode: str
     capabilities: tuple[str, ...]
@@ -138,7 +137,6 @@ def validate_connection_registration(value: object) -> ConnectionRegistration:
             "connectionId",
             "commandId",
             "idempotencyKey",
-            "credentialReference",
             "provider",
             "mode",
             "capabilities",
@@ -157,15 +155,6 @@ def validate_connection_registration(value: object) -> ConnectionRegistration:
     if type(mode) is not str or mode != expected_mode:
         raise ContractError("registration mode is invalid")
     capabilities = _capabilities(request["capabilities"])
-    reference = request["credentialReference"]
-    expected_reference = (
-        f"/zoolanding/{scope.environment}/integrations/stripe/connect-platform"
-        if provider == "stripe"
-        else f"/zoolanding/{scope.environment}/{scope.tenant_id}/"
-        f"{scope.draft_id}/notifications/smtp/{connection_id}"
-    )
-    if reference != expected_reference:
-        raise ContractError("registration reference is invalid")
     account_reference = request["accountReference"]
     if provider == "stripe":
         if account_reference is not None:
@@ -177,7 +166,6 @@ def validate_connection_registration(value: object) -> ConnectionRegistration:
         connection_id,
         _id(request["commandId"]),
         _idempotency(request["idempotencyKey"]),
-        reference,
         provider,
         mode,
         capabilities,
@@ -501,7 +489,10 @@ def _operation_input(kind: str, value: object) -> dict[str, Any]:
             {"subscriptionId", "expectedRevision", "action", "pausePolicy"},
             set(),
         ),
-        "customer-portal": ({"subscriptionId"}, set()),
+        "customer-portal": (
+            {"subscriptionId", "portalAttemptId"},
+            set(),
+        ),
         "migration-preview": (
             {"sourceOfferVersionId", "targetOfferVersionId", "commercialRequestId"},
             set(),

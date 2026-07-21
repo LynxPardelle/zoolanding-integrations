@@ -73,7 +73,7 @@ def dispatch(
         )
     except Exception as error:
         name = type(error).__name__
-        if name in {"RegistryAccessDenied"}:
+        if name in {"RegistryAccessDenied", "StripeCommandNotFound"}:
             status, code, message = 404, "not_found", "Resource not found."
         elif name in {"RegistryConflict", "StripeCommandConflict"}:
             status, code, message = 409, "conflict", "The resource changed."

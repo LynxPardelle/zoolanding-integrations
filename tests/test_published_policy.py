@@ -46,10 +46,6 @@ def descriptor(*, mode="test", admin_access=None):
                     "taxMode": "unconfigured",
                     "platformFeeMode": "disabled",
                     "webhookIngress": "direct-integrations-api",
-                    "onboardingRoutes": {
-                        "returnPath": "/admin/integrations/stripe/return",
-                        "refreshPath": "/admin/integrations/stripe/refresh",
-                    },
                 },
             }
         ],

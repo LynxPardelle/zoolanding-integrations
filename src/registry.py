@@ -235,11 +235,31 @@ class ConnectionRegistry:
                 current.provider != "stripe"
                 or current.status != "pending"
                 or current.revision != expected_revision
-                or current.provider_metadata.get("accountReference") is not None
                 or type(registration_hash) is not str
                 or re.fullmatch(r"[a-f0-9]{64}", registration_hash, re.ASCII) is None
             ):
                 raise ValueError
+            current_account = current.provider_metadata.get("accountReference")
+            if current_account is not None:
+                if (
+                    current_account != account_reference
+                    or current.provider_metadata.get("accountOwnership") != ownership
+                ):
+                    raise ValueError
+                sentinel = {
+                    **_routing_sentinel(current),
+                    "registrationHash": registration_hash,
+                }
+                record = self._backend.rebind_stripe_account(
+                    pk,
+                    sk,
+                    account_reference,
+                    ownership,
+                    expected_revision,
+                    registration_hash,
+                    sentinel,
+                )
+                return _connection_from_record(scope, record)
             sentinel = {
                 **_routing_sentinel(
                     IntegrationConnection(
@@ -655,6 +675,88 @@ class DynamoRegistryBackend:
                             "ConditionExpression": (
                                 "attribute_not_exists(pk) AND attribute_not_exists(sk)"
                             ),
+                        }
+                    },
+                ]
+            )
+            return self.get(pk, sk)
+        except Exception:
+            raise RegistryConflict("Stripe account binding conflicted") from None
+
+    def rebind_stripe_account(
+        self,
+        pk: str,
+        sk: str,
+        account_reference: str,
+        ownership: str,
+        expected_revision: int,
+        registration_hash: str,
+        sentinel: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        update_values = _serialize_values(
+            {
+                ":account": account_reference,
+                ":ownership": ownership,
+                ":pending": "pending",
+                ":next_revision": expected_revision + 1,
+                ":expected_revision": expected_revision,
+                ":provider": "stripe",
+                ":registration_hash": registration_hash,
+            }
+        )
+        sentinel_values = _serialize_values(
+            {
+                ":sentinel_type": "AccountRoutingSentinel",
+                ":environment": sentinel["environment"],
+                ":tenant_id": sentinel["tenantId"],
+                ":draft_id": sentinel["draftId"],
+                ":domain": sentinel["domain"],
+                ":provider": "stripe",
+                ":connection_id": sk.removeprefix("CONNECTION#"),
+                ":false": False,
+                ":registration_hash": registration_hash,
+            }
+        )
+        try:
+            self._client.transact_write_items(
+                TransactItems=[
+                    {
+                        "Update": {
+                            "TableName": self._table_name,
+                            "Key": _serialize({"pk": pk, "sk": sk}),
+                            "UpdateExpression": (
+                                "SET revision = :next_revision "
+                                "REMOVE providerMetadata.readiness"
+                            ),
+                            "ConditionExpression": (
+                                "revision = :expected_revision AND provider = :provider "
+                                "AND #status = :pending "
+                                "AND registrationHash = :registration_hash "
+                                "AND providerMetadata.accountReference = :account "
+                                "AND providerMetadata.accountOwnership = :ownership"
+                            ),
+                            "ExpressionAttributeNames": {"#status": "status"},
+                            "ExpressionAttributeValues": update_values,
+                        }
+                    },
+                    {
+                        "ConditionCheck": {
+                            "TableName": self._table_name,
+                            "Key": _serialize(
+                                {"pk": sentinel["pk"], "sk": sentinel["sk"]}
+                            ),
+                            "ConditionExpression": (
+                                "itemType = :sentinel_type "
+                                "AND environment = :environment "
+                                "AND tenantId = :tenant_id "
+                                "AND draftId = :draft_id "
+                                "AND domain = :domain "
+                                "AND provider = :provider "
+                                "AND connectionId = :connection_id "
+                                "AND authorizes = :false "
+                                "AND registrationHash = :registration_hash"
+                            ),
+                            "ExpressionAttributeValues": sentinel_values,
                         }
                     },
                 ]

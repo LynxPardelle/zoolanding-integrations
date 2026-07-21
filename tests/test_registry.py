@@ -54,6 +54,23 @@ def connection(
 def binding(
     resolved_scope=None, *, capabilities=None, mode="test", tax_mode="unconfigured"
 ):
+    selected_capabilities = capabilities or ["connect-onboarding", "checkout"]
+    stripe_metadata = {
+        "accountStrategy": "oauth-standard-v1",
+        "accountModel": "merchant",
+        "chargeType": "direct",
+        "feePayer": "connected-account",
+        "taxMode": tax_mode,
+        "platformFeeMode": "disabled",
+        "webhookIngress": "direct-integrations-api",
+    }
+    if "connect-onboarding" in selected_capabilities:
+        stripe_metadata["onboardingRoutes"] = {
+            "returnPath": "/admin/integrations/stripe/return",
+            "refreshPath": "/admin/integrations/stripe/refresh",
+        }
+    if "customer-portal" in selected_capabilities:
+        stripe_metadata["customerPortalReturnPath"] = "/admin/billing"
     return IntegrationBinding.from_mapping(
         resolved_scope or scope(),
         {
@@ -63,20 +80,8 @@ def binding(
             "connectionId": "stripe-primary",
             "status": "active",
             "mode": mode,
-            "capabilities": capabilities or ["connect-onboarding", "checkout"],
-            "stripe": {
-                "accountStrategy": "oauth-standard-v1",
-                "accountModel": "merchant",
-                "chargeType": "direct",
-                "feePayer": "connected-account",
-                "taxMode": tax_mode,
-                "platformFeeMode": "disabled",
-                "webhookIngress": "direct-integrations-api",
-                "onboardingRoutes": {
-                    "returnPath": "/admin/integrations/stripe/return",
-                    "refreshPath": "/admin/integrations/stripe/refresh",
-                },
-            },
+            "capabilities": selected_capabilities,
+            "stripe": stripe_metadata,
         },
     )
 
@@ -164,6 +169,52 @@ class MemoryBackend:
         self.records[(sentinel["pk"], sentinel["sk"])] = sentinel
         return updated
 
+    def rebind_stripe_account(
+        self,
+        pk,
+        sk,
+        account_reference,
+        ownership,
+        expected_revision,
+        registration_hash,
+        expected_sentinel,
+    ):
+        item = self.records[(pk, sk)]
+        sentinel = self.records[(expected_sentinel["pk"], expected_sentinel["sk"])]
+        if (
+            item["revision"] != expected_revision
+            or item["registrationHash"] != registration_hash
+            or item["providerMetadata"].get("accountReference") != account_reference
+            or item["providerMetadata"].get("accountOwnership") != ownership
+            or sentinel.get("connectionId") != item["connectionId"]
+            or any(
+                sentinel.get(key) != expected_sentinel.get(key)
+                for key in (
+                    "environment",
+                    "tenantId",
+                    "draftId",
+                    "domain",
+                    "provider",
+                    "connectionId",
+                    "authorizes",
+                    "registrationHash",
+                )
+            )
+        ):
+            raise RuntimeError("conflict")
+        metadata = {
+            key: value
+            for key, value in item["providerMetadata"].items()
+            if key != "readiness"
+        }
+        updated = {
+            **item,
+            "revision": expected_revision + 1,
+            "providerMetadata": metadata,
+        }
+        self.records[(pk, sk)] = updated
+        return updated
+
     def disable_stripe_account(
         self, pk, sk, sentinel_pk, expected_revision, registration_hash
     ):
@@ -247,6 +298,48 @@ class RegistryTests(unittest.TestCase):
                 "platform-controller",
                 1,
             )
+
+    def test_oauth_reconnect_is_atomic_only_for_the_same_exact_account(self):
+        registry_api = registry_module(self)
+        backend = MemoryBackend()
+        registry = registry_api.ConnectionRegistry(backend)
+        registry.register(
+            connection(status="pending", account=None, ready=False),
+            binding(),
+            "registration-request",
+        )
+        first = registry.bind_stripe_account(
+            scope(), "stripe-primary", "acct_synthetic", "external-oauth", 1
+        )
+        digest = hashlib.sha256(b"acct_synthetic").hexdigest()
+        sentinel_key = (f"ROUTING#test#test#{digest}", "CLAIM")
+        sentinel = dict(backend.records[sentinel_key])
+
+        reconnected = registry.bind_stripe_account(
+            scope(),
+            "stripe-primary",
+            "acct_synthetic",
+            "external-oauth",
+            first.revision,
+        )
+        self.assertEqual(reconnected.revision, first.revision + 1)
+        self.assertEqual(backend.records[sentinel_key], sentinel)
+
+        with self.assertRaises(registry_api.RegistryConflict):
+            registry.bind_stripe_account(
+                scope(),
+                "stripe-primary",
+                "acct_different1",
+                "external-oauth",
+                reconnected.revision,
+            )
+        self.assertEqual(
+            registry.connection(scope(), "stripe-primary").provider_metadata[
+                "accountReference"
+            ],
+            "acct_synthetic",
+        )
+        self.assertIn(sentinel_key, backend.records)
 
     def test_registration_is_draft_partitioned_and_uses_hashed_non_authorizing_sentinel(
         self,
@@ -494,6 +587,65 @@ class RegistryTests(unittest.TestCase):
         backend = registry_api.DynamoRegistryBackend("registry-table", client=Client())
         with self.assertRaises(registry_api.RegistryError):
             backend.query_connections(scope().partition_key)
+
+    def test_dynamo_same_account_rebind_checks_full_scope_and_keeps_routing_claim(self):
+        registry_api = registry_module(self)
+        current = connection(status="pending", ready=False)
+        record = {
+            **current.to_record(),
+            "registrationHash": "a" * 64,
+        }
+
+        class Client:
+            def __init__(self):
+                self.transaction = None
+
+            def transact_write_items(self, **kwargs):
+                self.transaction = kwargs
+
+            def get_item(self, **kwargs):
+                del kwargs
+                return {"Item": registry_api._serialize(record)}
+
+        client = Client()
+        backend = registry_api.DynamoRegistryBackend("registry-table", client=client)
+        sentinel = {
+            **registry_api._routing_sentinel(current),
+            "registrationHash": "a" * 64,
+        }
+        backend.rebind_stripe_account(
+            current.scope.partition_key,
+            "CONNECTION#stripe-primary",
+            "acct_synthetic",
+            "external-oauth",
+            1,
+            "a" * 64,
+            sentinel,
+        )
+
+        operations = client.transaction["TransactItems"]
+        self.assertEqual(len(operations), 2)
+        update = operations[0]["Update"]
+        check = operations[1]["ConditionCheck"]
+        self.assertIn(
+            "providerMetadata.accountReference = :account",
+            update["ConditionExpression"],
+        )
+        for field in ("environment", "tenantId", "draftId", "domain"):
+            self.assertIn(field, check["ConditionExpression"])
+        self.assertNotIn("acct_synthetic", repr(check))
+        self.assertEqual(
+            set(update["ExpressionAttributeValues"]),
+            {
+                ":account",
+                ":ownership",
+                ":pending",
+                ":next_revision",
+                ":expected_revision",
+                ":provider",
+                ":registration_hash",
+            },
+        )
 
     def test_non_ascii_identifier_is_rejected_before_registry_access(self):
         registry_api = registry_module(self)

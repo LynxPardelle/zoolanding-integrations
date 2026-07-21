@@ -115,6 +115,95 @@ class StripeStoreTests(unittest.TestCase):
                 content_hash="d" * 64,
             )
 
+    def test_operation_claim_accepts_only_code_owned_resource_dimensions(self):
+        accepted = (
+            ("offer", "immutable"),
+            ("offer", "presentation"),
+            ("offer", "lifecycle"),
+            ("discount", "immutable"),
+            ("discount", "presentation"),
+            ("discount", "lifecycle"),
+            ("checkout", "immutable"),
+            ("subscription", "change"),
+            ("subscription", "discount"),
+            ("subscription", "pause"),
+            ("customer-portal", "immutable"),
+        )
+        for index, (resource_type, dimension) in enumerate(accepted, start=1):
+            with self.subTest(resource_type=resource_type, dimension=dimension):
+                self.assertIsNone(
+                    self.claim(
+                        key=f"key-{index}",
+                        request_hash=f"{index:064x}",
+                        command_id=f"command-{index}",
+                        resource_type=resource_type,
+                        resource_id=f"resource-{index}",
+                        dimension=dimension,
+                    )
+                )
+
+        for resource_type, dimension in (
+            ("offer", "pause"),
+            ("subscription", "immutable"),
+            ("customer-portal", "portal"),
+            ("unknown", "immutable"),
+        ):
+            with (
+                self.subTest(resource_type=resource_type, dimension=dimension),
+                self.assertRaisesRegex(Exception, "conflict"),
+            ):
+                self.claim(
+                    key=f"invalid-{resource_type}-{dimension}",
+                    request_hash="f" * 64,
+                    command_id="invalid-command",
+                    resource_type=resource_type,
+                    resource_id="resource-invalid",
+                    dimension=dimension,
+                )
+
+    def test_subscription_projection_read_is_exactly_scoped_and_typed(self):
+        key = (SCOPE.partition_key, "STRIPE_SUBSCRIPTION_PROJECTION#subscription-1")
+        record = {
+            "pk": SCOPE.partition_key,
+            "sk": key[1],
+            "itemType": "StripeSubscriptionProjection",
+            **SCOPE.fields(),
+            "subscriptionId": "subscription-1",
+            "offerVersionId": "offer-v1",
+            "status": "active",
+            "currentPeriodEnd": 1_900_000_000,
+            "sourceRevision": 2,
+            "lastEventId": "evt-2",
+            "lastEventCreatedAt": 1_800_000_000,
+            "stateHash": "a" * 64,
+        }
+        self.client.items[key] = _serialize(record)
+
+        self.assertEqual(
+            self.store.get_subscription_projection(
+                SCOPE, "stripe-primary", "subscription-1"
+            ),
+            {
+                "subscriptionId": "subscription-1",
+                "offerVersionId": "offer-v1",
+                "status": "active",
+                "sourceRevision": 2,
+            },
+        )
+
+        for changed in (
+            {**record, "tenantId": "tenant-other"},
+            {**record, "subscriptionId": "subscription-other"},
+            {**record, "sourceRevision": True},
+            {**record, "unexpected": True},
+        ):
+            with self.subTest(changed=changed):
+                self.client.items[key] = _serialize(changed)
+                with self.assertRaisesRegex(Exception, "unavailable"):
+                    self.store.get_subscription_projection(
+                        SCOPE, "stripe-primary", "subscription-1"
+                    )
+
     def test_persisted_operation_claim_validation_is_closed_and_scope_bound(self):
         from src.stripe_store import _validated_operation_record
 

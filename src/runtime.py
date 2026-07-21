@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import time
+from collections.abc import Mapping
 from typing import Any
 
 try:
@@ -17,7 +18,13 @@ try:
         ConnectionRegistrationService,
         ConnectionResolutionService,
     )
-    from registry import BindingResolver, ConnectionRegistry, DynamoRegistryBackend
+    from registry import (
+        BindingResolver,
+        ConnectionRegistry,
+        DynamoRegistryBackend,
+        _deserialize,
+        _serialize,
+    )
     from onboarding import StripeOnboardingService
     from onboarding_state import DynamoOnboardingStateStore, OnboardingStateManager
     from providers.stripe_adapter import (
@@ -38,7 +45,13 @@ except ModuleNotFoundError:
         ConnectionRegistrationService,
         ConnectionResolutionService,
     )
-    from src.registry import BindingResolver, ConnectionRegistry, DynamoRegistryBackend
+    from src.registry import (
+        BindingResolver,
+        ConnectionRegistry,
+        DynamoRegistryBackend,
+        _deserialize,
+        _serialize,
+    )
     from src.onboarding import StripeOnboardingService
     from src.onboarding_state import DynamoOnboardingStateStore, OnboardingStateManager
     from src.providers.stripe_adapter import (
@@ -55,17 +68,98 @@ class RuntimeCompositionError(RuntimeError):
 
 
 class PublishedTaxPolicyVerifier:
-    """Test is locally safe; production remains closed until tax proof is published."""
+    """Require a server-owned, draft-scoped approval for production tax changes."""
+
+    def __init__(self, table_name: str, *, client: Any):
+        if type(table_name) is not str or not table_name.strip() or client is None:
+            raise RuntimeCompositionError("Tax verification is unavailable")
+        self._table_name = table_name
+        self._client = client
 
     def __call__(self, resolved: Any, state: Any, target: Any) -> bool:
-        del state, target
+        del target
         scope = getattr(getattr(resolved, "connection", None), "scope", None)
         if getattr(scope, "environment", None) == "test":
             return True
+        connection_id = getattr(
+            getattr(resolved, "connection", None), "connection_id", None
+        )
         metadata = getattr(getattr(resolved, "binding", None), "provider_metadata", {})
+        tax_mode = metadata.get("taxMode") if isinstance(metadata, Mapping) else None
+        approval_id = (
+            metadata.get("taxApprovalId") if isinstance(metadata, Mapping) else None
+        )
+        if (
+            getattr(scope, "environment", None) != "production"
+            or type(connection_id) is not str
+            or type(approval_id) is not str
+            or tax_mode not in {"manual-rate", "stripe-tax"}
+            or not isinstance(state, dict)
+        ):
+            return False
+        sk = f"TAX_APPROVAL#{connection_id}#{approval_id}"
+        try:
+            response = self._client.get_item(
+                TableName=self._table_name,
+                Key=_serialize({"pk": scope.partition_key, "sk": sk}),
+                ConsistentRead=True,
+            )
+            raw = response.get("Item") if isinstance(response, dict) else None
+            record = _deserialize(raw) if raw is not None else None
+        except Exception:
+            return False
+        expected_keys = {
+            "pk",
+            "sk",
+            "itemType",
+            *scope.fields().keys(),
+            "connectionId",
+            "approvalId",
+            "provider",
+            "taxMode",
+            "status",
+            "revision",
+        }
+        if (
+            not isinstance(record, dict)
+            or set(record) != expected_keys
+            or record.get("pk") != scope.partition_key
+            or record.get("sk") != sk
+            or record.get("itemType") != "StripeTaxApproval"
+            or any(
+                record.get(key) != expected for key, expected in scope.fields().items()
+            )
+            or record.get("connectionId") != connection_id
+            or record.get("approvalId") != approval_id
+            or record.get("provider") != "stripe"
+            or record.get("taxMode") != tax_mode
+            or record.get("status") != "approved"
+            or type(record.get("revision")) is not int
+            or record["revision"] < 1
+        ):
+            return False
+        automatic_tax = state.get("automaticTax")
+        if (
+            not isinstance(automatic_tax, dict)
+            or set(automatic_tax) != {"enabled"}
+            or type(automatic_tax["enabled"]) is not bool
+        ):
+            return False
+        if tax_mode == "stripe-tax":
+            return automatic_tax["enabled"] is True
+        if automatic_tax["enabled"] is not False:
+            return False
+        default_rates = state.get("defaultTaxRateIds")
+        items = state.get("items")
         return bool(
-            metadata.get("taxMode") in {"manual-rate", "stripe-tax"}
-            and metadata.get("taxApprovalId")
+            isinstance(default_rates, list)
+            and isinstance(items, list)
+            and (
+                default_rates
+                or any(
+                    isinstance(item, dict) and item.get("taxRateIds") for item in items
+                )
+            )
         )
 
 
@@ -161,17 +255,21 @@ def stripe_command_runtime() -> dict[str, Any]:
             boto3.client("secretsmanager")
         ),
     )
+    registry_table_name = _required("INTEGRATION_REGISTRY_TABLE_NAME")
+    dynamodb_client = boto3.client("dynamodb")
     return {
         "service": StripeCommandService(
             BindingResolver(registry),
             DynamoStripeCommandStore(
-                _required("INTEGRATION_REGISTRY_TABLE_NAME"),
-                client=boto3.client("dynamodb"),
+                registry_table_name,
+                client=dynamodb_client,
             ),
             provider,
             PublishedCheckoutRouteResolver(policies),
             now_epoch=lambda: int(time.time()),
-            tax_verifier=PublishedTaxPolicyVerifier(),
+            tax_verifier=PublishedTaxPolicyVerifier(
+                registry_table_name, client=dynamodb_client
+            ),
         )
     }
 

@@ -79,7 +79,7 @@ class ConnectionRegistrationService:
             return self._admin.register(
                 connection,
                 binding,
-                credential_reference=registration.credential_reference,
+                credential_reference=connection.credential_reference,
                 idempotency_key=registration.idempotency_key,
             )
         except Exception:

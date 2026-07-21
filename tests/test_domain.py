@@ -45,6 +45,7 @@ class IntegrationDomainTests(unittest.TestCase):
                     "returnPath": "/admin/integrations/stripe/return",
                     "refreshPath": "/admin/integrations/stripe/refresh",
                 },
+                "customerPortalReturnPath": "/admin/billing",
             },
         }
         value.update(changes)
@@ -115,6 +116,45 @@ class IntegrationDomainTests(unittest.TestCase):
                 self.assertRaises(ValueError),
             ):
                 self.domain.IntegrationBinding.from_mapping(self.scope, candidate)
+
+    def test_stripe_optional_routes_follow_capabilities_and_oauth_is_the_default(self):
+        checkout_only = self.stripe_binding(capabilities=["checkout"])
+        checkout_only["stripe"].pop("accountStrategy")
+        checkout_only["stripe"].pop("onboardingRoutes")
+        checkout_only["stripe"].pop("customerPortalReturnPath")
+        parsed = self.domain.IntegrationBinding.from_mapping(self.scope, checkout_only)
+        self.assertEqual(
+            parsed.provider_metadata["accountStrategy"], "oauth-standard-v1"
+        )
+
+        portal = self.stripe_binding(capabilities=["customer-portal"])
+        portal["stripe"].pop("onboardingRoutes")
+        self.domain.IntegrationBinding.from_mapping(self.scope, portal)
+
+        for candidate in (
+            self.stripe_binding(capabilities=["connect-onboarding"]),
+            self.stripe_binding(capabilities=["customer-portal"]),
+        ):
+            if "connect-onboarding" in candidate["capabilities"]:
+                candidate["stripe"].pop("onboardingRoutes")
+                candidate["stripe"].pop("customerPortalReturnPath")
+            else:
+                candidate["stripe"].pop("onboardingRoutes")
+                candidate["stripe"].pop("customerPortalReturnPath")
+            with self.assertRaises(ValueError):
+                self.domain.IntegrationBinding.from_mapping(self.scope, candidate)
+
+        forbidden_onboarding = self.stripe_binding(capabilities=["checkout"])
+        forbidden_onboarding["stripe"].pop("customerPortalReturnPath")
+        with self.assertRaises(ValueError):
+            self.domain.IntegrationBinding.from_mapping(
+                self.scope, forbidden_onboarding
+            )
+
+        forbidden_portal = self.stripe_binding(capabilities=["checkout"])
+        forbidden_portal["stripe"].pop("onboardingRoutes")
+        with self.assertRaises(ValueError):
+            self.domain.IntegrationBinding.from_mapping(self.scope, forbidden_portal)
 
     def test_unknown_provider_fails_with_a_sanitized_validation_error(self):
         unknown = self.stripe_binding(provider="unknown")

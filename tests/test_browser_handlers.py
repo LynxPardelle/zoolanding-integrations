@@ -38,6 +38,21 @@ class Registry:
         self.updated.append((resolved_scope, connection_id, status, expected_revision))
         return connection(status=status)
 
+    def connection(self, resolved_scope, connection_id):
+        self.read = (resolved_scope, connection_id)
+        return connection()
+
+    def disable_stripe_account(
+        self, resolved_scope, connection_id, account_reference, expected_revision
+    ):
+        self.disabled = (
+            resolved_scope,
+            connection_id,
+            account_reference,
+            expected_revision,
+        )
+        return connection(status="disabled", account=None, ready=False)
+
 
 class BindingResolver:
     def __init__(self):
@@ -193,8 +208,8 @@ class BrowserHandlerTests(unittest.TestCase):
             now_epoch=1_000,
         )
         self.assertEqual(response["statusCode"], 200)
-        self.assertEqual(registry.updated[0][0].draft_id, "draft-example")
-        self.assertEqual(registry.updated[0][1:], ("stripe-primary", "disabled", 1))
+        self.assertEqual(registry.disabled[0].draft_id, "draft-example")
+        self.assertEqual(registry.disabled[1:], ("stripe-primary", "acct_synthetic", 1))
 
         reconnect = {**payload, "operation": "requestReconnect"}
         response = handler.handle_request(

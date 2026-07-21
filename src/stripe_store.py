@@ -1839,6 +1839,63 @@ class DynamoStripeCommandStore:
             }
         }
 
+    def get_subscription_projection(
+        self,
+        scope: IntegrationScope,
+        connection_id: str,
+        subscription_id: str,
+    ) -> dict[str, Any] | None:
+        _identity(scope, connection_id)
+        _identifier(subscription_id)
+        record = self._get(
+            scope.partition_key,
+            f"STRIPE_SUBSCRIPTION_PROJECTION#{subscription_id}",
+        )
+        if record is None:
+            return None
+        expected_keys = {
+            "pk",
+            "sk",
+            "itemType",
+            *scope.fields().keys(),
+            "subscriptionId",
+            "offerVersionId",
+            "status",
+            "currentPeriodEnd",
+            "sourceRevision",
+            "lastEventId",
+            "lastEventCreatedAt",
+            "stateHash",
+        }
+        if (
+            not isinstance(record, Mapping)
+            or set(record) != expected_keys
+            or record.get("pk") != scope.partition_key
+            or record.get("sk") != f"STRIPE_SUBSCRIPTION_PROJECTION#{subscription_id}"
+            or record.get("itemType") != "StripeSubscriptionProjection"
+            or any(
+                record.get(key) != expected for key, expected in scope.fields().items()
+            )
+            or record.get("subscriptionId") != subscription_id
+            or record.get("status") not in {"active", "past_due", "canceled"}
+            or type(record.get("sourceRevision")) is not int
+            or record["sourceRevision"] < 1
+            or type(record.get("currentPeriodEnd")) is not int
+            or record["currentPeriodEnd"] < 0
+            or type(record.get("lastEventCreatedAt")) is not int
+            or record["lastEventCreatedAt"] < 0
+        ):
+            raise StripeStoreError("Stripe subscription projection is unavailable")
+        _identifier(record.get("offerVersionId"))
+        _identifier(record.get("lastEventId"))
+        _digest(record.get("stateHash"))
+        return {
+            "subscriptionId": record["subscriptionId"],
+            "offerVersionId": record["offerVersionId"],
+            "status": record["status"],
+            "sourceRevision": record["sourceRevision"],
+        }
+
     def _object_index_writes(self, scope, connection_id, mapping):
         operations = []
         for object_type, field in _PROVIDER_OBJECT_FIELDS.items():
@@ -1946,7 +2003,14 @@ def _operation_claim(value: object) -> dict[str, Any]:
     claim = dict(value)
     _identifier(claim["resourceType"])
     _identifier(claim["resourceId"])
-    if claim["dimension"] not in {"immutable", "presentation", "lifecycle"}:
+    allowed = {
+        "offer": {"immutable", "presentation", "lifecycle"},
+        "discount": {"immutable", "presentation", "lifecycle"},
+        "checkout": {"immutable"},
+        "subscription": {"change", "discount", "pause"},
+        "customer-portal": {"immutable"},
+    }
+    if claim["dimension"] not in allowed.get(claim["resourceType"], set()):
         raise StripeCommandConflict("Stripe command conflicted")
     if (
         type(claim["revision"]) is not int

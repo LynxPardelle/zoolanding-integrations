@@ -823,13 +823,18 @@ class InternalContractTests(unittest.TestCase):
             "connectionId": "stripe-primary",
             "commandId": "command-1",
             "idempotencyKey": "retry-1",
-            "credentialReference": "/zoolanding/test/integrations/stripe/connect-platform",
             "provider": "stripe",
             "mode": "test",
             "capabilities": ["checkout"],
             "accountReference": None,
         }
         contracts.validate_connection_registration(payload)
+        payload["credentialReference"] = (
+            "/zoolanding/test/integrations/stripe/connect-platform"
+        )
+        with self.assertRaises(contracts.ContractError):
+            contracts.validate_connection_registration(payload)
+        payload.pop("credentialReference")
         payload["secretValue"] = "synthetic"
         with self.assertRaises(contracts.ContractError):
             contracts.validate_connection_registration(payload)
@@ -893,7 +898,6 @@ class InternalContractTests(unittest.TestCase):
             "connectionId": "stripe-primary",
             "commandId": "command-1",
             "idempotencyKey": "retry-1",
-            "credentialReference": "/zoolanding/test/integrations/stripe/connect-platform",
             "provider": "stripe",
             "mode": "test",
             "capabilities": ["connect-onboarding", "checkout"],
@@ -908,6 +912,10 @@ class InternalContractTests(unittest.TestCase):
         self.assertEqual(registered["statusCode"], 200)
         self.assertNotIn("credentialReference", registered["body"])
         self.assertEqual(admin.calls[0][0][0].scope.draft_id, "draft-example")
+        self.assertEqual(
+            admin.calls[0][1]["credential_reference"],
+            "/zoolanding/test/integrations/stripe/connect-platform",
+        )
 
         class Resolver:
             def resolve(self, *args, **kwargs):

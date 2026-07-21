@@ -835,7 +835,7 @@ class SecretsManagerStripeClientFactory:
             client = stripe.StripeClient(
                 secret_key,
                 client_id=client_id,
-                max_network_retries=2,
+                max_network_retries=1,
                 http_client=http_client,
             )
         except Exception:
@@ -848,7 +848,7 @@ class _TimedOpener:
         self._opener = opener
 
     def open(self, request: Any):
-        return self._opener.open(request, timeout=5)
+        return self._opener.open(request, timeout=3)
 
 
 class _TimedUrllib:
@@ -861,7 +861,7 @@ class _TimedUrllib:
 
     @staticmethod
     def urlopen(request: Any):
-        return urllib.request.urlopen(request, timeout=5)
+        return urllib.request.urlopen(request, timeout=3)
 
 
 class StripeSdkClient:
@@ -906,10 +906,10 @@ class StripeSdkClient:
         response = self.client.v1.accounts.create(
             {
                 "controller": {
-                    "fees": {"payer": "application"},
-                    "losses": {"payments": "application"},
-                    "requirement_collection": "application",
-                    "stripe_dashboard": {"type": "express"},
+                    "fees": {"payer": "account"},
+                    "losses": {"payments": "stripe"},
+                    "requirement_collection": "stripe",
+                    "stripe_dashboard": {"type": "full"},
                 },
                 "capabilities": {
                     "card_payments": {"requested": True},
@@ -1095,7 +1095,7 @@ class StripeSdkClient:
     def retrieve_subscription_operation_state(self, **kwargs: Any) -> dict[str, Any]:
         response = self.client.v1.subscriptions.retrieve(
             kwargs["subscription_id"],
-            {},
+            {"expand": ["latest_invoice.payments"]},
             {"stripe_account": kwargs["stripe_account"]},
         )
         items_value = _mapping_value(_mapping_value(response, "items"), "data")
@@ -1107,6 +1107,10 @@ class StripeSdkClient:
                 "itemId": _mapping_value(item, "id"),
                 "priceId": _reference_value(_mapping_value(item, "price")),
                 "quantity": _mapping_value(item, "quantity"),
+                "taxRateIds": [
+                    _reference_value(rate)
+                    for rate in (_mapping_value(item, "tax_rates") or [])
+                ],
             }
             for item in items_value
         ]
@@ -1121,6 +1125,30 @@ class StripeSdkClient:
             resumes_at = _mapping_value(pause, "resumes_at")
             if resumes_at is not None:
                 pause_collection["resumesAt"] = resumes_at
+        latest = _mapping_value(response, "latest_invoice")
+        latest_invoice = None
+        if latest is not None:
+            payments = _mapping_value(_mapping_value(latest, "payments"), "data")
+            if not isinstance(payments, list):
+                raise StripeAdapterError("Stripe subscription is unavailable")
+            defaults = [
+                payment
+                for payment in payments
+                if _mapping_value(payment, "is_default") is True
+            ]
+            if len(defaults) > 1:
+                raise StripeAdapterError("Stripe subscription is unavailable")
+            latest_invoice = {
+                "invoiceId": _mapping_value(latest, "id"),
+                "status": _mapping_value(latest, "status"),
+                "paymentStatus": (
+                    None if not defaults else _mapping_value(defaults[0], "status")
+                ),
+            }
+        automatic_tax = _mapping_value(response, "automatic_tax")
+        tax_rates = _mapping_value(response, "default_tax_rates")
+        if not isinstance(tax_rates, list):
+            raise StripeAdapterError("Stripe subscription is unavailable")
         return {
             "subscriptionId": _mapping_value(response, "id"),
             "customerId": _reference_value(_mapping_value(response, "customer")),
@@ -1129,6 +1157,10 @@ class StripeSdkClient:
             "scheduleId": _reference_value(_mapping_value(response, "schedule")),
             "discounts": discounts,
             "pauseCollection": pause_collection,
+            "latestInvoice": latest_invoice,
+            "pendingUpdate": _mapping_value(response, "pending_update") is not None,
+            "automaticTax": {"enabled": _mapping_value(automatic_tax, "enabled")},
+            "defaultTaxRateIds": [_reference_value(rate) for rate in tax_rates],
         }
 
     def preview_subscription_change(self, **kwargs: Any) -> dict[str, Any]:
@@ -1144,6 +1176,7 @@ class StripeSdkClient:
                         }
                     ],
                     "proration_date": kwargs["preview_timestamp"],
+                    "proration_behavior": "always_invoice",
                 },
             },
             {"stripe_account": kwargs["stripe_account"]},
@@ -1161,8 +1194,9 @@ class StripeSdkClient:
                         "quantity": kwargs["quantity"],
                     }
                 ],
-                "proration_behavior": "create_prorations",
+                "proration_behavior": "always_invoice",
                 "proration_date": kwargs["preview_timestamp"],
+                "payment_behavior": "pending_if_incomplete",
             },
             _request_options(kwargs),
         )
@@ -1182,28 +1216,41 @@ class StripeSdkClient:
             or type(end) is not int
         ):
             raise StripeAdapterError("Stripe subscription is unavailable")
+        preserved = kwargs["preserved_settings"]
+        phase_settings = {
+            "automatic_tax": preserved["automaticTax"],
+            "default_tax_rates": preserved["defaultTaxRateIds"],
+            "discounts": [
+                {"promotion_code": promotion_code}
+                for promotion_code in preserved["discounts"]
+            ],
+        }
         self.client.v1.subscription_schedules.update(
             schedule_id,
             {
                 "end_behavior": "release",
                 "phases": [
                     {
+                        **phase_settings,
                         "start_date": start,
                         "end_date": end,
                         "items": [
                             {
                                 "price": kwargs["current_price_id"],
                                 "quantity": kwargs["quantity"],
+                                "tax_rates": preserved["itemTaxRateIds"],
                             }
                         ],
                     },
                     {
+                        **phase_settings,
                         "items": [
                             {
                                 "price": kwargs["price_id"],
                                 "quantity": kwargs["quantity"],
+                                "tax_rates": preserved["itemTaxRateIds"],
                             }
-                        ]
+                        ],
                     },
                 ],
             },
@@ -1251,6 +1298,7 @@ class StripeSdkClient:
             {
                 "customer": kwargs["customer_id"],
                 "configuration": kwargs["configuration_id"],
+                "return_url": kwargs["return_url"],
             },
             _request_options(kwargs),
         )

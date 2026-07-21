@@ -63,12 +63,24 @@ def handle_request(
             store=auth_store,
             now_epoch=now_epoch,
         )
-        connection = registry.update_status(
-            policies.scope,
-            connection_id,
-            "disabled" if operation == "disable" else "pending",
-            revision,
-        )
+        if operation == "disable":
+            current = registry.connection(policies.scope, connection_id)
+            account_reference = current.provider_metadata.get("accountReference")
+            if current.provider == "stripe" and type(account_reference) is str:
+                connection = registry.disable_stripe_account(
+                    policies.scope,
+                    connection_id,
+                    account_reference,
+                    revision,
+                )
+            else:
+                connection = registry.update_status(
+                    policies.scope, connection_id, "disabled", revision
+                )
+        else:
+            connection = registry.update_status(
+                policies.scope, connection_id, "pending", revision
+            )
         return {
             "connection": {
                 "connectionId": connection.connection_id,

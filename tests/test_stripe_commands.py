@@ -251,6 +251,7 @@ class Store:
         self.code_claims = {}
         self.operation_claims = {}
         self.persisted_values = []
+        self.subscription_projections = {}
 
     def claim(
         self,
@@ -325,6 +326,12 @@ class Store:
     def get_mapping(self, scope, connection_id, resource_type, resource_id):
         value = self.mappings.get(
             (scope.partition_key, connection_id, resource_type, resource_id)
+        )
+        return dict(value) if value is not None else None
+
+    def get_subscription_projection(self, scope, connection_id, subscription_id):
+        value = self.subscription_projections.get(
+            (scope.partition_key, connection_id, subscription_id)
         )
         return dict(value) if value is not None else None
 
@@ -438,6 +445,7 @@ class Provider:
     def __init__(self):
         self.calls = []
         self.fail_checkout_once = False
+        self.portal_expires_at = 1_800_001_800
 
     def create_product(self, resolved_binding, resource_id, idempotency_key):
         self.calls.append(("product", resource_id, idempotency_key))
@@ -529,11 +537,20 @@ class Provider:
                     "itemId": "si_synthetic01",
                     "priceId": "price_synthetic01",
                     "quantity": 2,
+                    "taxRateIds": [],
                 }
             ],
             "scheduleId": None,
             "discounts": [],
             "pauseCollection": None,
+            "latestInvoice": {
+                "invoiceId": "in_synthetic01",
+                "status": "paid",
+                "paymentStatus": "paid",
+            },
+            "pendingUpdate": False,
+            "automaticTax": {"enabled": True},
+            "defaultTaxRateIds": [],
         }
 
     def preview_subscription_change(self, resolved_binding, **kwargs):
@@ -560,7 +577,7 @@ class Provider:
         self.calls.append(("portal-session", kwargs))
         return {
             "redirectUrl": "https://billing.stripe.com/p/session/synthetic",
-            "expiresAt": 1_800_001_800,
+            "expiresAt": self.portal_expires_at,
         }
 
 
@@ -626,6 +643,72 @@ class StripeCommandTests(unittest.TestCase):
             "providerSubscriptionId": "sub_synthetic01",
             "status": "active",
         }
+        self.store.subscription_projections[(*prefix, "subscription-1")] = {
+            "subscriptionId": "subscription-1",
+            "offerVersionId": "offer-v1",
+            "status": "active",
+            "sourceRevision": 2,
+        }
+
+    def test_subscription_revision_is_checked_from_projection_before_provider_network(
+        self,
+    ):
+        self.seed_subscription()
+        payload = {
+            "subscriptionId": "subscription-1",
+            "expectedRevision": 1,
+            "targetOfferVersionId": "offer-v2",
+            "planChangePolicy": {"mode": "next-renewal"},
+        }
+        stale = subscription_command(
+            "subscription-change", payload, revision=1, operation="subscription-change"
+        )
+
+        with self.assertRaisesRegex(Exception, "conflict"):
+            self.service.execute("subscription-change", stale)
+        self.assertEqual(self.provider.calls, [])
+
+    def test_missing_subscription_projection_is_not_found_before_provider_network(self):
+        self.seed_subscription()
+        self.store.subscription_projections.clear()
+        value = subscription_command(
+            "subscription-discount",
+            {
+                "subscriptionId": "subscription-1",
+                "expectedRevision": 2,
+                "action": "remove",
+            },
+            operation="remove",
+        )
+
+        with self.assertRaisesRegex(Exception, "not found"):
+            self.service.execute("subscription-discount", value)
+        self.assertEqual(self.provider.calls, [])
+
+    def test_foreign_subscription_projection_routes_to_review_without_provider_network(
+        self,
+    ):
+        self.seed_subscription()
+        key = next(iter(self.store.subscription_projections))
+        self.store.subscription_projections[key][
+            "subscriptionId"
+        ] = "subscription-other"
+        value = subscription_command(
+            "subscription-pause",
+            {
+                "subscriptionId": "subscription-1",
+                "expectedRevision": 2,
+                "action": "resume",
+                "pausePolicy": {"enabled": False},
+            },
+            operation="resume",
+        )
+
+        self.assertEqual(
+            self.service.execute("subscription-pause", value)["status"],
+            "needs_review",
+        )
+        self.assertEqual(self.provider.calls, [])
 
     def test_immediate_plan_change_previews_and_applies_identical_item_quantity_and_timestamp(
         self,
@@ -706,11 +789,13 @@ class StripeCommandTests(unittest.TestCase):
                         "itemId": "si_one00001",
                         "priceId": "price_synthetic01",
                         "quantity": 1,
+                        "taxRateIds": [],
                     },
                     {
                         "itemId": "si_two00002",
                         "priceId": "price_synthetic02",
                         "quantity": 1,
+                        "taxRateIds": [],
                     },
                 ]
             },
@@ -742,6 +827,101 @@ class StripeCommandTests(unittest.TestCase):
                     "subscription-schedule", [call[0] for call in self.provider.calls]
                 )
 
+    def test_subscription_mutations_block_unsafe_invoice_payment_pending_and_status_states(
+        self,
+    ):
+        unsafe_changes = (
+            {"status": "past_due"},
+            {"status": "unpaid"},
+            {"status": "incomplete"},
+            {"pendingUpdate": True},
+            {
+                "latestInvoice": {
+                    "invoiceId": "in_synthetic01",
+                    "status": "open",
+                    "paymentStatus": "open",
+                }
+            },
+            {
+                "latestInvoice": {
+                    "invoiceId": "in_synthetic01",
+                    "status": "paid",
+                    "paymentStatus": "canceled",
+                }
+            },
+        )
+        for change in unsafe_changes:
+            with self.subTest(change=change):
+                self.setUp()
+                self.seed_subscription()
+                original = self.provider.retrieve_subscription_operation_state
+                self.provider.retrieve_subscription_operation_state = (
+                    lambda *args, change=change: {**original(*args), **change}
+                )
+                value = subscription_command(
+                    "subscription-pause",
+                    {
+                        "subscriptionId": "subscription-1",
+                        "expectedRevision": 2,
+                        "action": "resume",
+                        "pausePolicy": {"enabled": False},
+                    },
+                    operation="resume",
+                )
+                self.assertEqual(
+                    self.service.execute("subscription-pause", value)["status"],
+                    "needs_review",
+                )
+                self.assertFalse(
+                    any(call[0] == "subscription-pause" for call in self.provider.calls)
+                )
+
+    def test_next_renewal_preserves_discount_tax_and_item_tax_settings(self):
+        self.seed_subscription()
+        original = self.provider.retrieve_subscription_operation_state
+        self.provider.retrieve_subscription_operation_state = lambda *args: {
+            **original(*args),
+            "discounts": ["promo_synthetic01"],
+            "automaticTax": {"enabled": True},
+            "defaultTaxRateIds": ["txr_synthetic01"],
+            "items": [
+                {
+                    "itemId": "si_synthetic01",
+                    "priceId": "price_synthetic01",
+                    "quantity": 2,
+                    "taxRateIds": ["txr_item00001"],
+                }
+            ],
+        }
+        value = subscription_command(
+            "subscription-change",
+            {
+                "subscriptionId": "subscription-1",
+                "expectedRevision": 2,
+                "targetOfferVersionId": "offer-v2",
+                "planChangePolicy": {"mode": "next-renewal"},
+            },
+            operation="subscription-change",
+        )
+
+        self.assertEqual(
+            self.service.execute("subscription-change", value)["status"], "accepted"
+        )
+        scheduled = next(
+            call[1]
+            for call in self.provider.calls
+            if call[0] == "subscription-schedule"
+        )
+        self.assertEqual(
+            scheduled["preserved_settings"],
+            {
+                "automaticTax": {"enabled": True},
+                "defaultTaxRateIds": ["txr_synthetic01"],
+                "discounts": ["promo_synthetic01"],
+                "itemTaxRateIds": ["txr_item00001"],
+            },
+        )
+
     def test_discount_pause_and_portal_use_exact_mappings_and_restricted_configuration(
         self,
     ):
@@ -772,7 +952,7 @@ class StripeCommandTests(unittest.TestCase):
             "subscription-pause",
             {
                 "subscriptionId": "subscription-1",
-                "expectedRevision": 3,
+                "expectedRevision": 2,
                 "action": "pause",
                 "pausePolicy": {
                     "enabled": True,
@@ -786,7 +966,7 @@ class StripeCommandTests(unittest.TestCase):
                     },
                 },
             },
-            revision=3,
+            revision=2,
             operation="pause",
         )
 
@@ -809,7 +989,10 @@ class StripeCommandTests(unittest.TestCase):
         self.assertEqual(pause_call["pause_collection"], {"behavior": "keep_as_draft"})
 
         portal_payload = offer_command()
-        portal_payload["input"] = {"subscriptionId": "subscription-1"}
+        portal_payload["input"] = {
+            "subscriptionId": "subscription-1",
+            "portalAttemptId": "portal-attempt-1",
+        }
         portal_hash = hashlib.sha256(
             json.dumps(
                 portal_payload["input"], sort_keys=True, separators=(",", ":")
@@ -830,6 +1013,13 @@ class StripeCommandTests(unittest.TestCase):
             first["redirectUrl"], "https://billing.stripe.com/p/session/synthetic"
         )
         self.assertEqual(second["status"], "accepted")
+        portal_call = next(
+            call[1] for call in self.provider.calls if call[0] == "portal-session"
+        )
+        self.assertEqual(
+            portal_call["return_url"],
+            "https://test.zoolandingpage.com.mx/admin/billing?draftDomain=example.com",
+        )
         self.assertEqual(
             [call[0] for call in self.provider.calls].count("portal-configuration"), 1
         )
@@ -837,6 +1027,167 @@ class StripeCommandTests(unittest.TestCase):
             [call[0] for call in self.provider.calls].count("portal-session"), 2
         )
         self.assertNotIn("billing.stripe.com", repr(self.store.persisted_values))
+        self.assertTrue(
+            any(
+                mapping.get("resourceType") == "customer-portal"
+                and mapping.get("resourceId") == "portal-attempt-1"
+                and "redirectUrl" not in mapping
+                for _result, mappings in self.store.persisted_values
+                for mapping in mappings
+            )
+        )
+
+        self.now = 1_800_001_800
+        before = len(
+            [call for call in self.provider.calls if call[0] == "portal-session"]
+        )
+        expired = self.service.execute("customer-portal", portal)
+        self.assertEqual(expired["status"], "needs_review")
+        self.assertEqual(
+            len([call for call in self.provider.calls if call[0] == "portal-session"]),
+            before,
+        )
+
+        next_payload = offer_command()
+        next_payload["input"] = {
+            "subscriptionId": "subscription-1",
+            "portalAttemptId": "portal-attempt-2",
+        }
+        next_hash = hashlib.sha256(
+            json.dumps(
+                next_payload["input"], sort_keys=True, separators=(",", ":")
+            ).encode()
+        ).hexdigest()
+        next_payload["idempotencyKey"] = integration_key(
+            next_payload["scope"],
+            "stripe-primary",
+            "customer-portal",
+            "subscription-1",
+            1,
+            next_hash,
+        )
+        self.provider.portal_expires_at = self.now + 1_800
+        next_attempt = self.service.execute(
+            "customer-portal", command("customer-portal", next_payload)
+        )
+        self.assertEqual(next_attempt["status"], "accepted")
+
+    def test_all_supported_pause_invoice_behaviors_are_forwarded_exactly(self):
+        for configured, expected in (
+            ("void", "void"),
+            ("keep-as-draft", "keep_as_draft"),
+            ("mark-uncollectible", "mark_uncollectible"),
+        ):
+            with self.subTest(configured=configured):
+                self.setUp()
+                self.seed_subscription()
+                value = subscription_command(
+                    "subscription-pause",
+                    {
+                        "subscriptionId": "subscription-1",
+                        "expectedRevision": 2,
+                        "action": "pause",
+                        "pausePolicy": {
+                            "enabled": True,
+                            "newInvoiceBehavior": configured,
+                            "existingInvoiceBehavior": "unchanged",
+                            "accessBehavior": "suspend",
+                            "resume": {"mode": "manual"},
+                            "onResume": {
+                                "collection": "restore",
+                                "access": "restore-if-suspended",
+                            },
+                        },
+                    },
+                    operation="pause",
+                )
+                self.assertEqual(
+                    self.service.execute("subscription-pause", value)["status"],
+                    "accepted",
+                )
+                call = next(
+                    item[1]
+                    for item in self.provider.calls
+                    if item[0] == "subscription-pause"
+                )
+                self.assertEqual(call["pause_collection"], {"behavior": expected})
+
+    def test_customer_portal_attempt_id_is_bounded_and_part_of_canonical_idempotency(
+        self,
+    ):
+        payload = offer_command()
+        input_value = {
+            "subscriptionId": "subscription-1",
+            "portalAttemptId": "portal-attempt-1",
+        }
+        payload["input"] = input_value
+        content_hash = hashlib.sha256(
+            json.dumps(input_value, sort_keys=True, separators=(",", ":")).encode()
+        ).hexdigest()
+        payload["idempotencyKey"] = integration_key(
+            payload["scope"],
+            "stripe-primary",
+            "customer-portal",
+            "subscription-1",
+            1,
+            content_hash,
+        )
+        self.assertEqual(
+            command("customer-portal", payload).input["portalAttemptId"],
+            "portal-attempt-1",
+        )
+
+        payload["input"] = {**input_value, "portalAttemptId": "a" * 65}
+        with self.assertRaises(Exception):
+            command("customer-portal", payload)
+
+    def test_restricted_portal_remains_available_for_failed_payment_recovery(self):
+        self.seed_subscription()
+        original = self.provider.retrieve_subscription_operation_state
+        self.provider.retrieve_subscription_operation_state = lambda *args: {
+            **original(*args),
+            "status": "past_due",
+            "latestInvoice": {
+                "invoiceId": "in_synthetic01",
+                "status": "open",
+                "paymentStatus": "open",
+            },
+        }
+        payload = offer_command()
+        payload["input"] = {
+            "subscriptionId": "subscription-1",
+            "portalAttemptId": "recovery-attempt-1",
+        }
+        content_hash = hashlib.sha256(
+            json.dumps(payload["input"], sort_keys=True, separators=(",", ":")).encode()
+        ).hexdigest()
+        payload["idempotencyKey"] = integration_key(
+            payload["scope"],
+            "stripe-primary",
+            "customer-portal",
+            "subscription-1",
+            1,
+            content_hash,
+        )
+
+        self.assertEqual(
+            self.service.execute(
+                "customer-portal", command("customer-portal", payload)
+            )["status"],
+            "accepted",
+        )
+        self.assertFalse(
+            any(
+                call[0]
+                in {
+                    "subscription-apply",
+                    "subscription-schedule",
+                    "subscription-discount",
+                    "subscription-pause",
+                }
+                for call in self.provider.calls
+            )
+        )
 
     def provision_offer(self):
         return self.service.execute("offer", command("offer", offer_command()))

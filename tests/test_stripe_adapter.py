@@ -3,6 +3,7 @@ import importlib.util
 import json
 import sys
 import unittest
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -117,7 +118,7 @@ class StripeAdapterTests(unittest.TestCase):
         )
         self.assertEqual(constructed[0][0], "sk_test_syntheticsecret123456")
         self.assertEqual(constructed[0][1]["client_id"], "ca_syntheticclient1234")
-        self.assertEqual(constructed[0][1]["max_network_retries"], 2)
+        self.assertEqual(constructed[0][1]["max_network_retries"], 1)
         self.assertIsInstance(constructed[0][1]["http_client"], HttpClient)
 
         for invalid in (
@@ -146,17 +147,68 @@ class StripeAdapterTests(unittest.TestCase):
                     connection(status="pending", account=None, ready=False)
                 )
 
-    def test_stdlib_transport_always_applies_the_five_second_network_timeout(self):
+    def test_stdlib_transport_always_applies_the_three_second_network_timeout(self):
         stripe = stripe_module(self)
         with patch("urllib.request.urlopen", return_value="response") as opened:
             self.assertEqual(stripe._TimedUrllib.urlopen("request"), "response")
-        opened.assert_called_once_with("request", timeout=5)
+        opened.assert_called_once_with("request", timeout=3)
 
         opener = SimpleNamespace(open=lambda *args, **kwargs: (args, kwargs))
         timed = stripe._TimedOpener(opener)
         args, kwargs = timed.open("request")
         self.assertEqual(args, ("request",))
-        self.assertEqual(kwargs, {"timeout": 5})
+        self.assertEqual(kwargs, {"timeout": 3})
+
+    def test_official_stripe_http_client_retries_429_timeout_and_5xx_once_with_backoff(
+        self,
+    ):
+        try:
+            import stripe as official_stripe
+        except ModuleNotFoundError:
+            build = (
+                Path(__file__).parents[1]
+                / ".aws-sam"
+                / "build"
+                / "InternalStripeCustomerPortalFunction"
+            )
+            with patch.object(sys, "path", [str(build), *sys.path]):
+                official_stripe = importlib.import_module("stripe")
+
+        HTTPClient = official_stripe._http_client.HTTPClient
+        APIConnectionError = official_stripe._error.APIConnectionError
+
+        class FakeHttp(HTTPClient):
+            def __init__(self, responses):
+                super().__init__()
+                self.responses = list(responses)
+                self.calls = 0
+
+            def request(self, method, url, headers, post_data=None, **kwargs):
+                del method, url, headers, post_data, kwargs
+                self.calls += 1
+                response = self.responses.pop(0)
+                if isinstance(response, Exception):
+                    raise response
+                return response
+
+        cases = (
+            (("{}", 429, {"stripe-should-retry": "true"}), "429"),
+            (APIConnectionError("timeout", should_retry=True), "timeout"),
+            (("{}", 503, {}), "5xx"),
+        )
+        for first, label in cases:
+            with (
+                self.subTest(label=label),
+                patch("stripe._http_client.time.sleep") as slept,
+            ):
+                client = FakeHttp([first, ("{}", 200, {})])
+                response = client.request_with_retries(
+                    "post", "https://api.stripe.com/v1/test", {}, max_network_retries=1
+                )
+                self.assertEqual(response[1], 200)
+                self.assertEqual(client.calls, 2)
+                slept.assert_called_once()
+                self.assertLessEqual(slept.call_args.args[0], 0.5)
 
     def test_webhook_verifier_uses_official_raw_signature_api_and_fixed_tolerance(self):
         stripe = stripe_module(self)
@@ -566,12 +618,21 @@ class StripeAdapterTests(unittest.TestCase):
                                 "id": "si_synthetic01",
                                 "price": "price_synthetic01",
                                 "quantity": 2,
+                                "tax_rates": [],
                             }
                         ]
                     },
                     "schedule": None,
                     "discounts": [],
                     "pause_collection": None,
+                    "latest_invoice": {
+                        "id": "in_synthetic01",
+                        "status": "paid",
+                        "payments": {"data": [{"is_default": True, "status": "paid"}]},
+                    },
+                    "pending_update": None,
+                    "automatic_tax": {"enabled": True},
+                    "default_tax_rates": [],
                 }
             )
             invoices = Resource({"id": "in_synthetic01"})
@@ -731,10 +792,10 @@ class StripeAdapterTests(unittest.TestCase):
         self.assertEqual(
             controller_params["controller"],
             {
-                "fees": {"payer": "application"},
-                "losses": {"payments": "application"},
-                "requirement_collection": "application",
-                "stripe_dashboard": {"type": "express"},
+                "fees": {"payer": "account"},
+                "losses": {"payments": "stripe"},
+                "requirement_collection": "stripe",
+                "stripe_dashboard": {"type": "full"},
             },
         )
         self.assertEqual(
@@ -752,6 +813,8 @@ class StripeAdapterTests(unittest.TestCase):
             subscription_id="sub_synthetic01",
         )
         self.assertEqual(state["items"][0]["quantity"], 2)
+        self.assertEqual(state["latestInvoice"]["paymentStatus"], "paid")
+        self.assertEqual(state["automaticTax"], {"enabled": True})
         shared = {
             "stripe_account": "acct_synthetic",
             "subscription_id": "sub_synthetic01",
@@ -776,6 +839,12 @@ class StripeAdapterTests(unittest.TestCase):
             preview_params["subscription_details"]["proration_date"],
             apply_params["proration_date"],
         )
+        self.assertEqual(
+            preview_params["subscription_details"]["proration_behavior"],
+            "always_invoice",
+        )
+        self.assertEqual(apply_params["proration_behavior"], "always_invoice")
+        self.assertEqual(apply_params["payment_behavior"], "pending_if_incomplete")
         configuration = sdk.create_portal_configuration(
             stripe_account="acct_synthetic", idempotency_key="idem"
         )
@@ -788,9 +857,14 @@ class StripeAdapterTests(unittest.TestCase):
             stripe_account="acct_synthetic",
             customer_id="cus_synthetic01",
             configuration_id="bpc_synthetic01",
+            return_url="https://example.com/admin/billing",
             idempotency_key="idem",
         )
         self.assertEqual(portal["expiresAt"], 1_800_001_800)
+        portal_params = OfficialClient.v1.billing_portal.sessions.calls[-1][1][0]
+        self.assertEqual(
+            portal_params["return_url"], "https://example.com/admin/billing"
+        )
 
 
 if __name__ == "__main__":

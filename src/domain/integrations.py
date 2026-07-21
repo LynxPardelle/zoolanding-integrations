@@ -65,9 +65,15 @@ _STRIPE_KEYS = frozenset(
         "platformFeeMode",
         "webhookIngress",
         "onboardingRoutes",
+        "customerPortalReturnPath",
     }
 )
-_STRIPE_REQUIRED = _STRIPE_KEYS - {"taxApprovalId"}
+_STRIPE_REQUIRED = _STRIPE_KEYS - {
+    "accountStrategy",
+    "taxApprovalId",
+    "onboardingRoutes",
+    "customerPortalReturnPath",
+}
 
 
 def _safe_id(value: object, name: str) -> str:
@@ -120,13 +126,17 @@ def _provider(provider: object, adapter_version: object) -> str:
     return provider
 
 
-def _stripe_binding_metadata(value: object) -> Mapping[str, Any]:
+def _stripe_binding_metadata(
+    value: object, capabilities: frozenset[str]
+) -> Mapping[str, Any]:
     if (
         not isinstance(value, Mapping)
         or not _STRIPE_REQUIRED.issubset(value)
         or not set(value).issubset(_STRIPE_KEYS)
     ):
         raise ValueError("Stripe binding metadata is invalid")
+    selected = dict(value)
+    selected.setdefault("accountStrategy", "oauth-standard-v1")
     expected = {
         "accountModel": "merchant",
         "chargeType": "direct",
@@ -135,30 +145,42 @@ def _stripe_binding_metadata(value: object) -> Mapping[str, Any]:
         "webhookIngress": "direct-integrations-api",
     }
     if any(
-        value.get(key) != expected_value for key, expected_value in expected.items()
+        selected.get(key) != expected_value for key, expected_value in expected.items()
     ):
         raise ValueError("Stripe binding metadata is invalid")
-    if value.get("taxMode") not in {"unconfigured", "manual-rate", "stripe-tax"}:
+    if selected.get("taxMode") not in {"unconfigured", "manual-rate", "stripe-tax"}:
         raise ValueError("Stripe binding metadata is invalid")
-    if value.get("accountStrategy") not in {
+    if selected.get("accountStrategy") not in {
         "oauth-standard-v1",
         "controller-account-link-v1",
     }:
         raise ValueError("Stripe binding metadata is invalid")
-    routes = value.get("onboardingRoutes")
-    if (
-        not isinstance(routes, Mapping)
-        or set(routes) != {"returnPath", "refreshPath"}
-        or any(
-            type(routes[field]) is not str
-            or _SAME_ORIGIN_PATH.fullmatch(routes[field]) is None
-            for field in ("returnPath", "refreshPath")
-        )
+    has_onboarding = "connect-onboarding" in capabilities
+    if has_onboarding != ("onboardingRoutes" in selected):
+        raise ValueError("Stripe binding metadata is invalid")
+    if has_onboarding:
+        routes = selected["onboardingRoutes"]
+        if (
+            not isinstance(routes, Mapping)
+            or set(routes) != {"returnPath", "refreshPath"}
+            or any(
+                type(routes[field]) is not str
+                or _SAME_ORIGIN_PATH.fullmatch(routes[field]) is None
+                for field in ("returnPath", "refreshPath")
+            )
+        ):
+            raise ValueError("Stripe binding metadata is invalid")
+    has_portal = "customer-portal" in capabilities
+    if has_portal != ("customerPortalReturnPath" in selected):
+        raise ValueError("Stripe binding metadata is invalid")
+    if has_portal and (
+        type(selected["customerPortalReturnPath"]) is not str
+        or _SAME_ORIGIN_PATH.fullmatch(selected["customerPortalReturnPath"]) is None
     ):
         raise ValueError("Stripe binding metadata is invalid")
-    if "taxApprovalId" in value:
-        _safe_id(value["taxApprovalId"], "tax approval ID")
-    return _freeze(dict(value))
+    if "taxApprovalId" in selected:
+        _safe_id(selected["taxApprovalId"], "tax approval ID")
+    return _freeze(selected)
 
 
 @dataclass(frozen=True, slots=True)
@@ -219,7 +241,9 @@ class IntegrationBinding:
             self, "capabilities", _capabilities(self.provider, self.capabilities)
         )
         if self.provider == "stripe":
-            metadata = _stripe_binding_metadata(self.provider_metadata)
+            metadata = _stripe_binding_metadata(
+                self.provider_metadata, self.capabilities
+            )
         elif self.provider_metadata:
             raise ValueError("provider metadata is invalid")
         else:
