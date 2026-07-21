@@ -80,6 +80,7 @@ class PublishedPolicyTests(unittest.TestCase):
         self.prefix = f"sites/{DOMAIN}/versions/{self.version}/"
         self.key = f"{self.prefix}{DOMAIN}/server/integration-bindings.json"
         self.auth_key = f"{self.prefix}{DOMAIN}/server/auth-profile-registry.json"
+        self.commerce_key = f"{self.prefix}{DOMAIN}/server/commerce.json"
         self.table = FakeTable(
             {
                 "pk": f"SITE#{DOMAIN}",
@@ -222,6 +223,67 @@ class PublishedPolicyTests(unittest.TestCase):
         }
         with self.assertRaises(self.policy.PolicyResolutionError):
             self.resolver().resolve(environment="test", domain=DOMAIN)
+
+    def test_checkout_routes_are_loaded_from_the_same_published_version(self):
+        self.s3.objects[self.commerce_key] = {
+            "version": 1,
+            "scope": {
+                "environment": "test",
+                "tenantId": TENANT,
+                "draftId": DRAFT,
+                "domain": DOMAIN,
+            },
+            "commerce": {
+                "status": "active",
+                "checkout": {
+                    "successPath": "/pago/resultado",
+                    "cancelPath": "/planes",
+                    "termsPath": "/terminos",
+                    "privacyPath": "/privacidad",
+                    "refundPolicyPath": "/terminos#reembolsos",
+                    "supportPath": "/contacto",
+                },
+            },
+        }
+        scope = self.resolver().resolve(environment="test", domain=DOMAIN).scope
+        routes = self.policy.PublishedCheckoutRouteResolver(
+            self.resolver()
+        ).resolve(scope)
+
+        self.assertEqual(
+            routes,
+            {
+                "successUrl": "https://test.zoolandingpage.com.mx/pago/resultado?draftDomain=example.com",
+                "cancelUrl": "https://test.zoolandingpage.com.mx/planes?draftDomain=example.com",
+            },
+        )
+        self.assertEqual(self.s3.keys[-1]["Key"], self.commerce_key)
+
+    def test_checkout_routes_reject_absolute_or_ambiguous_paths(self):
+        value = {
+            "version": 1,
+            "scope": {
+                "environment": "test",
+                "tenantId": TENANT,
+                "draftId": DRAFT,
+                "domain": DOMAIN,
+            },
+            "commerce": {
+                "status": "active",
+                "checkout": {
+                    "successPath": "//evil.example/path",
+                    "cancelPath": "/plans?draftDomain=other.example",
+                    "termsPath": "/terms",
+                    "privacyPath": "/privacy",
+                    "refundPolicyPath": "/refunds",
+                    "supportPath": "/support",
+                },
+            },
+        }
+        self.s3.objects[self.commerce_key] = value
+        scope = self.resolver().resolve(environment="test", domain=DOMAIN).scope
+        with self.assertRaises(self.policy.PolicyResolutionError):
+            self.policy.PublishedCheckoutRouteResolver(self.resolver()).resolve(scope)
 
 
 if __name__ == "__main__":

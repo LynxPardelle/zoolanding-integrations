@@ -93,10 +93,15 @@ class SamControlPlaneTests(unittest.TestCase):
             "AuthSessionTableName",
             "AuthUserStateTableName",
             "InternalCallerArns",
-            "StripeSecretsPrefixArn",
-            "IntegrationSecretsPrefixArn",
         ):
             self.assertIn(name, parameters)
+        self.assertNotIn("StripeSecretsPrefixArn", parameters)
+        self.assertNotIn("IntegrationSecretsPrefixArn", parameters)
+        for role in ("StripeOnboardingRole", "InternalProviderCommandRole"):
+            rendered = self._role(role)
+            self.assertIn("${AWS::Partition}", rendered)
+            self.assertIn("/zoolanding/${EnvironmentName}/integrations/*/*/stripe/*", rendered)
+            self.assertNotIn("PrefixArn", rendered)
         self.assertIn("Runtime: python3.13", self.text)
         self.assertNotIn("Cache", self.text)
         self.assertNotIn("dev", self.text.lower())

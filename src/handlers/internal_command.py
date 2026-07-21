@@ -44,7 +44,7 @@ def handle_internal_command(
             raise validation_error() from None
         try:
             result = service.execute(kind, command)
-            return validate_service_result(result, command.command_id)
+            return validate_service_result(result, command)
         except ContractError:
             raise RuntimeError("invalid service response") from None
 

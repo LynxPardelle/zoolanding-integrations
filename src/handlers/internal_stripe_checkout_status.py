@@ -25,4 +25,16 @@ def handle_request(event, *, service=None, allowed_callers=None):
 
 def lambda_handler(event, context):
     del context
-    return handle_request(event)
+    try:
+        dependencies = _runtime_dependencies()
+    except Exception:
+        return handle_request(event)
+    return handle_request(event, **dependencies)
+
+
+def _runtime_dependencies():
+    try:
+        from runtime import stripe_command_runtime
+    except ModuleNotFoundError:
+        from src.runtime import stripe_command_runtime
+    return stripe_command_runtime()

@@ -28,7 +28,17 @@ def connection(
     status="active",
     mode="test",
     account="acct_synthetic",
+    ready=True,
 ):
+    metadata = {"accountReference": account}
+    if ready and status == "active":
+        metadata["readiness"] = {
+            "chargesEnabled": True,
+            "payoutsEnabled": True,
+            "detailsSubmitted": True,
+            "capabilitiesReady": True,
+            "requirementsDueCount": 0,
+        }
     return IntegrationConnection(
         scope=resolved_scope or scope(),
         connection_id="stripe-primary",
@@ -37,7 +47,7 @@ def connection(
         status=status,
         mode=mode,
         capabilities=frozenset({"connect-onboarding", "checkout"}),
-        provider_metadata={"accountReference": account},
+        provider_metadata=metadata,
     )
 
 
@@ -91,6 +101,22 @@ class MemoryBackend:
         if item["revision"] != expected_revision:
             raise RuntimeError("conflict")
         updated = {**item, "status": status, "revision": expected_revision + 1}
+        self.records[(pk, sk)] = updated
+        return updated
+
+    def activate_ready(self, pk, sk, readiness, expected_revision):
+        item = self.records[(pk, sk)]
+        if item["revision"] != expected_revision:
+            raise RuntimeError("conflict")
+        updated = {
+            **item,
+            "status": "active",
+            "revision": expected_revision + 1,
+            "providerMetadata": {
+                **item["providerMetadata"],
+                "readiness": dict(readiness),
+            },
+        }
         self.records[(pk, sk)] = updated
         return updated
 
@@ -168,6 +194,37 @@ class RegistryTests(unittest.TestCase):
                     provider=provider,
                     capability=capability,
                 )
+
+    def test_checkout_resolution_requires_persisted_canonical_provider_readiness(self):
+        registry_api = registry_module(self)
+        backend = MemoryBackend()
+        not_ready = connection(ready=False)
+        registry_api.ConnectionRegistry(backend).register(
+            not_ready, binding(), "request-not-ready"
+        )
+        resolver = registry_api.BindingResolver(registry_api.ConnectionRegistry(backend))
+        with self.assertRaises(registry_api.RegistryAccessDenied):
+            resolver.resolve(
+                scope(), "stripe-primary", provider="stripe", capability="checkout"
+            )
+
+        activated = registry_api.ConnectionRegistry(backend).activate_ready(
+            scope(),
+            "stripe-primary",
+            {
+                "status": "ready",
+                "chargesEnabled": True,
+                "payoutsEnabled": True,
+                "detailsSubmitted": True,
+                "capabilitiesReady": True,
+                "requirementsDueCount": 0,
+            },
+            1,
+        )
+        self.assertEqual(activated.status, "active")
+        resolver.resolve(
+            scope(), "stripe-primary", provider="stripe", capability="checkout"
+        )
 
         pending_backend = MemoryBackend()
         pending_registry = registry_api.ConnectionRegistry(pending_backend)

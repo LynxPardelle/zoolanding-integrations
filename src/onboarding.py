@@ -8,9 +8,10 @@ from .providers.stripe_adapter import build_onboarding_callbacks
 
 
 class StripeOnboardingService:
-    def __init__(self, state_manager: Any, stripe_adapter: Any):
+    def __init__(self, state_manager: Any, stripe_adapter: Any, registry: Any):
         self._state = state_manager
         self._adapter = stripe_adapter
+        self._registry = registry
 
     def start(self, resolved: Any, context: Any, now_epoch: int) -> dict[str, str]:
         state = self._state.issue(
@@ -41,6 +42,14 @@ class StripeOnboardingService:
             session_hash=context.session_hash,
             now_epoch=now_epoch,
         )
-        return self._adapter.retrieve_canonical_status(
+        status = self._adapter.retrieve_canonical_status(
             resolved.binding, resolved.connection
         )
+        if status.get("status") == "ready":
+            self._registry.activate_ready(
+                resolved.connection.scope,
+                resolved.connection.connection_id,
+                status,
+                resolved.connection.revision,
+            )
+        return status

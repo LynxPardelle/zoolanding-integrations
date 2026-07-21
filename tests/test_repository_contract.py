@@ -116,6 +116,20 @@ class RepositoryContractTests(unittest.TestCase):
             if path.is_file() and ".git" not in path.parts:
                 self.assertNotIn("deploy-dev", path.name.lower())
 
+    def test_task_041_042_runtime_composition_is_available_to_small_handlers(self):
+        runtime = importlib.import_module("src.runtime")
+        self.assertTrue(callable(getattr(runtime, "stripe_command_runtime", None)))
+        for name in (
+            "internal_stripe_offer",
+            "internal_stripe_product_presentation",
+            "internal_stripe_discount",
+            "internal_stripe_discount_lifecycle",
+            "internal_stripe_checkout",
+            "internal_stripe_checkout_status",
+        ):
+            module = importlib.import_module(f"src.handlers.{name}")
+            self.assertIn("stripe_command_runtime", module._runtime_dependencies.__code__.co_names)
+
 
 if __name__ == "__main__":
     unittest.main()

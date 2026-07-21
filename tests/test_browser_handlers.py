@@ -111,10 +111,9 @@ class BrowserHandlerTests(unittest.TestCase):
             request(
                 "/features/integrations/action",
                 {
-                    "operation": "setStatus",
+                    "operation": "disable",
                     "input": {
                         "connectionId": "stripe-primary",
-                        "status": "disabled",
                         "expectedRevision": 1,
                     },
                 },
@@ -165,10 +164,9 @@ class BrowserHandlerTests(unittest.TestCase):
         handler = handler_module(self, "connection_action")
         registry = Registry()
         payload = {
-            "operation": "setStatus",
+            "operation": "disable",
             "input": {
                 "connectionId": "stripe-primary",
-                "status": "disabled",
                 "expectedRevision": 1,
             },
         }
@@ -193,6 +191,68 @@ class BrowserHandlerTests(unittest.TestCase):
         self.assertEqual(response["statusCode"], 200)
         self.assertEqual(registry.updated[0][0].draft_id, "draft-example")
         self.assertEqual(registry.updated[0][1:], ("stripe-primary", "disabled", 1))
+
+        reconnect = {**payload, "operation": "requestReconnect"}
+        response = handler.handle_request(
+            request("/features/integrations/action", reconnect),
+            policy_resolver=Resolver(),
+            auth_store=auth_store(),
+            registry=registry,
+            environment="test",
+            now_epoch=1_000,
+        )
+        self.assertEqual(response["statusCode"], 200)
+        self.assertEqual(registry.updated[-1][1:], ("stripe-primary", "pending", 1))
+
+    def test_browser_cannot_mark_a_pending_connection_active(self):
+        handler = handler_module(self, "connection_action")
+        registry = Registry()
+        for payload in (
+            {
+                "operation": "setStatus",
+                "input": {
+                    "connectionId": "stripe-primary",
+                    "status": "active",
+                    "expectedRevision": 1,
+                },
+            },
+            {
+                "operation": "active",
+                "input": {"connectionId": "stripe-primary", "expectedRevision": 1},
+            },
+        ):
+            with self.subTest(payload=payload):
+                response = handler.handle_request(
+                    request("/features/integrations/action", payload),
+                    policy_resolver=Resolver(),
+                    auth_store=auth_store(),
+                    registry=registry,
+                    environment="test",
+                    now_epoch=1_000,
+                )
+                self.assertEqual(response["statusCode"], 422)
+        self.assertEqual(registry.updated, [])
+
+    def test_onboarding_lambda_entrypoint_uses_runtime_dependencies(self):
+        handler = handler_module(self, "stripe_onboarding")
+        service = OnboardingService()
+        handler._runtime_dependencies = lambda: {
+            "policy_resolver": Resolver(),
+            "auth_store": auth_store(),
+            "binding_resolver": BindingResolver(),
+            "onboarding_service": service,
+            "environment": "test",
+            "now_epoch": 1_000,
+        }
+        response = handler.lambda_handler(
+            request(
+                handler.PATH,
+                {"operation": "start", "input": {"bindingId": "stripe-primary"}},
+            ),
+            None,
+        )
+        self.assertEqual(response["statusCode"], 200)
+        self.assertEqual(service.calls[0][0], "start")
 
     def test_onboarding_accepts_no_account_or_callback_urls_and_return_rechecks_status(
         self,

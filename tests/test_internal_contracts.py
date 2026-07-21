@@ -43,31 +43,60 @@ def canonical_hash(schema_version, snapshot):
     ).hexdigest()
 
 
+def integration_key(scope, connection_id, operation, resource_id, revision, content_hash):
+    digest = hashlib.sha256(
+        json.dumps(
+            {
+                "scope": scope,
+                "connectionId": connection_id,
+                "operation": operation,
+                "resourceId": resource_id,
+                "revision": revision,
+                "contentHash": content_hash,
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+    return f"integrations-command-v1:{digest}"
+
+
 def offer_command():
     snapshot = {
+        "schemaVersion": 1,
         "amountMinor": 90000,
+        "billingScheme": "per_unit",
         "currency": "MXN",
-        "saleType": "subscription",
-        "recurrence": {"interval": "month", "intervalCount": 1},
+        "saleType": "recurring",
+        "recurrence": {
+            "interval": "month",
+            "intervalCount": 1,
+            "usageType": "licensed",
+        },
         "taxBehavior": "exclusive",
     }
+    scope = {
+        "environment": "test",
+        "tenantId": "tenant-example",
+        "draftId": "draft-example",
+        "domain": "example.com",
+    }
+    content_hash = canonical_hash(1, snapshot)
     return {
         "version": 1,
-        "scope": {
-            "environment": "test",
-            "tenantId": "tenant-example",
-            "draftId": "draft-example",
-            "domain": "example.com",
-        },
+        "scope": scope,
         "connectionId": "stripe-primary",
         "commandId": "command-1",
-        "idempotencyKey": "retry-1",
+        "idempotencyKey": integration_key(
+            scope, "stripe-primary", "provision", "offer-v1", 1, content_hash
+        ),
         "input": {
+            "operation": "provision",
             "resourceId": "offer-v1",
             "revision": 1,
             "schemaVersion": 1,
             "snapshot": snapshot,
-            "contentHash": canonical_hash(1, snapshot),
+            "contentHash": content_hash,
         },
     }
 
@@ -119,6 +148,277 @@ class InternalContractTests(unittest.TestCase):
         wrong_hash["input"]["contentHash"] = "0" * 64
         with self.assertRaises(contracts.ContractError):
             contracts.validate_command("offer", wrong_hash)
+
+    def test_offer_deactivate_is_closed_and_requires_a_verified_lifecycle_hash(self):
+        contracts = contracts_module(self)
+        payload = offer_command()
+        lifecycle = {"targetState": "retired"}
+        payload["input"] = {
+            "operation": "deactivate",
+            "resourceId": "offer-v1",
+            "revision": 2,
+            "schemaVersion": 1,
+            "snapshot": lifecycle,
+            "contentHash": canonical_hash(1, lifecycle),
+        }
+        payload["idempotencyKey"] = integration_key(
+            payload["scope"],
+            payload["connectionId"],
+            "deactivate",
+            "offer-v1",
+            2,
+            payload["input"]["contentHash"],
+        )
+
+        parsed = contracts.validate_command("offer", payload)
+        self.assertEqual(parsed.input["operation"], "deactivate")
+        for invalid in (
+            {**payload["input"], "operation": "archive"},
+            {**payload["input"], "contentHash": "0" * 64},
+            {**payload["input"], "priceId": "price_browser"},
+        ):
+            changed = offer_command()
+            changed["input"] = invalid
+            with self.assertRaises(contracts.ContractError):
+                contracts.validate_command("offer", changed)
+
+    def test_checkout_command_contains_only_trusted_snapshots_and_closed_policy(self):
+        contracts = contracts_module(self)
+        payload = offer_command()
+        snapshot = offer_command()["input"]["snapshot"]
+        payload["input"] = {
+            "orderId": "order-1",
+            "paymentAttemptId": "attempt-1",
+            "revision": 1,
+            "reservationIds": ["reservation-1"],
+            "checkoutExpiresAt": 1_800_002_100,
+            "offerBindings": [
+                {
+                    "offerVersionId": "offer-v1",
+                    "revision": 1,
+                    "quantity": 1,
+                    "sellableType": "subscription",
+                    "snapshot": snapshot,
+                    "contentHash": canonical_hash(1, snapshot),
+                }
+            ],
+            "taxPolicy": {"mode": "automatic"},
+            "shippingPolicy": {"collection": "none"},
+            "paymentCollection": "immediate_card_link",
+        }
+        payload["idempotencyKey"] = integration_key(
+            payload["scope"],
+            payload["connectionId"],
+            "checkout",
+            "attempt-1",
+            1,
+            hashlib.sha256(
+                json.dumps(
+                    payload["input"], sort_keys=True, separators=(",", ":")
+                ).encode("utf-8")
+            ).hexdigest(),
+        )
+
+        parsed = contracts.validate_command("checkout", payload)
+        self.assertEqual(parsed.input["reservationIds"], ["reservation-1"])
+        self.assertRegex(parsed.content_hash, r"^[a-f0-9]{64}$")
+        for field, value in (
+            ("successUrl", "https://evil.example/success"),
+            ("priceId", "price_browser"),
+            ("customerEmail", "person@example.com"),
+        ):
+            changed = json.loads(json.dumps(payload))
+            changed["input"][field] = value
+            with self.subTest(field=field), self.assertRaises(contracts.ContractError):
+                contracts.validate_command("checkout", changed)
+
+        multiple_reservations = json.loads(json.dumps(payload))
+        multiple_reservations["input"]["reservationIds"].append("reservation-2")
+        with self.assertRaises(contracts.ContractError):
+            contracts.validate_command("checkout", multiple_reservations)
+
+        multiple_recurring_offers = json.loads(json.dumps(payload))
+        second = dict(multiple_recurring_offers["input"]["offerBindings"][0])
+        second["offerVersionId"] = "offer-v2"
+        multiple_recurring_offers["input"]["offerBindings"].append(second)
+        with self.assertRaises(contracts.ContractError):
+            contracts.validate_command("checkout", multiple_recurring_offers)
+
+    def test_typed_redirect_and_checkout_status_responses_are_safe(self):
+        contracts = contracts_module(self)
+        command = contracts.validate_command("checkout", self._checkout_command())
+        result = contracts.validate_service_result(
+            {
+                "commandId": command.command_id,
+                "status": "accepted",
+                "redirectUrl": "https://checkout.stripe.com/c/pay/synthetic",
+                "expiresAt": 1_800_002_100,
+            },
+            command,
+        )
+        self.assertEqual(result["status"], "accepted")
+        for unsafe in (
+            "http://checkout.stripe.com/c/pay/synthetic",
+            "https://evil.example/c/pay/synthetic",
+            "https://user@checkout.stripe.com/c/pay/synthetic",
+        ):
+            with self.subTest(url=unsafe), self.assertRaises(contracts.ContractError):
+                contracts.validate_service_result(
+                    {
+                        "commandId": command.command_id,
+                        "status": "accepted",
+                        "redirectUrl": unsafe,
+                        "expiresAt": 1_800_002_100,
+                    },
+                    command,
+                )
+
+        status_payload = offer_command()
+        status_payload["input"] = {
+            "orderId": "order-1",
+            "paymentAttemptId": "attempt-1",
+            "revision": 1,
+        }
+        status_command = contracts.validate_command("checkout-status", status_payload)
+        self.assertEqual(
+            contracts.validate_service_result(
+                {
+                    "orderId": "order-1",
+                    "paymentAttemptId": "attempt-1",
+                    "revision": 1,
+                    "status": "pending",
+                },
+                status_command,
+            )["status"],
+            "pending",
+        )
+        with self.assertRaises(contracts.ContractError):
+            contracts.validate_service_result(
+                {
+                    "orderId": "order-1",
+                    "paymentAttemptId": "attempt-1",
+                    "revision": 1,
+                    "status": "paid",
+                    "sessionId": "cs_test_synthetic",
+                },
+                status_command,
+            )
+
+    def test_phase4_idempotency_is_derived_and_scope_bound(self):
+        contracts = contracts_module(self)
+        payload = offer_command()
+        parsed = contracts.validate_command("offer", payload)
+        self.assertEqual(parsed.idempotency_key, payload["idempotencyKey"])
+
+        for mutate in (
+            lambda value: value["scope"].update({"draftId": "draft-other"}),
+            lambda value: value["input"].update({"revision": 2}),
+            lambda value: value.update({"idempotencyKey": "retry-arbitrary"}),
+        ):
+            changed = json.loads(json.dumps(payload))
+            mutate(changed)
+            with self.assertRaises(contracts.ContractError):
+                contracts.validate_command("offer", changed)
+
+    def test_subscription_policy_commands_are_closed_before_task45(self):
+        contracts = contracts_module(self)
+        payload = offer_command()
+        payload["input"] = {
+            "subscriptionId": "subscription-1",
+            "expectedRevision": 2,
+            "targetOfferVersionId": "offer-v2",
+            "planChangePolicy": {"mode": "immediate-prorated"},
+            "previewTimestamp": 1_800_000_000,
+        }
+        payload["idempotencyKey"] = integration_key(
+            payload["scope"],
+            payload["connectionId"],
+            "subscription-change",
+            "subscription-1",
+            2,
+            hashlib.sha256(
+                json.dumps(
+                    payload["input"], sort_keys=True, separators=(",", ":")
+                ).encode("utf-8")
+            ).hexdigest(),
+        )
+        contracts.validate_command("subscription-change", payload)
+        changed = json.loads(json.dumps(payload))
+        changed["input"]["planChangePolicy"] = {"mode": "operator-selectable"}
+        with self.assertRaises(contracts.ContractError):
+            contracts.validate_command("subscription-change", changed)
+
+        pause = offer_command()
+        pause["input"] = {
+            "subscriptionId": "subscription-1",
+            "expectedRevision": 2,
+            "action": "pause",
+            "pausePolicy": {
+                "enabled": True,
+                "newInvoiceBehavior": "void",
+                "existingInvoiceBehavior": "unchanged",
+                "accessBehavior": "suspend",
+                "resume": {"mode": "manual"},
+                "onResume": {
+                    "collection": "restore",
+                    "access": "restore-if-suspended",
+                },
+            },
+        }
+        pause["idempotencyKey"] = integration_key(
+            pause["scope"],
+            pause["connectionId"],
+            "pause",
+            "subscription-1",
+            2,
+            hashlib.sha256(
+                json.dumps(
+                    pause["input"], sort_keys=True, separators=(",", ":")
+                ).encode("utf-8")
+            ).hexdigest(),
+        )
+        contracts.validate_command("subscription-pause", pause)
+        pause["input"]["pausePolicy"]["resume"] = {"mode": "automatic"}
+        with self.assertRaises(contracts.ContractError):
+            contracts.validate_command("subscription-pause", pause)
+
+    def _checkout_command(self):
+        payload = offer_command()
+        snapshot = payload["input"]["snapshot"]
+        payload["input"] = {
+            "orderId": "order-1",
+            "paymentAttemptId": "attempt-1",
+            "revision": 1,
+            "reservationIds": ["reservation-1"],
+            "checkoutExpiresAt": 1_800_002_100,
+            "offerBindings": [
+                {
+                    "offerVersionId": "offer-v1",
+                    "revision": 1,
+                    "quantity": 1,
+                    "sellableType": "subscription",
+                    "snapshot": snapshot,
+                    "contentHash": canonical_hash(1, snapshot),
+                }
+            ],
+            "taxPolicy": {"mode": "automatic"},
+            "shippingPolicy": {"collection": "none"},
+            "paymentCollection": "immediate_card_link",
+        }
+        content_hash = hashlib.sha256(
+            json.dumps(
+                payload["input"], sort_keys=True, separators=(",", ":")
+            ).encode("utf-8")
+        ).hexdigest()
+        payload["idempotencyKey"] = integration_key(
+            payload["scope"],
+            payload["connectionId"],
+            "checkout",
+            "attempt-1",
+            1,
+            content_hash,
+        )
+        return payload
 
     def test_discount_and_operation_values_are_typed_not_just_key_closed(self):
         contracts = contracts_module(self)
@@ -200,6 +500,71 @@ class InternalContractTests(unittest.TestCase):
         )
         self.assertEqual(invalid["statusCode"], 503)
         self.assertNotIn("price_synthetic", invalid["body"])
+
+    def test_checkout_seam_preserves_typed_ephemeral_redirect_and_conflicts(self):
+        checkout_handler = handler_module(self, "internal_stripe_checkout")
+        redirect = checkout_handler.handle_request(
+            request(checkout_handler.PATH, self._checkout_command()),
+            service=CommandService(
+                {
+                    "commandId": "command-1",
+                    "status": "accepted",
+                    "redirectUrl": "https://checkout.stripe.com/c/pay/synthetic",
+                    "expiresAt": 1_800_002_100,
+                }
+            ),
+            allowed_callers={ALLOWED_CALLER},
+        )
+        self.assertEqual(redirect["statusCode"], 200)
+        self.assertEqual(
+            json.loads(redirect["body"])["data"]["redirectUrl"],
+            "https://checkout.stripe.com/c/pay/synthetic",
+        )
+        self.assertEqual(redirect["headers"]["Cache-Control"], "no-store")
+
+        class ConflictService:
+            def execute(self, kind, command):
+                del kind, command
+                from src.stripe_commands import StripeCommandConflict
+
+                raise StripeCommandConflict("provider detail must not escape")
+
+        conflict = checkout_handler.handle_request(
+            request(checkout_handler.PATH, self._checkout_command()),
+            service=ConflictService(),
+            allowed_callers={ALLOWED_CALLER},
+        )
+        self.assertEqual(conflict["statusCode"], 409)
+        self.assertNotIn("provider detail", conflict["body"])
+
+    def test_task_041_042_lambda_entrypoints_use_the_command_runtime(self):
+        names = (
+            "internal_stripe_offer",
+            "internal_stripe_product_presentation",
+            "internal_stripe_discount",
+            "internal_stripe_discount_lifecycle",
+            "internal_stripe_checkout",
+            "internal_stripe_checkout_status",
+        )
+        for name in names:
+            module = handler_module(self, name)
+            self.assertTrue(hasattr(module, "_runtime_dependencies"), name)
+
+        handler = handler_module(self, "internal_stripe_offer")
+        service = CommandService()
+        with patch.object(
+            handler,
+            "_runtime_dependencies",
+            return_value={
+                "service": service,
+                "allowed_callers": {ALLOWED_CALLER},
+            },
+        ):
+            result = handler.lambda_handler(
+                request(handler.PATH, offer_command()), None
+            )
+        self.assertEqual(result["statusCode"], 200)
+        self.assertEqual(service.calls[0][0], "offer")
 
     def test_all_task_040_seams_exist_with_literal_paths_and_migrations_fail_closed(
         self,

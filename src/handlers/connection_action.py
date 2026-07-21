@@ -42,18 +42,14 @@ def handle_request(
 ) -> dict[str, Any]:
     def handle(payload: dict[str, Any]) -> dict[str, Any]:
         request = closed_object(payload, {"operation", "input"})
-        if request["operation"] != "setStatus":
+        operation = request["operation"]
+        if operation not in {"disable", "requestReconnect"}:
             raise validation_error()
         input_value = closed_object(
             request["input"],
-            {"connectionId", "status", "expectedRevision"},
+            {"connectionId", "expectedRevision"},
         )
         connection_id = safe_id(input_value["connectionId"])
-        if type(input_value["status"]) is not str or input_value["status"] not in {
-            "active",
-            "disabled",
-        }:
-            raise validation_error()
         revision = positive_int(input_value["expectedRevision"])
         policies = policy_resolver.resolve(
             environment=environment,
@@ -70,7 +66,7 @@ def handle_request(
         connection = registry.update_status(
             policies.scope,
             connection_id,
-            input_value["status"],
+            "disabled" if operation == "disable" else "pending",
             revision,
         )
         return {

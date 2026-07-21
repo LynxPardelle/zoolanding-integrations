@@ -283,7 +283,9 @@ class IntegrationConnection:
 
     def _validated_metadata(self, metadata: dict[str, Any]) -> dict[str, Any]:
         if self.provider == "stripe":
-            if not set(metadata).issubset({"accountReference", "resourceMappings"}):
+            if not set(metadata).issubset(
+                {"accountReference", "resourceMappings", "readiness"}
+            ):
                 raise ValueError("Stripe connection metadata is invalid")
             if "accountReference" in metadata:
                 account_reference = metadata["accountReference"]
@@ -305,6 +307,31 @@ class IntegrationConnection:
                     or pattern.fullmatch(reference) is None
                 ):
                     raise ValueError("provider resource mappings are invalid")
+            if "readiness" in metadata:
+                readiness = metadata["readiness"]
+                if (
+                    not isinstance(readiness, Mapping)
+                    or set(readiness)
+                    != {
+                        "chargesEnabled",
+                        "payoutsEnabled",
+                        "detailsSubmitted",
+                        "capabilitiesReady",
+                        "requirementsDueCount",
+                    }
+                    or any(
+                        type(readiness[field]) is not bool
+                        for field in (
+                            "chargesEnabled",
+                            "payoutsEnabled",
+                            "detailsSubmitted",
+                            "capabilitiesReady",
+                        )
+                    )
+                    or type(readiness["requirementsDueCount"]) is not int
+                    or not 0 <= readiness["requirementsDueCount"] <= 100
+                ):
+                    raise ValueError("Stripe connection metadata is invalid")
             return metadata
         expected_domain = (
             "zoolandingpage.com.mx"
@@ -329,8 +356,8 @@ class IntegrationConnection:
                 f"{self.scope.draft_id}/stripe/{self.connection_id}"
             )
         return (
-            f"/zoolanding/{self.scope.environment}/{self.scope.tenant_id}/{self.scope.draft_id}/"
-            f"notifications/smtp/{self.connection_id}"
+            f"/zoolanding/{self.scope.environment}/integrations/{self.scope.tenant_id}/"
+            f"{self.scope.draft_id}/smtp/{self.connection_id}"
         )
 
     def to_record(self) -> dict[str, Any]:

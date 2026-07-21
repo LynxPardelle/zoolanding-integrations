@@ -75,7 +75,7 @@ def dispatch(
         name = type(error).__name__
         if name in {"RegistryAccessDenied"}:
             status, code, message = 404, "not_found", "Resource not found."
-        elif name in {"RegistryConflict"}:
+        elif name in {"RegistryConflict", "StripeCommandConflict"}:
             status, code, message = 409, "conflict", "The resource changed."
         else:
             status, code, message = 503, "unavailable", "Service unavailable."

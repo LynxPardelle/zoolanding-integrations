@@ -7,6 +7,7 @@ import json
 import re
 from types import MappingProxyType
 from typing import Any
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 try:
     from domain.integrations import IntegrationBinding, IntegrationScope
@@ -133,6 +134,19 @@ class PublishedPolicyResolver:
         self._cache[cache_key] = resolved
         return resolved
 
+    def _checkout_policy(self, scope: IntegrationScope) -> dict[str, Any]:
+        if type(scope) is not IntegrationScope:
+            raise PolicyResolutionError("Published Checkout policy is unavailable")
+        resolved = self.resolve(
+            environment=scope.environment,
+            domain=scope.domain,
+            tenant_id=scope.tenant_id,
+            draft_id=scope.draft_id,
+        )
+        return self._load_json(
+            f"{resolved.prefix}{scope.domain}/server/commerce.json"
+        )
+
     def _metadata(self, domain: str) -> dict[str, Any]:
         try:
             response = self._registry.get_item(
@@ -180,6 +194,48 @@ class PublishedPolicyResolver:
         if not isinstance(value, dict) or _json_depth(value) > MAX_JSON_DEPTH:
             raise PolicyResolutionError("Published Integration policy is invalid")
         return value
+
+
+class PublishedCheckoutRouteResolver:
+    """Resolve only code-owned Checkout callback routes from a pinned release."""
+
+    def __init__(self, policy_resolver: PublishedPolicyResolver):
+        if type(policy_resolver) is not PublishedPolicyResolver:
+            raise PolicyResolutionError("Published Checkout policy is unavailable")
+        self._policies = policy_resolver
+
+    def resolve(self, scope: IntegrationScope) -> dict[str, str]:
+        try:
+            value = self._policies._checkout_policy(scope)
+            if set(value) != {"version", "scope", "commerce"} or value["version"] != 1:
+                raise ValueError
+            if value["scope"] != scope.fields():
+                raise ValueError
+            commerce = value["commerce"]
+            if not isinstance(commerce, dict) or commerce.get("status") != "active":
+                raise ValueError
+            checkout = commerce.get("checkout")
+            expected = {
+                "successPath",
+                "cancelPath",
+                "termsPath",
+                "privacyPath",
+                "refundPolicyPath",
+                "supportPath",
+            }
+            if not isinstance(checkout, dict) or set(checkout) != expected:
+                raise ValueError
+            paths = {key: _same_origin_path(value) for key, value in checkout.items()}
+            return {
+                "successUrl": _checkout_url(scope, paths["successPath"]),
+                "cancelUrl": _checkout_url(scope, paths["cancelPath"]),
+            }
+        except PolicyResolutionError:
+            raise
+        except (KeyError, TypeError, ValueError):
+            raise PolicyResolutionError(
+                "Published Checkout policy is invalid"
+            ) from None
 
 
 def _unique_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
@@ -282,3 +338,40 @@ def _freeze(value: Any) -> Any:
     if isinstance(value, list):
         return tuple(_freeze(item) for item in value)
     return value
+
+
+def _same_origin_path(value: object) -> str:
+    if (
+        type(value) is not str
+        or not 1 <= len(value) <= 256
+        or not value.startswith("/")
+        or value.startswith("//")
+        or "\\" in value
+        or any(
+            character.isspace()
+            or ord(character) < 32
+            or ord(character) == 127
+            for character in value
+        )
+    ):
+        raise ValueError
+    parsed = urlsplit(value)
+    if parsed.scheme or parsed.netloc or not parsed.path.startswith("/"):
+        raise ValueError
+    query = parse_qsl(parsed.query, keep_blank_values=True, strict_parsing=False)
+    if any(key == "draftDomain" for key, _value in query):
+        raise ValueError
+    return value
+
+
+def _checkout_url(scope: IntegrationScope, path: str) -> str:
+    parsed = urlsplit(path)
+    if scope.environment == "production":
+        host = scope.domain
+        query = parsed.query
+    else:
+        host = "test.zoolandingpage.com.mx"
+        query_items = parse_qsl(parsed.query, keep_blank_values=True)
+        query_items.append(("draftDomain", scope.domain))
+        query = urlencode(query_items)
+    return urlunsplit(("https", host, parsed.path, query, parsed.fragment))

@@ -23,12 +23,6 @@ Parameters:
   InternalCallerArns:
     Type: String
     MinLength: 20
-  StripeSecretsPrefixArn:
-    Type: String
-    MinLength: 20
-  IntegrationSecretsPrefixArn:
-    Type: String
-    MinLength: 20
 
 Globals:
   Function:
@@ -290,7 +284,7 @@ Resources:
               - Effect: Allow
                 Action: secretsmanager:GetSecretValue
                 Resource:
-                  Fn::Sub: ${StripeSecretsPrefixArn}*
+                  Fn::Sub: arn:${AWS::Partition}:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:/zoolanding/${EnvironmentName}/integrations/*/*/stripe/*
 
   ConnectionAdminRole:
     Type: AWS::IAM::Role
@@ -320,7 +314,7 @@ Resources:
               - Effect: Allow
                 Action: secretsmanager:DescribeSecret
                 Resource:
-                  Fn::Sub: ${IntegrationSecretsPrefixArn}*
+                  Fn::Sub: arn:${AWS::Partition}:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:/zoolanding/${EnvironmentName}/integrations/*
 
   InternalConnectionResolveRole:
     Type: AWS::IAM::Role
@@ -349,6 +343,25 @@ Resources:
       ManagedPolicyArns:
         - Ref: ControlPlaneLoggingPolicy
         - Ref: IntegrationRegistryReadPolicy
+        - Ref: PublishedPolicyReadPolicy
+      Policies:
+        - PolicyName: ScopedProviderCommands
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:PutItem
+                  - dynamodb:UpdateItem
+                  - dynamodb:TransactWriteItems
+                Resource:
+                  Fn::GetAtt:
+                    - IntegrationRegistryTable
+                    - Arn
+              - Effect: Allow
+                Action: secretsmanager:GetSecretValue
+                Resource:
+                  Fn::Sub: arn:${AWS::Partition}:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:/zoolanding/${EnvironmentName}/integrations/*/*/stripe/*
 
   InternalMigrationBoundaryRole:
     Type: AWS::IAM::Role

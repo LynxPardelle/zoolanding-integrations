@@ -7,6 +7,7 @@ import hashlib
 import json
 import re
 from typing import Any, Mapping
+from urllib.parse import urlsplit
 
 try:
     from domain.integrations import IntegrationScope
@@ -18,6 +19,7 @@ _SAFE_ID = re.compile(r"[a-z0-9][a-z0-9._-]{0,127}", re.ASCII)
 _HASH = re.compile(r"[a-f0-9]{64}", re.ASCII)
 _CURRENCY = re.compile(r"[A-Z]{3}", re.ASCII)
 _COUPON_CODE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}", re.ASCII)
+_COUNTRY = re.compile(r"[A-Z]{2}", re.ASCII)
 _STRIPE_ACCOUNT = re.compile(r"acct_[A-Za-z0-9]{8,64}", re.ASCII)
 _PROVIDER_CAPABILITIES = {
     "stripe": frozenset(
@@ -33,6 +35,18 @@ _PROVIDER_CAPABILITIES = {
     ),
     "email.smtp": frozenset({"send"}),
 }
+_DERIVED_IDEMPOTENCY_KINDS = frozenset(
+    {
+        "offer",
+        "product-presentation",
+        "discount",
+        "discount-lifecycle",
+        "checkout",
+        "subscription-change",
+        "subscription-discount",
+        "subscription-pause",
+    }
+)
 
 
 class ContractError(ValueError):
@@ -86,6 +100,18 @@ def validate_command(kind: str, value: object) -> InternalCommand:
         parsed_input, content_hash = _snapshot_input(kind, request["input"])
     else:
         parsed_input = _operation_input(kind, request["input"])
+        content_hash = _canonical_hash(parsed_input)
+    if kind in _DERIVED_IDEMPOTENCY_KINDS:
+        operation, resource_id, revision = _command_identity(kind, parsed_input)
+        if request["idempotencyKey"] != derive_command_idempotency_key(
+            scope,
+            connection_id,
+            operation,
+            resource_id,
+            revision,
+            content_hash,
+        ):
+            raise ContractError("idempotency key is invalid")
     return InternalCommand(
         kind,
         scope,
@@ -130,8 +156,8 @@ def validate_connection_registration(value: object) -> ConnectionRegistration:
         f"/zoolanding/{scope.environment}/integrations/{scope.tenant_id}/"
         f"{scope.draft_id}/stripe/{connection_id}"
         if provider == "stripe"
-        else f"/zoolanding/{scope.environment}/{scope.tenant_id}/{scope.draft_id}/"
-        f"notifications/smtp/{connection_id}"
+        else f"/zoolanding/{scope.environment}/integrations/{scope.tenant_id}/"
+        f"{scope.draft_id}/smtp/{connection_id}"
     )
     if reference != expected_reference:
         raise ContractError("registration reference is invalid")
@@ -157,11 +183,47 @@ def validate_connection_registration(value: object) -> ConnectionRegistration:
     )
 
 
-def validate_service_result(value: object, expected_command_id: str) -> dict[str, str]:
+def validate_service_result(
+    value: object, expected: InternalCommand | str
+) -> dict[str, Any]:
+    command = expected if type(expected) is InternalCommand else None
+    expected_command_id = command.command_id if command is not None else expected
+    if command is not None and command.kind == "checkout-status":
+        result = _closed(
+            value, {"orderId", "paymentAttemptId", "revision", "status"}
+        )
+        if (
+            result["orderId"] != command.input["orderId"]
+            or result["paymentAttemptId"] != command.input["paymentAttemptId"]
+            or result["revision"] != command.input["revision"]
+            or result["status"]
+            not in {"not_created", "pending", "paid", "terminal_unpaid", "unknown"}
+        ):
+            raise ContractError("command result is invalid")
+        return dict(result)
+
+    if command is not None and command.kind in {"checkout", "customer-portal"}:
+        if isinstance(value, dict) and set(value) == {
+            "commandId",
+            "status",
+            "redirectUrl",
+            "expiresAt",
+        }:
+            result = value
+            if (
+                result["commandId"] != expected_command_id
+                or result["status"] != "accepted"
+                or not _provider_redirect(result["redirectUrl"], command.kind)
+            ):
+                raise ContractError("command result is invalid")
+            _positive_int(result["expiresAt"])
+            return dict(result)
+
     result = _closed(value, {"commandId", "status"})
     if result["commandId"] != expected_command_id or result["status"] not in {
         "accepted",
         "pending",
+        "needs_review",
     }:
         raise ContractError("command result is invalid")
     return {"commandId": expected_command_id, "status": result["status"]}
@@ -211,8 +273,9 @@ def validate_connection_resolution_result(
         f"{expected.scope.tenant_id}/{expected.scope.draft_id}/stripe/"
         f"{expected.connection_id}"
         if provider == "stripe"
-        else f"/zoolanding/{expected.scope.environment}/{expected.scope.tenant_id}/"
-        f"{expected.scope.draft_id}/notifications/smtp/{expected.connection_id}"
+        else f"/zoolanding/{expected.scope.environment}/integrations/"
+        f"{expected.scope.tenant_id}/{expected.scope.draft_id}/smtp/"
+        f"{expected.connection_id}"
     )
     if reference != expected_reference:
         raise ContractError("resolution result is invalid")
@@ -236,25 +299,28 @@ def validate_connection_resolution_result(
 
 
 def _snapshot_input(kind: str, value: object) -> tuple[Any, str]:
+    required = {"resourceId", "revision", "schemaVersion", "snapshot", "contentHash"}
+    if kind == "offer":
+        required.add("operation")
     item = _closed(
         value,
-        {"resourceId", "revision", "schemaVersion", "snapshot", "contentHash"},
+        required,
     )
     _id(item["resourceId"])
     _positive_int(item["revision"])
     if item["schemaVersion"] != 1:
         raise ContractError("snapshot schema is invalid")
-    snapshot = _snapshot(kind, item["snapshot"])
+    snapshot_kind = kind
+    if kind == "offer":
+        operation = item["operation"]
+        if type(operation) is not str or operation not in {"provision", "deactivate"}:
+            raise ContractError("offer operation is invalid")
+        snapshot_kind = "offer" if operation == "provision" else "offer-lifecycle"
+    snapshot = _snapshot(snapshot_kind, item["snapshot"])
     content_hash = item["contentHash"]
     if type(content_hash) is not str or _HASH.fullmatch(content_hash) is None:
         raise ContractError("snapshot hash is invalid")
-    encoded = json.dumps(
-        {"schemaVersion": 1, "snapshot": snapshot},
-        sort_keys=True,
-        separators=(",", ":"),
-        ensure_ascii=True,
-    ).encode("ascii")
-    if hashlib.sha256(encoded).hexdigest() != content_hash:
+    if _canonical_hash({"schemaVersion": 1, "snapshot": snapshot}) != content_hash:
         raise ContractError("snapshot hash is invalid")
     return item, content_hash
 
@@ -263,8 +329,18 @@ def _snapshot(kind: str, value: object) -> dict[str, Any]:
     if kind == "offer":
         item = _closed(
             value,
-            {"amountMinor", "currency", "saleType", "recurrence", "taxBehavior"},
+            {
+                "schemaVersion",
+                "amountMinor",
+                "billingScheme",
+                "currency",
+                "saleType",
+                "recurrence",
+                "taxBehavior",
+            },
         )
+        if item["schemaVersion"] != 1 or item["billingScheme"] != "per_unit":
+            raise ContractError("offer billing is invalid")
         _nonnegative_int(item["amountMinor"])
         if (
             type(item["currency"]) is not str
@@ -272,24 +348,33 @@ def _snapshot(kind: str, value: object) -> dict[str, Any]:
         ):
             raise ContractError("offer currency is invalid")
         if type(item["saleType"]) is not str or item["saleType"] not in {
-            "one_time",
-            "subscription",
+            "one_time", "recurring"
         }:
             raise ContractError("offer sale type is invalid")
         recurrence = item["recurrence"]
-        if recurrence is not None:
-            recurrence = _closed(recurrence, {"interval", "intervalCount"})
+        if item["saleType"] == "recurring":
+            recurrence = _closed(
+                recurrence, {"interval", "intervalCount", "usageType"}
+            )
             if (
                 recurrence["interval"] not in {"month", "year"}
                 or recurrence["intervalCount"] != 1
+                or recurrence["usageType"] != "licensed"
             ):
                 raise ContractError("offer recurrence is invalid")
+        elif recurrence is not None:
+            raise ContractError("offer recurrence is invalid")
         if type(item["taxBehavior"]) is not str or item["taxBehavior"] not in {
             "exclusive",
             "inclusive",
             "unspecified",
         }:
             raise ContractError("offer tax behavior is invalid")
+        return item
+    if kind == "offer-lifecycle":
+        item = _closed(value, {"targetState"})
+        if item["targetState"] != "retired":
+            raise ContractError("offer lifecycle is invalid")
         return item
     if kind == "product-presentation":
         item = _closed(value, {"displayName"}, {"displayDescription"})
@@ -300,73 +385,63 @@ def _snapshot(kind: str, value: object) -> dict[str, Any]:
     if kind == "discount":
         item = _closed(
             value,
-            {"discountType", "duration"},
             {
-                "percentageBasisPoints",
-                "amountMinor",
-                "currency",
+                "schemaVersion",
+                "customerFacingCode",
+                "duration",
                 "durationInMonths",
                 "eligibleOfferVersionIds",
-                "redemptionLimit",
                 "redeemByEpoch",
-                "customerFacingCode",
+                "redemptionLimit",
+                "value",
             },
         )
-        if type(item["discountType"]) is not str or item["discountType"] not in {
-            "percentage",
-            "fixed",
-        }:
-            raise ContractError("discount type is invalid")
+        if item["schemaVersion"] != 1:
+            raise ContractError("discount schema is invalid")
         if type(item["duration"]) is not str or item["duration"] not in {
             "once",
             "forever",
             "repeating",
         }:
             raise ContractError("discount duration is invalid")
-        if item["discountType"] == "percentage":
-            if (
-                "percentageBasisPoints" not in item
-                or "amountMinor" in item
-                or "currency" in item
-            ):
-                raise ContractError("discount value is invalid")
-            basis_points = item["percentageBasisPoints"]
+        discount_value = item["value"]
+        if isinstance(discount_value, dict) and discount_value.get("type") == "percentage":
+            discount_value = _closed(discount_value, {"type", "basisPoints"})
+            basis_points = discount_value["basisPoints"]
             if type(basis_points) is not int or not 1 <= basis_points <= 10_000:
                 raise ContractError("discount value is invalid")
         else:
-            if (
-                "amountMinor" not in item
-                or "currency" not in item
-                or "percentageBasisPoints" in item
-            ):
+            discount_value = _closed(
+                discount_value, {"type", "amountMinor", "currency"}
+            )
+            if discount_value["type"] != "fixed_amount":
                 raise ContractError("discount value is invalid")
-            _positive_int(item["amountMinor"])
+            _positive_int(discount_value["amountMinor"])
             if (
-                type(item["currency"]) is not str
-                or _CURRENCY.fullmatch(item["currency"]) is None
+                type(discount_value["currency"]) is not str
+                or _CURRENCY.fullmatch(discount_value["currency"]) is None
             ):
                 raise ContractError("discount value is invalid")
         if item["duration"] == "repeating":
-            _positive_int(item.get("durationInMonths"))
-        elif "durationInMonths" in item:
+            _positive_int(item["durationInMonths"])
+        elif item["durationInMonths"] is not None:
             raise ContractError("discount duration is invalid")
-        if "eligibleOfferVersionIds" in item:
-            eligible = item["eligibleOfferVersionIds"]
-            if (
-                not isinstance(eligible, list)
-                or not 1 <= len(eligible) <= 100
-                or any(type(offer_id) is not str for offer_id in eligible)
-                or len(set(eligible)) != len(eligible)
-            ):
-                raise ContractError("discount eligibility is invalid")
-            for offer_id in eligible:
-                _id(offer_id)
+        eligible = item["eligibleOfferVersionIds"]
+        if (
+            not isinstance(eligible, list)
+            or len(eligible) > 200
+            or any(type(offer_id) is not str for offer_id in eligible)
+            or eligible != sorted(set(eligible))
+        ):
+            raise ContractError("discount eligibility is invalid")
+        for offer_id in eligible:
+            _id(offer_id)
         for integer_field in ("redemptionLimit", "redeemByEpoch"):
-            if integer_field in item:
+            if item[integer_field] is not None:
                 _positive_int(item[integer_field])
-        if "customerFacingCode" in item and (
-            type(item["customerFacingCode"]) is not str
-            or _COUPON_CODE.fullmatch(item["customerFacingCode"]) is None
+        code = item["customerFacingCode"]
+        if code is not None and (
+            type(code) is not str or _COUPON_CODE.fullmatch(code) is None
         ):
             raise ContractError("discount code is invalid")
         return item
@@ -383,20 +458,35 @@ def _snapshot(kind: str, value: object) -> dict[str, Any]:
 def _operation_input(kind: str, value: object) -> dict[str, Any]:
     specifications: dict[str, tuple[set[str], set[str]]] = {
         "checkout": (
-            {"orderId", "paymentAttemptId", "revision", "offerBindings"},
+            {
+                "orderId",
+                "paymentAttemptId",
+                "revision",
+                "reservationIds",
+                "checkoutExpiresAt",
+                "offerBindings",
+                "taxPolicy",
+                "shippingPolicy",
+                "paymentCollection",
+            },
             {"discountVersionId"},
         ),
         "checkout-status": ({"orderId", "paymentAttemptId", "revision"}, set()),
         "subscription-change": (
-            {"subscriptionId", "expectedRevision", "targetOfferVersionId", "proration"},
-            set(),
+            {
+                "subscriptionId",
+                "expectedRevision",
+                "targetOfferVersionId",
+                "planChangePolicy",
+            },
+            {"previewTimestamp"},
         ),
         "subscription-discount": (
-            {"subscriptionId", "expectedRevision", "discountVersionId"},
-            set(),
+            {"subscriptionId", "expectedRevision", "action"},
+            {"discountVersionId"},
         ),
         "subscription-pause": (
-            {"subscriptionId", "expectedRevision", "action"},
+            {"subscriptionId", "expectedRevision", "action", "pausePolicy"},
             set(),
         ),
         "customer-portal": ({"subscriptionId"}, set()),
@@ -417,6 +507,30 @@ def _operation_input(kind: str, value: object) -> dict[str, Any]:
     required, optional = specifications[kind]
     item = _closed(value, required, optional)
     _validate_operation_ids(item)
+    if kind == "checkout":
+        _validate_checkout(item)
+    elif kind == "subscription-change":
+        policy = _closed(item["planChangePolicy"], {"mode"})
+        if policy["mode"] not in {
+            "disabled",
+            "next-renewal",
+            "immediate-prorated",
+        }:
+            raise ContractError("plan change policy is invalid")
+        if policy["mode"] == "immediate-prorated":
+            _positive_int(item.get("previewTimestamp"))
+        elif "previewTimestamp" in item:
+            raise ContractError("plan change policy is invalid")
+    elif kind == "subscription-discount":
+        action = item["action"]
+        if action not in {"apply", "remove"}:
+            raise ContractError("subscription discount action is invalid")
+        if (action == "apply") != ("discountVersionId" in item):
+            raise ContractError("subscription discount action is invalid")
+    elif kind == "subscription-pause":
+        if item["action"] not in {"pause", "resume"}:
+            raise ContractError("subscription pause action is invalid")
+        _pause_policy(item["pausePolicy"])
     if kind == "connection-resolve":
         provider = item["provider"]
         capability = item["capability"]
@@ -429,7 +543,7 @@ def _operation_input(kind: str, value: object) -> dict[str, Any]:
             raise ContractError("connection resolution is invalid")
     if kind == "migration-execute" and item["confirmation"] is not True:
         raise ContractError("migration confirmation is invalid")
-    for field in ("proration", "action"):
+    for field in ("action",):
         if field in item and (
             type(item[field]) is not str or _SAFE_ID.fullmatch(item[field]) is None
         ):
@@ -448,13 +562,202 @@ def _validate_operation_ids(item: Mapping[str, Any]) -> None:
                 raise ContractError("command hash is invalid")
     if "offerBindings" in item:
         bindings = item["offerBindings"]
-        if not isinstance(bindings, list) or not 1 <= len(bindings) <= 100:
+        if not isinstance(bindings, list) or not 1 <= len(bindings) <= 20:
             raise ContractError("offer bindings are invalid")
         for binding in bindings:
-            parsed = _closed(binding, {"offerVersionId", "revision", "quantity"})
+            parsed = _closed(
+                binding,
+                {
+                    "offerVersionId",
+                    "revision",
+                    "quantity",
+                    "sellableType",
+                    "snapshot",
+                    "contentHash",
+                },
+            )
             _id(parsed["offerVersionId"])
             _positive_int(parsed["revision"])
             _positive_int(parsed["quantity"])
+            if parsed["quantity"] > 1_000_000:
+                raise ContractError("offer bindings are invalid")
+            if parsed["sellableType"] not in {
+                "physical",
+                "service",
+                "subscription",
+                "add_on",
+            }:
+                raise ContractError("offer bindings are invalid")
+            snapshot = _snapshot("offer", parsed["snapshot"])
+            content_hash = parsed["contentHash"]
+            if (
+                type(content_hash) is not str
+                or _HASH.fullmatch(content_hash) is None
+                or _canonical_hash({"schemaVersion": 1, "snapshot": snapshot})
+                != content_hash
+            ):
+                raise ContractError("offer bindings are invalid")
+
+
+def _validate_checkout(item: Mapping[str, Any]) -> None:
+    reservations = item["reservationIds"]
+    if (
+        not isinstance(reservations, list)
+        or len(reservations) != 1
+        or len(set(reservations)) != len(reservations)
+    ):
+        raise ContractError("checkout reservations are invalid")
+    for reservation_id in reservations:
+        _id(reservation_id)
+    _positive_int(item["checkoutExpiresAt"])
+    tax = _closed(item["taxPolicy"], {"mode"})
+    if tax["mode"] not in {"disabled", "automatic"}:
+        raise ContractError("checkout tax policy is invalid")
+    shipping = item["shippingPolicy"]
+    if isinstance(shipping, dict) and shipping.get("collection") == "none":
+        _closed(shipping, {"collection"})
+    else:
+        shipping = _closed(shipping, {"collection", "allowedCountries"})
+        countries = shipping["allowedCountries"]
+        if (
+            shipping["collection"] != "required"
+            or not isinstance(countries, list)
+            or not 1 <= len(countries) <= 50
+            or len(set(countries)) != len(countries)
+            or any(
+                type(country) is not str or _COUNTRY.fullmatch(country) is None
+                for country in countries
+            )
+        ):
+            raise ContractError("checkout shipping policy is invalid")
+    if item["paymentCollection"] != "immediate_card_link":
+        raise ContractError("checkout payment policy is invalid")
+
+    sellable_types = {line["sellableType"] for line in item["offerBindings"]}
+    sale_types = {line["snapshot"]["saleType"] for line in item["offerBindings"]}
+    offer_ids = [line["offerVersionId"] for line in item["offerBindings"]]
+    if (
+        len(set(offer_ids)) != len(offer_ids)
+        or ("recurring" in sale_types and len(offer_ids) != 1)
+        or ("physical" in sellable_types and "recurring" in sale_types)
+        or ("physical" in sellable_types and "subscription" in sellable_types)
+        or ("physical" in sellable_types and shipping["collection"] != "required")
+        or ("physical" not in sellable_types and shipping["collection"] != "none")
+        or ("recurring" in sale_types and "one_time" in sale_types)
+        or any(
+            line["sellableType"] == "subscription"
+            and line["snapshot"]["saleType"] != "recurring"
+            for line in item["offerBindings"]
+        )
+    ):
+        raise ContractError("checkout cart is invalid")
+
+
+def _canonical_hash(value: Any) -> str:
+    encoded = json.dumps(
+        value,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=True,
+    ).encode("ascii")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def derive_command_idempotency_key(
+    scope: IntegrationScope,
+    connection_id: str,
+    operation: str,
+    resource_id: str,
+    revision: int,
+    content_hash: str | None,
+) -> str:
+    if (
+        type(scope) is not IntegrationScope
+        or type(connection_id) is not str
+        or type(operation) is not str
+        or type(resource_id) is not str
+        or type(revision) is not int
+        or type(content_hash) is not str
+    ):
+        raise ContractError("idempotency key is invalid")
+    digest = _canonical_hash(
+        {
+            "scope": scope.fields(),
+            "connectionId": connection_id,
+            "operation": operation,
+            "resourceId": resource_id,
+            "revision": revision,
+            "contentHash": content_hash,
+        }
+    )
+    return f"integrations-command-v1:{digest}"
+
+
+def _command_identity(kind: str, item: Mapping[str, Any]) -> tuple[str, str, int]:
+    operation = kind
+    if kind == "offer":
+        operation = item["operation"]
+    elif kind == "discount-lifecycle":
+        operation = item["snapshot"]["targetState"]
+    elif kind in {"subscription-discount", "subscription-pause"}:
+        operation = item["action"]
+    resource_id = (
+        item.get("resourceId")
+        or item.get("paymentAttemptId")
+        or item.get("subscriptionId")
+    )
+    revision = item.get("revision") or item.get("expectedRevision")
+    if type(resource_id) is not str or type(revision) is not int:
+        raise ContractError("idempotency key is invalid")
+    return operation, resource_id, revision
+
+
+def _pause_policy(value: object) -> dict[str, Any]:
+    if not isinstance(value, dict) or type(value.get("enabled")) is not bool:
+        raise ContractError("pause policy is invalid")
+    if value["enabled"] is False:
+        return _closed(value, {"enabled"})
+    item = _closed(
+        value,
+        {
+            "enabled",
+            "newInvoiceBehavior",
+            "existingInvoiceBehavior",
+            "accessBehavior",
+            "resume",
+            "onResume",
+        },
+    )
+    if (
+        item["newInvoiceBehavior"]
+        not in {"void", "keep-as-draft", "mark-uncollectible"}
+        or item["existingInvoiceBehavior"] != "unchanged"
+        or item["accessBehavior"] not in {"retain", "suspend"}
+        or _closed(item["resume"], {"mode"})["mode"] != "manual"
+        or _closed(item["onResume"], {"collection", "access"})
+        != {"collection": "restore", "access": "restore-if-suspended"}
+    ):
+        raise ContractError("pause policy is invalid")
+    return item
+
+
+def _provider_redirect(value: object, kind: str) -> bool:
+    if type(value) is not str or not 1 <= len(value) <= 2048:
+        return False
+    try:
+        parsed = urlsplit(value)
+        port = parsed.port
+    except ValueError:
+        return False
+    expected_host = "checkout.stripe.com" if kind == "checkout" else "billing.stripe.com"
+    return (
+        parsed.scheme == "https"
+        and parsed.hostname == expected_host
+        and port in {None, 443}
+        and parsed.username is None
+        and parsed.password is None
+        and parsed.path.startswith("/")
+    )
 
 
 def _scope(value: object) -> IntegrationScope:

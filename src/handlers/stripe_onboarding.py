@@ -84,4 +84,16 @@ def handle_request(
 
 def lambda_handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
     del context
-    return unavailable_response(event)
+    try:
+        dependencies = _runtime_dependencies()
+    except Exception:
+        return unavailable_response(event)
+    return handle_request(event, **dependencies)
+
+
+def _runtime_dependencies() -> dict[str, Any]:
+    try:
+        from runtime import stripe_onboarding_runtime
+    except ModuleNotFoundError:
+        from src.runtime import stripe_onboarding_runtime
+    return stripe_onboarding_runtime()

@@ -163,7 +163,7 @@ class ConnectionRegistry:
         expected_revision: object,
     ) -> IntegrationConnection:
         connection_id = _safe_id(connection_id)
-        if type(status) is not str or status not in {"active", "disabled"}:
+        if type(status) is not str or status not in {"pending", "disabled"}:
             raise RegistryAccessDenied("Integration status is invalid")
         if type(expected_revision) is not int or expected_revision < 1:
             raise RegistryAccessDenied("Integration revision is invalid")
@@ -172,6 +172,30 @@ class ConnectionRegistry:
                 scope.partition_key,
                 f"CONNECTION#{connection_id}",
                 status,
+                expected_revision,
+            )
+            return _connection_from_record(scope, record)
+        except RegistryError:
+            raise
+        except Exception:
+            raise RegistryConflict("Integration update conflicted") from None
+
+    def activate_ready(
+        self,
+        scope: IntegrationScope,
+        connection_id: object,
+        readiness: object,
+        expected_revision: object,
+    ) -> IntegrationConnection:
+        connection_id = _safe_id(connection_id)
+        if type(expected_revision) is not int or expected_revision < 1:
+            raise RegistryAccessDenied("Integration revision is invalid")
+        sanitized = _provider_readiness(readiness)
+        try:
+            record = self._backend.activate_ready(
+                scope.partition_key,
+                f"CONNECTION#{connection_id}",
+                sanitized,
                 expected_revision,
             )
             return _connection_from_record(scope, record)
@@ -212,6 +236,13 @@ class BindingResolver:
             or binding.mode != connection.mode
             or capability not in binding.capabilities
             or capability not in connection.capabilities
+            or (
+                provider == "stripe"
+                and capability != "connect-onboarding"
+                and not _readiness_is_complete(
+                    connection.provider_metadata.get("readiness")
+                )
+            )
         ):
             raise RegistryAccessDenied("Integration binding is unavailable")
         return ResolvedBinding(binding, connection)
@@ -316,6 +347,42 @@ class DynamoRegistryBackend:
                         ":next_revision": expected_revision + 1,
                         ":item_type": "IntegrationConnection",
                         ":expected_revision": expected_revision,
+                    }
+                ),
+                ReturnValues="ALL_NEW",
+            )
+        except Exception:
+            raise RegistryConflict("Integration update conflicted") from None
+        return _deserialize(response.get("Attributes"))
+
+    def activate_ready(
+        self,
+        pk: str,
+        sk: str,
+        readiness: dict[str, Any],
+        expected_revision: int,
+    ) -> dict[str, Any]:
+        try:
+            response = self._client.update_item(
+                TableName=self._table_name,
+                Key=_serialize({"pk": pk, "sk": sk}),
+                UpdateExpression=(
+                    "SET #status = :status, revision = :next_revision, "
+                    "providerMetadata.readiness = :readiness"
+                ),
+                ConditionExpression=(
+                    "itemType = :item_type AND revision = :expected_revision "
+                    "AND provider = :provider"
+                ),
+                ExpressionAttributeNames={"#status": "status"},
+                ExpressionAttributeValues=_serialize_values(
+                    {
+                        ":status": "active",
+                        ":next_revision": expected_revision + 1,
+                        ":readiness": readiness,
+                        ":item_type": "IntegrationConnection",
+                        ":expected_revision": expected_revision,
+                        ":provider": "stripe",
                     }
                 ),
                 ReturnValues="ALL_NEW",
@@ -430,6 +497,56 @@ def _safe_id(value: object) -> str:
     if type(value) is not str or _SAFE_ID.fullmatch(value) is None:
         raise RegistryAccessDenied("Integration identifier is invalid")
     return value
+
+
+def _provider_readiness(value: object) -> dict[str, Any]:
+    if (
+        not isinstance(value, Mapping)
+        or set(value)
+        != {
+            "status",
+            "chargesEnabled",
+            "payoutsEnabled",
+            "detailsSubmitted",
+            "capabilitiesReady",
+            "requirementsDueCount",
+        }
+        or value.get("status") != "ready"
+    ):
+        raise RegistryAccessDenied("Provider readiness is invalid")
+    sanitized = {key: value[key] for key in value if key != "status"}
+    if not _readiness_is_complete(sanitized):
+        raise RegistryAccessDenied("Provider readiness is invalid")
+    if (
+        type(sanitized["requirementsDueCount"]) is not int
+        or sanitized["requirementsDueCount"] != 0
+    ):
+        raise RegistryAccessDenied("Provider readiness is invalid")
+    return sanitized
+
+
+def _readiness_is_complete(value: object) -> bool:
+    return (
+        isinstance(value, Mapping)
+        and set(value)
+        == {
+            "chargesEnabled",
+            "payoutsEnabled",
+            "detailsSubmitted",
+            "capabilitiesReady",
+            "requirementsDueCount",
+        }
+        and all(
+            value.get(field) is True
+            for field in (
+                "chargesEnabled",
+                "payoutsEnabled",
+                "detailsSubmitted",
+                "capabilitiesReady",
+            )
+        )
+        and value.get("requirementsDueCount") == 0
+    )
 
 
 def _serialize(value: Mapping[str, Any]) -> dict[str, Any]:
