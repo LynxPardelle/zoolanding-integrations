@@ -59,14 +59,18 @@ class OnboardingService:
         self.calls.append(("start", resolved, context, now_epoch))
         return {"handoffUrl": "https://connect.stripe.com/setup/synthetic"}
 
-    def complete_return(self, resolved, context, state, now_epoch):
-        self.calls.append(("return", resolved, context, state, now_epoch))
+    def complete_return(self, resolved, context, state, now_epoch, **outcome):
+        self.calls.append(("return", resolved, context, state, now_epoch, outcome))
         return {
             "status": "ready",
             "chargesEnabled": True,
             "detailsSubmitted": True,
             "requirementsDueCount": 0,
         }
+
+    def deauthorize(self, resolved, context, now_epoch):
+        self.calls.append(("deauthorize", resolved, context, now_epoch))
+        return {"status": "disabled"}
 
 
 def request(path, body, *, csrf=True):
@@ -301,7 +305,11 @@ class BrowserHandlerTests(unittest.TestCase):
                 "/features/integrations/stripe/onboarding",
                 {
                     "operation": "return",
-                    "input": {"bindingId": "stripe-primary", "state": "a" * 43},
+                    "input": {
+                        "bindingId": "stripe-primary",
+                        "state": "a" * 43,
+                        "code": "code_synthetic",
+                    },
                 },
             ),
             **dependencies,
@@ -309,6 +317,33 @@ class BrowserHandlerTests(unittest.TestCase):
         self.assertEqual(returned["statusCode"], 200)
         self.assertEqual(body(returned)["data"]["status"], "ready")
         self.assertEqual([call[0] for call in service.calls], ["start", "return"])
+
+        denied = handler.handle_request(
+            request(
+                handler.PATH,
+                {
+                    "operation": "return",
+                    "input": {
+                        "bindingId": "stripe-primary",
+                        "state": "b" * 43,
+                        "error": "access_denied",
+                    },
+                },
+            ),
+            **dependencies,
+        )
+        self.assertEqual(denied["statusCode"], 200)
+        self.assertEqual(service.calls[-1][-1], {"error": "access_denied"})
+
+        deauthorized = handler.handle_request(
+            request(
+                handler.PATH,
+                {"operation": "deauthorize", "input": {"bindingId": "stripe-primary"}},
+            ),
+            **dependencies,
+        )
+        self.assertEqual(deauthorized["statusCode"], 200)
+        self.assertEqual(service.calls[-1][0], "deauthorize")
         malformed = handler.handle_request(
             request(
                 "/features/integrations/stripe/onboarding",

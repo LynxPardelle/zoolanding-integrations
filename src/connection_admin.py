@@ -77,14 +77,21 @@ def _validate_secret_metadata(
         ):
             raise ConnectionAdminError("Credential metadata is invalid")
         tags[item["Key"]] = item["Value"]
-    purpose = "stripe" if connection.provider == "stripe" else "smtp"
-    required = {
-        "zoolanding:environment": connection.scope.environment,
-        "zoolanding:tenant-id": connection.scope.tenant_id,
-        "zoolanding:draft-id": connection.scope.draft_id,
-        "zoolanding:secret-purpose": purpose,
-        "zoolanding:connection-id": connection.connection_id,
-        "zoolanding:enabled": "true",
-    }
+    required = (
+        {
+            "zoolanding:environment": connection.scope.environment,
+            "zoolanding:secret-purpose": "stripe-connect-platform",
+            "zoolanding:enabled": "true",
+        }
+        if connection.provider == "stripe"
+        else {
+            "zoolanding:environment": connection.scope.environment,
+            "zoolanding:tenant-id": connection.scope.tenant_id,
+            "zoolanding:draft-id": connection.scope.draft_id,
+            "zoolanding:secret-purpose": "smtp",
+            "zoolanding:connection-id": connection.connection_id,
+            "zoolanding:enabled": "true",
+        }
+    )
     if any(tags.get(key) != value for key, value in required.items()):
         raise ConnectionAdminError("Credential metadata is invalid")

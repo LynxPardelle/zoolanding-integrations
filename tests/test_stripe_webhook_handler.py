@@ -87,6 +87,7 @@ class StripeWebhookHandlerTests(unittest.TestCase):
                     "environment": "test",
                     "mode": "test",
                     "account_reference": "acct_synthetic",
+                    "event_type": "checkout.session.completed",
                 }
             ],
         )

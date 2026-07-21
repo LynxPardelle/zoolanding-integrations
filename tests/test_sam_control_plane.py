@@ -78,7 +78,8 @@ class SamControlPlaneTests(unittest.TestCase):
         )
         connection_admin_role = self._role("ConnectionAdminRole")
         self.assertIn(
-            "/zoolanding/${EnvironmentName}/integrations/*", connection_admin_role
+            "/zoolanding/${EnvironmentName}/integrations/stripe/connect-platform*",
+            connection_admin_role,
         )
         self.assertIn(
             "/zoolanding/${EnvironmentName}/*/*/notifications/smtp/*",
@@ -109,8 +110,10 @@ class SamControlPlaneTests(unittest.TestCase):
             rendered = self._role(role)
             self.assertIn("${AWS::Partition}", rendered)
             self.assertIn(
-                "/zoolanding/${EnvironmentName}/integrations/*/*/stripe/*", rendered
+                "/zoolanding/${EnvironmentName}/integrations/stripe/connect-platform*",
+                rendered,
             )
+            self.assertNotIn("integrations/*/*/stripe", rendered)
             self.assertNotIn("PrefixArn", rendered)
         self.assertIn("Runtime: python3.13", self.text)
         self.assertNotIn("Cache", self.text)

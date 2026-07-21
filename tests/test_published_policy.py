@@ -39,12 +39,17 @@ def descriptor(*, mode="test", admin_access=None):
                 "mode": mode,
                 "capabilities": ["checkout", "one-time-payments"],
                 "stripe": {
+                    "accountStrategy": "oauth-standard-v1",
                     "accountModel": "merchant",
                     "chargeType": "direct",
                     "feePayer": "connected-account",
                     "taxMode": "unconfigured",
                     "platformFeeMode": "disabled",
                     "webhookIngress": "direct-integrations-api",
+                    "onboardingRoutes": {
+                        "returnPath": "/admin/integrations/stripe/return",
+                        "refreshPath": "/admin/integrations/stripe/refresh",
+                    },
                 },
             }
         ],
@@ -246,9 +251,9 @@ class PublishedPolicyTests(unittest.TestCase):
             },
         }
         scope = self.resolver().resolve(environment="test", domain=DOMAIN).scope
-        routes = self.policy.PublishedCheckoutRouteResolver(
-            self.resolver()
-        ).resolve(scope)
+        routes = self.policy.PublishedCheckoutRouteResolver(self.resolver()).resolve(
+            scope
+        )
 
         self.assertEqual(
             routes,

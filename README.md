@@ -2,7 +2,7 @@
 
 Generic, server-only integration connection and provider-mapping foundation for Zoolanding drafts.
 
-The current local phase implements immutable published-policy resolution, provider-neutral connection/binding contracts, Auth Admin authorization, retained DynamoDB boundaries, and separate browser and AWS_IAM API seams. Browser reads/actions, internal connection registration/resolution, and Stripe onboarding are runtime-composed. The Stripe Offer, Product presentation, Discount, Discount lifecycle, Checkout, and Checkout-status Lambdas now use draft-scoped conditional receipts, server-only resource mappings, hashed inverse indexes, and the official SDK adapter. Subscription, migration, webhook, and Stream processing remain fail closed until their later implementation and rollout gates. There is no live credential, provider call, deployment configuration, or AWS `dev` environment in this repository.
+The current local phase implements immutable published-policy resolution, provider-neutral connection/binding contracts, Auth Admin authorization, retained DynamoDB boundaries, and separate browser and AWS_IAM API seams. Browser reads/actions, internal connection registration/resolution, Stripe Connect onboarding, webhook ingress, Stream normalization, and Stripe commerce commands are runtime-composed. OAuth Standard and controller-owned Account Links use one environment-scoped platform secret while account ownership and hashed routing claims remain isolated per draft. Offer, presentation, discount, checkout, subscription change/discount/pause, and restricted customer-portal commands use conditional receipts, server-only mappings, and the official SDK adapter. Migration commands remain fail closed until their later implementation and rollout gates. There is no live credential, provider call, deployment configuration, or AWS `dev` environment in this repository.
 
 ## Runtime dependencies
 
@@ -17,4 +17,4 @@ python -m compileall -q src tests
 sam validate --lint
 ```
 
-The Stream functions deliberately return every received record as a partial-batch failure. Unimplemented subscription and migration commands return a typed unavailable response. Their implementation tasks must replace these fail-closed boundaries before any deployment that exposes them. A local SAM build additionally requires a Python 3.13 runtime on `PATH`; validation does not relax the declared production runtime to match an older workstation interpreter.
+Unimplemented migration commands return a typed unavailable response. Their implementation tasks must replace those fail-closed boundaries before any deployment that exposes them. A local SAM build additionally requires a Python 3.13 runtime on `PATH`; validation does not relax the declared production runtime to match an older workstation interpreter.

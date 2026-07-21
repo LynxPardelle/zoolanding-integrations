@@ -767,6 +767,16 @@ class InternalContractTests(unittest.TestCase):
         self.assertEqual(result["statusCode"], 200)
         self.assertEqual(service.calls[0][0], "offer")
 
+    def test_task_045_lambda_entrypoints_use_the_command_runtime(self):
+        for name in (
+            "internal_stripe_subscription_change",
+            "internal_stripe_subscription_discount",
+            "internal_stripe_subscription_pause",
+            "internal_stripe_customer_portal",
+        ):
+            module = handler_module(self, name)
+            self.assertTrue(hasattr(module, "_runtime_dependencies"), name)
+
     def test_all_task_040_seams_exist_with_literal_paths_and_migrations_fail_closed(
         self,
     ):
@@ -813,11 +823,11 @@ class InternalContractTests(unittest.TestCase):
             "connectionId": "stripe-primary",
             "commandId": "command-1",
             "idempotencyKey": "retry-1",
-            "credentialReference": "/zoolanding/test/integrations/tenant-example/draft-example/stripe/stripe-primary",
+            "credentialReference": "/zoolanding/test/integrations/stripe/connect-platform",
             "provider": "stripe",
             "mode": "test",
             "capabilities": ["checkout"],
-            "accountReference": "acct_synthetic",
+            "accountReference": None,
         }
         contracts.validate_connection_registration(payload)
         payload["secretValue"] = "synthetic"
@@ -883,11 +893,11 @@ class InternalContractTests(unittest.TestCase):
             "connectionId": "stripe-primary",
             "commandId": "command-1",
             "idempotencyKey": "retry-1",
-            "credentialReference": "/zoolanding/test/integrations/tenant-example/draft-example/stripe/stripe-primary",
+            "credentialReference": "/zoolanding/test/integrations/stripe/connect-platform",
             "provider": "stripe",
             "mode": "test",
             "capabilities": ["connect-onboarding", "checkout"],
-            "accountReference": "acct_synthetic",
+            "accountReference": None,
         }
         admin = Admin()
         registered = register_handler.handle_request(

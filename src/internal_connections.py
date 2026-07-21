@@ -51,7 +51,7 @@ class ConnectionRegistrationService:
             raise InternalConnectionError("Connection registration is not published")
         binding = matches[0]
         metadata = (
-            {"accountReference": registration.account_reference}
+            {}
             if registration.provider == "stripe"
             else {
                 "adapterId": "smtp2go-smtp-v1",

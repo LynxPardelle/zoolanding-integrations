@@ -51,7 +51,13 @@ class StripeEventWorker:
         account = connection.provider_metadata.get("accountReference")
         if (
             connection.provider != "stripe"
-            or connection.status != "active"
+            or (
+                connection.status != "active"
+                and not (
+                    selected["eventType"] == "account.application.deauthorized"
+                    and connection.status == "pending"
+                )
+            )
             or connection.mode != selected["mode"]
             or type(account) is not str
             or hashlib.sha256(account.encode("ascii")).hexdigest()
@@ -64,6 +70,30 @@ class StripeEventWorker:
             ),
             selected,
         )
+        if selected["eventType"] == "account.application.deauthorized":
+            if (
+                state["objectType"] != "account"
+                or state["objectId"] != selected["accountHash"]
+                or state["canonical"] != {"accountHash": selected["accountHash"]}
+            ):
+                raise RuntimeError("Canonical Stripe event is invalid")
+            self._registry.disable_stripe_account(
+                scope,
+                selected["connectionId"],
+                account,
+                connection.revision,
+            )
+            self._store.complete_ingress(
+                scope=scope,
+                outbox_id=record["outboxId"],
+                receipt_id=record["receiptId"],
+                claimed_revision=claimed_revision,
+                sequence=sequence,
+                decision_code="processed",
+                envelopes=[],
+                projection=None,
+            )
+            return
         mapping = self._mapping(scope, selected["connectionId"], state)
         if mapping is None:
             if state["mappingHint"] is not None:
@@ -331,7 +361,7 @@ def _canonical_state(value: object, receipt: Mapping[str, Any]) -> dict[str, Any
         or value.get("mode") != receipt["mode"]
         or value.get("accountHash") != receipt["accountHash"]
         or value.get("objectType")
-        not in {"checkout-session", "refund", "subscription", "invoice"}
+        not in {"checkout-session", "refund", "subscription", "invoice", "account"}
         or type(value.get("objectId")) is not str
         or (
             value.get("mappingHint") is not None

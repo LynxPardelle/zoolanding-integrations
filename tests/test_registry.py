@@ -30,7 +30,7 @@ def connection(
     account="acct_synthetic",
     ready=True,
 ):
-    metadata = {"accountReference": account}
+    metadata = {"accountReference": account} if account is not None else {}
     if ready and status == "active":
         metadata["readiness"] = {
             "chargesEnabled": True,
@@ -65,12 +65,17 @@ def binding(
             "mode": mode,
             "capabilities": capabilities or ["connect-onboarding", "checkout"],
             "stripe": {
+                "accountStrategy": "oauth-standard-v1",
                 "accountModel": "merchant",
                 "chargeType": "direct",
                 "feePayer": "connected-account",
                 "taxMode": tax_mode,
                 "platformFeeMode": "disabled",
                 "webhookIngress": "direct-integrations-api",
+                "onboardingRoutes": {
+                    "returnPath": "/admin/integrations/stripe/return",
+                    "refreshPath": "/admin/integrations/stripe/refresh",
+                },
             },
         },
     )
@@ -127,8 +132,122 @@ class MemoryBackend:
         self.records[(pk, sk)] = updated
         return updated
 
+    def bind_stripe_account(
+        self,
+        pk,
+        sk,
+        account_reference,
+        sentinel,
+        ownership,
+        expected_revision,
+        registration_hash,
+        old_sentinel_pk,
+    ):
+        item = self.records[(pk, sk)]
+        if (
+            item["revision"] != expected_revision
+            or item["registrationHash"] != registration_hash
+            or (sentinel["pk"], sentinel["sk"]) in self.records
+        ):
+            raise RuntimeError("conflict")
+        del self.records[(old_sentinel_pk, "CLAIM")]
+        updated = {
+            **item,
+            "revision": expected_revision + 1,
+            "providerMetadata": {
+                **item["providerMetadata"],
+                "accountReference": account_reference,
+                "accountOwnership": ownership,
+            },
+        }
+        self.records[(pk, sk)] = updated
+        self.records[(sentinel["pk"], sentinel["sk"])] = sentinel
+        return updated
+
+    def disable_stripe_account(
+        self, pk, sk, sentinel_pk, expected_revision, registration_hash
+    ):
+        item = self.records[(pk, sk)]
+        if item["revision"] != expected_revision:
+            raise RuntimeError("conflict")
+        self.records.pop((sentinel_pk, "CLAIM"), None)
+        metadata = {
+            key: value
+            for key, value in item["providerMetadata"].items()
+            if key not in {"accountReference", "accountOwnership", "readiness"}
+        }
+        updated = {
+            **item,
+            "status": "disabled",
+            "revision": expected_revision + 1,
+            "providerMetadata": metadata,
+        }
+        self.records[(pk, sk)] = updated
+        return updated
+
 
 class RegistryTests(unittest.TestCase):
+    def test_pending_stripe_account_is_bound_and_disabled_with_hashed_atomic_claims(
+        self,
+    ):
+        registry_api = registry_module(self)
+        backend = MemoryBackend()
+        registry = registry_api.ConnectionRegistry(backend)
+        registry.register(
+            connection(status="pending", account=None, ready=False),
+            binding(),
+            "registration-request",
+        )
+
+        bound = registry.bind_stripe_account(
+            scope(),
+            "stripe-primary",
+            "acct_synthetic",
+            "external-oauth",
+            1,
+        )
+
+        digest = hashlib.sha256(b"acct_synthetic").hexdigest()
+        sentinel = backend.records[(f"ROUTING#test#test#{digest}", "CLAIM")]
+        self.assertEqual(bound.provider_metadata["accountReference"], "acct_synthetic")
+        self.assertEqual(bound.provider_metadata["accountOwnership"], "external-oauth")
+        self.assertNotIn("acct_synthetic", repr(sentinel))
+        self.assertFalse(sentinel["authorizes"])
+
+        disabled = registry.disable_stripe_account(
+            scope(), "stripe-primary", "acct_synthetic", 2
+        )
+        self.assertEqual(disabled.status, "disabled")
+        self.assertNotIn("accountReference", disabled.provider_metadata)
+        self.assertNotIn((f"ROUTING#test#test#{digest}", "CLAIM"), backend.records)
+
+    def test_account_binding_rejects_replay_to_another_draft(self):
+        registry_api = registry_module(self)
+        backend = MemoryBackend()
+        first = registry_api.ConnectionRegistry(backend)
+        first.register(
+            connection(status="pending", account=None, ready=False),
+            binding(),
+            "first",
+        )
+        first.bind_stripe_account(
+            scope(), "stripe-primary", "acct_synthetic", "external-oauth", 1
+        )
+        second_scope = scope("draft-other")
+        first.register(
+            connection(second_scope, status="pending", account=None, ready=False),
+            binding(second_scope),
+            "second",
+        )
+        with self.assertRaises(registry_api.RegistryConflict):
+            first.bind_stripe_account(
+                second_scope,
+                "stripe-primary",
+                "acct_synthetic",
+                "platform-controller",
+                1,
+            )
+
     def test_registration_is_draft_partitioned_and_uses_hashed_non_authorizing_sentinel(
         self,
     ):
@@ -400,6 +519,34 @@ class RegistryTests(unittest.TestCase):
         self.assertEqual(routed.connection_id, "stripe-primary")
         self.assertIn((f"ROUTING#test#test#{digest}", "CLAIM"), backend.get_calls)
         self.assertNotIn("acct_synthetic", repr(backend.get_calls))
+
+    def test_deauthorization_webhook_alone_can_route_a_bound_pending_account(self):
+        registry_api = registry_module(self)
+        backend = MemoryBackend()
+        registry = registry_api.ConnectionRegistry(backend)
+        registry.register(
+            connection(status="pending", account=None, ready=False),
+            binding(),
+            "request-1",
+        )
+        registry.bind_stripe_account(
+            scope(), "stripe-primary", "acct_synthetic", "external-oauth", 1
+        )
+
+        routed = registry.stripe_webhook_connection(
+            environment="test",
+            mode="test",
+            account_reference="acct_synthetic",
+            event_type="account.application.deauthorized",
+        )
+        self.assertEqual(routed.status, "pending")
+        with self.assertRaises(registry_api.RegistryAccessDenied):
+            registry.stripe_webhook_connection(
+                environment="test",
+                mode="test",
+                account_reference="acct_synthetic",
+                event_type="invoice.paid",
+            )
 
     def test_stripe_webhook_routing_rejects_mode_scope_and_account_tampering(self):
         registry_api = registry_module(self)

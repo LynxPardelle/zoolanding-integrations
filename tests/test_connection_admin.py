@@ -36,6 +36,18 @@ class Registry:
 
 
 def secret_metadata(candidate):
+    if candidate.provider == "stripe":
+        return {
+            "Name": candidate.credential_reference,
+            "Tags": [
+                {"Key": "zoolanding:environment", "Value": candidate.scope.environment},
+                {
+                    "Key": "zoolanding:secret-purpose",
+                    "Value": "stripe-connect-platform",
+                },
+                {"Key": "zoolanding:enabled", "Value": "true"},
+            ],
+        }
     return {
         "Name": candidate.credential_reference,
         "Tags": [
@@ -89,8 +101,8 @@ class ConnectionAdminTests(unittest.TestCase):
         wrong_tags = secret_metadata(candidate)
         wrong_tags["Tags"] = [
             (
-                {**tag, "Value": "draft-other"}
-                if tag["Key"] == "zoolanding:draft-id"
+                {**tag, "Value": "production"}
+                if tag["Key"] == "zoolanding:environment"
                 else tag
             )
             for tag in wrong_tags["Tags"]

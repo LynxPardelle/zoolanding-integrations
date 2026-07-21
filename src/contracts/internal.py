@@ -50,6 +50,7 @@ _DERIVED_IDEMPOTENCY_KINDS = frozenset(
         "subscription-change",
         "subscription-discount",
         "subscription-pause",
+        "customer-portal",
     }
 )
 
@@ -158,8 +159,7 @@ def validate_connection_registration(value: object) -> ConnectionRegistration:
     capabilities = _capabilities(request["capabilities"])
     reference = request["credentialReference"]
     expected_reference = (
-        f"/zoolanding/{scope.environment}/integrations/{scope.tenant_id}/"
-        f"{scope.draft_id}/stripe/{connection_id}"
+        f"/zoolanding/{scope.environment}/integrations/stripe/connect-platform"
         if provider == "stripe"
         else f"/zoolanding/{scope.environment}/{scope.tenant_id}/"
         f"{scope.draft_id}/notifications/smtp/{connection_id}"
@@ -168,10 +168,7 @@ def validate_connection_registration(value: object) -> ConnectionRegistration:
         raise ContractError("registration reference is invalid")
     account_reference = request["accountReference"]
     if provider == "stripe":
-        if (
-            type(account_reference) is not str
-            or _STRIPE_ACCOUNT.fullmatch(account_reference) is None
-        ):
+        if account_reference is not None:
             raise ContractError("registration account is invalid")
     elif account_reference is not None:
         raise ContractError("registration account is invalid")
@@ -272,9 +269,7 @@ def validate_connection_resolution_result(
         raise ContractError("resolution result is invalid")
     reference = result["credentialReference"]
     expected_reference = (
-        f"/zoolanding/{expected.scope.environment}/integrations/"
-        f"{expected.scope.tenant_id}/{expected.scope.draft_id}/stripe/"
-        f"{expected.connection_id}"
+        f"/zoolanding/{expected.scope.environment}/integrations/stripe/connect-platform"
         if provider == "stripe"
         else f"/zoolanding/{expected.scope.environment}/"
         f"{expected.scope.tenant_id}/{expected.scope.draft_id}/notifications/smtp/"
@@ -740,7 +735,11 @@ def _command_identity(kind: str, item: Mapping[str, Any]) -> tuple[str, str, int
         or item.get("paymentAttemptId")
         or item.get("subscriptionId")
     )
-    revision = item.get("revision") or item.get("expectedRevision")
+    revision = (
+        1
+        if kind == "customer-portal"
+        else item.get("revision") or item.get("expectedRevision")
+    )
     if type(resource_id) is not str or type(revision) is not int:
         raise ContractError("idempotency key is invalid")
     return operation, resource_id, revision

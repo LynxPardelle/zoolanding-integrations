@@ -34,12 +34,17 @@ class IntegrationDomainTests(unittest.TestCase):
                 "customer-portal",
             ],
             "stripe": {
+                "accountStrategy": "oauth-standard-v1",
                 "accountModel": "merchant",
                 "chargeType": "direct",
                 "feePayer": "connected-account",
                 "taxMode": "unconfigured",
                 "platformFeeMode": "disabled",
                 "webhookIngress": "direct-integrations-api",
+                "onboardingRoutes": {
+                    "returnPath": "/admin/integrations/stripe/return",
+                    "refreshPath": "/admin/integrations/stripe/refresh",
+                },
             },
         }
         value.update(changes)
@@ -64,6 +69,13 @@ class IntegrationDomainTests(unittest.TestCase):
             binding.capabilities, frozenset(self.stripe_binding()["capabilities"])
         )
         self.assertEqual(binding.provider_metadata["chargeType"], "direct")
+        self.assertEqual(
+            binding.provider_metadata["accountStrategy"], "oauth-standard-v1"
+        )
+        self.assertEqual(
+            binding.provider_metadata["onboardingRoutes"]["returnPath"],
+            "/admin/integrations/stripe/return",
+        )
         with self.assertRaises(TypeError):
             binding.provider_metadata["chargeType"] = "destination"
         with self.assertRaises(ValueError):
@@ -76,6 +88,33 @@ class IntegrationDomainTests(unittest.TestCase):
                 self.scope,
                 self.stripe_binding(capabilities=["checkout", "checkout"]),
             )
+
+    def test_stripe_account_strategy_and_onboarding_routes_are_closed_and_same_origin(
+        self,
+    ):
+        for stripe_change in (
+            {"accountStrategy": "v2"},
+            {"accountStrategy": None},
+            {
+                "onboardingRoutes": {
+                    "returnPath": "https://attacker.example/return",
+                    "refreshPath": "/admin/integrations/stripe/refresh",
+                }
+            },
+            {
+                "onboardingRoutes": {
+                    "returnPath": "/admin/integrations/stripe/return?next=https://attacker.example",
+                    "refreshPath": "/admin/integrations/stripe/refresh",
+                }
+            },
+        ):
+            candidate = self.stripe_binding()
+            candidate["stripe"] = {**candidate["stripe"], **stripe_change}
+            with (
+                self.subTest(stripe_change=stripe_change),
+                self.assertRaises(ValueError),
+            ):
+                self.domain.IntegrationBinding.from_mapping(self.scope, candidate)
 
     def test_unknown_provider_fails_with_a_sanitized_validation_error(self):
         unknown = self.stripe_binding(provider="unknown")
@@ -127,6 +166,32 @@ class IntegrationDomainTests(unittest.TestCase):
             candidate.provider_metadata["resourceMappings"]["price"], "price_synthetic"
         )
 
+        owned = self.domain.IntegrationConnection(
+            scope=self.scope,
+            connection_id="stripe-primary",
+            provider="stripe",
+            adapter_version="v1",
+            status="active",
+            mode="test",
+            capabilities=frozenset({"checkout"}),
+            provider_metadata={
+                **valid,
+                "accountOwnership": "external-oauth",
+            },
+        )
+        self.assertEqual(owned.provider_metadata["accountOwnership"], "external-oauth")
+        with self.assertRaises(ValueError):
+            self.domain.IntegrationConnection(
+                scope=self.scope,
+                connection_id="stripe-primary",
+                provider="stripe",
+                adapter_version="v1",
+                status="active",
+                mode="test",
+                capabilities=frozenset({"checkout"}),
+                provider_metadata={**valid, "accountOwnership": "browser-owned"},
+            )
+
         invalid = {
             **valid,
             "resourceMappings": {"price": "_".join(("ghp", "syntheticcredential"))},
@@ -152,11 +217,11 @@ class IntegrationDomainTests(unittest.TestCase):
             status="pending",
             mode="test",
             capabilities=frozenset({"connect-onboarding", "checkout"}),
-            provider_metadata={"accountReference": "acct_synthetic"},
+            provider_metadata={},
         )
         self.assertEqual(
             connection.credential_reference,
-            "/zoolanding/test/integrations/tenant-example/draft-example/stripe/stripe-primary",
+            "/zoolanding/test/integrations/stripe/connect-platform",
         )
         record = connection.to_record()
         self.assertEqual(record["pk"], self.scope.partition_key)

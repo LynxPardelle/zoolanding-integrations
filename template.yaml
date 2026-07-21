@@ -277,6 +277,7 @@ Resources:
                 Action:
                   - dynamodb:PutItem
                   - dynamodb:UpdateItem
+                  - dynamodb:TransactWriteItems
                 Resource:
                   Fn::GetAtt:
                     - IntegrationRegistryTable
@@ -284,7 +285,7 @@ Resources:
               - Effect: Allow
                 Action: secretsmanager:GetSecretValue
                 Resource:
-                  Fn::Sub: arn:${AWS::Partition}:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:/zoolanding/${EnvironmentName}/integrations/*/*/stripe/*
+                  Fn::Sub: arn:${AWS::Partition}:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:/zoolanding/${EnvironmentName}/integrations/stripe/connect-platform*
 
   ConnectionAdminRole:
     Type: AWS::IAM::Role
@@ -314,7 +315,7 @@ Resources:
               - Effect: Allow
                 Action: secretsmanager:DescribeSecret
                 Resource:
-                  - Fn::Sub: arn:${AWS::Partition}:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:/zoolanding/${EnvironmentName}/integrations/*
+                  - Fn::Sub: arn:${AWS::Partition}:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:/zoolanding/${EnvironmentName}/integrations/stripe/connect-platform*
                   - Fn::Sub: arn:${AWS::Partition}:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:/zoolanding/${EnvironmentName}/*/*/notifications/smtp/*
 
   InternalConnectionResolveRole:
@@ -362,7 +363,7 @@ Resources:
               - Effect: Allow
                 Action: secretsmanager:GetSecretValue
                 Resource:
-                  Fn::Sub: arn:${AWS::Partition}:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:/zoolanding/${EnvironmentName}/integrations/*/*/stripe/*
+                  Fn::Sub: arn:${AWS::Partition}:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:/zoolanding/${EnvironmentName}/integrations/stripe/connect-platform*
 
   InternalMigrationBoundaryRole:
     Type: AWS::IAM::Role
@@ -483,7 +484,7 @@ Resources:
               - Effect: Allow
                 Action: secretsmanager:GetSecretValue
                 Resource:
-                  Fn::Sub: arn:${AWS::Partition}:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:/zoolanding/${EnvironmentName}/integrations/*/*/stripe/*
+                  Fn::Sub: arn:${AWS::Partition}:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:/zoolanding/${EnvironmentName}/integrations/stripe/connect-platform*
               - Effect: Allow
                 Action:
                   - logs:CreateLogStream

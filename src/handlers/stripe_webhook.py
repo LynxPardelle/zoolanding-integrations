@@ -65,6 +65,7 @@ def handle_request(
             environment=environment,
             mode=selected["mode"],
             account_reference=selected["account"],
+            event_type=selected["event_type"],
         )
         store.accept_supported(
             scope=connection.scope,

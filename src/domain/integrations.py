@@ -16,6 +16,7 @@ _DOMAIN = re.compile(
     re.ASCII,
 )
 _STRIPE_ACCOUNT_REFERENCE = re.compile(r"acct_[A-Za-z0-9]{8,64}", re.ASCII)
+_SAME_ORIGIN_PATH = re.compile(r"/(?!/)(?!.*[\\\s?#:\x00-\x1f\x7f]).{0,255}", re.ASCII)
 _STRIPE_RESOURCE_REFERENCES = {
     "product": re.compile(r"prod_[A-Za-z0-9]{8,64}", re.ASCII),
     "price": re.compile(r"price_[A-Za-z0-9]{8,64}", re.ASCII),
@@ -56,12 +57,14 @@ _BINDING_KEYS = frozenset(
 _STRIPE_KEYS = frozenset(
     {
         "accountModel",
+        "accountStrategy",
         "chargeType",
         "feePayer",
         "taxMode",
         "taxApprovalId",
         "platformFeeMode",
         "webhookIngress",
+        "onboardingRoutes",
     }
 )
 _STRIPE_REQUIRED = _STRIPE_KEYS - {"taxApprovalId"}
@@ -136,6 +139,22 @@ def _stripe_binding_metadata(value: object) -> Mapping[str, Any]:
     ):
         raise ValueError("Stripe binding metadata is invalid")
     if value.get("taxMode") not in {"unconfigured", "manual-rate", "stripe-tax"}:
+        raise ValueError("Stripe binding metadata is invalid")
+    if value.get("accountStrategy") not in {
+        "oauth-standard-v1",
+        "controller-account-link-v1",
+    }:
+        raise ValueError("Stripe binding metadata is invalid")
+    routes = value.get("onboardingRoutes")
+    if (
+        not isinstance(routes, Mapping)
+        or set(routes) != {"returnPath", "refreshPath"}
+        or any(
+            type(routes[field]) is not str
+            or _SAME_ORIGIN_PATH.fullmatch(routes[field]) is None
+            for field in ("returnPath", "refreshPath")
+        )
+    ):
         raise ValueError("Stripe binding metadata is invalid")
     if "taxApprovalId" in value:
         _safe_id(value["taxApprovalId"], "tax approval ID")
@@ -284,7 +303,12 @@ class IntegrationConnection:
     def _validated_metadata(self, metadata: dict[str, Any]) -> dict[str, Any]:
         if self.provider == "stripe":
             if not set(metadata).issubset(
-                {"accountReference", "resourceMappings", "readiness"}
+                {
+                    "accountReference",
+                    "accountOwnership",
+                    "resourceMappings",
+                    "readiness",
+                }
             ):
                 raise ValueError("Stripe connection metadata is invalid")
             if "accountReference" in metadata:
@@ -296,6 +320,11 @@ class IntegrationConnection:
                     raise ValueError("Stripe connection metadata is invalid")
             elif self.scope.environment == "production" and self.status == "active":
                 raise ValueError("Stripe connection metadata is invalid")
+            if "accountOwnership" in metadata:
+                if "accountReference" not in metadata or metadata[
+                    "accountOwnership"
+                ] not in {"external-oauth", "platform-controller"}:
+                    raise ValueError("Stripe connection metadata is invalid")
             mappings = metadata.get("resourceMappings", {})
             if not isinstance(mappings, Mapping) or len(mappings) > 64:
                 raise ValueError("provider resource mappings are invalid")
@@ -351,10 +380,7 @@ class IntegrationConnection:
     @property
     def credential_reference(self) -> str:
         if self.provider == "stripe":
-            return (
-                f"/zoolanding/{self.scope.environment}/integrations/{self.scope.tenant_id}/"
-                f"{self.scope.draft_id}/stripe/{self.connection_id}"
-            )
+            return f"/zoolanding/{self.scope.environment}/integrations/stripe/connect-platform"
         return (
             f"/zoolanding/{self.scope.environment}/{self.scope.tenant_id}/"
             f"{self.scope.draft_id}/notifications/smtp/{self.connection_id}"
@@ -381,12 +407,13 @@ class IntegrationConnection:
         """Return server-only uniqueness claims for production registration."""
         if self.scope.environment != "production":
             return frozenset()
-        claims = {f"CREDENTIAL#{self.credential_reference}"}
+        claims = set()
         if self.provider == "stripe" and "accountReference" in self.provider_metadata:
             claims.add(
                 f"PROVIDER#stripe#ACCOUNT#{self.provider_metadata['accountReference']}"
             )
         elif self.provider == "email.smtp":
+            claims.add(f"CREDENTIAL#{self.credential_reference}")
             claims.add(
                 "PROVIDER#email.smtp#DOMAIN#"
                 f"{self.provider_metadata['canonicalSendingDomain']}"

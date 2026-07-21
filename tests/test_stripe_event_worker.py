@@ -80,6 +80,80 @@ class StripeEventWorkerTests(unittest.TestCase):
             {"batchItemFailures": []},
         )
 
+    def test_deauthorization_event_disables_exact_account_without_commerce_event(self):
+        module = self.module()
+
+        class Store:
+            def __init__(self):
+                self.completed = []
+
+            def claim_ingress(self, **kwargs):
+                return {"processingRevision": 2}
+
+            def receipt(self, selected_scope, receipt_id):
+                return {
+                    "scope": selected_scope,
+                    "receiptId": receipt_id,
+                    "connectionId": "stripe-primary",
+                    "provider": "stripe",
+                    "mode": "test",
+                    "eventType": "account.application.deauthorized",
+                    "accountHash": hashlib.sha256(b"acct_synthetic").hexdigest(),
+                    "payloadHash": "b" * 64,
+                    "status": "processing",
+                    "revision": 2,
+                    "decisionCode": "processing",
+                    "eventCreatedAt": 1_799_999_995,
+                    "receivedAt": 1_800_000_000,
+                    "expiresAt": 1_800_000_000 + 90 * 24 * 60 * 60,
+                }
+
+            def complete_ingress(self, **kwargs):
+                self.completed.append(kwargs)
+
+        class Registry:
+            def __init__(self):
+                self.disabled = []
+
+            def connection(self, selected_scope, connection_id):
+                return connection()
+
+            def disable_stripe_account(self, *args):
+                self.disabled.append(args)
+
+        class Provider:
+            def retrieve_webhook_state(self, *args):
+                digest = hashlib.sha256(b"acct_synthetic").hexdigest()
+                return {
+                    "eventId": "evt-deauthorized",
+                    "eventType": "account.application.deauthorized",
+                    "eventCreatedAt": 1_799_999_995,
+                    "mode": "test",
+                    "accountHash": digest,
+                    "objectType": "account",
+                    "objectId": digest,
+                    "mappingHint": None,
+                    "canonical": {"accountHash": digest},
+                }
+
+        class Mappings:
+            def __getattr__(self, name):
+                raise AssertionError(f"mapping access is forbidden: {name}")
+
+        store = Store()
+        registry = Registry()
+        worker = module.StripeEventWorker(registry, store, Mappings(), Provider())
+        record = module._ingress_record(
+            stream_record("101", event_id="evt-deauthorized")
+        )
+
+        worker.process(record, "101")
+
+        self.assertEqual(registry.disabled[0][2:], ("acct_synthetic", 1))
+        self.assertEqual(store.completed[0]["decision_code"], "processed")
+        self.assertEqual(store.completed[0]["envelopes"], [])
+        self.assertIsNone(store.completed[0]["projection"])
+
     def test_worker_refetches_scoped_state_and_emits_closed_payment_event(self):
         class Store:
             def __init__(self):

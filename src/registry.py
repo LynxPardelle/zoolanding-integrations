@@ -208,12 +208,124 @@ class ConnectionRegistry:
         except Exception:
             raise RegistryConflict("Integration update conflicted") from None
 
+    def bind_stripe_account(
+        self,
+        scope: IntegrationScope,
+        connection_id: object,
+        account_reference: object,
+        ownership: object,
+        expected_revision: object,
+    ) -> IntegrationConnection:
+        connection_id = _safe_id(connection_id)
+        if (
+            type(account_reference) is not str
+            or _STRIPE_ACCOUNT.fullmatch(account_reference) is None
+            or ownership not in {"external-oauth", "platform-controller"}
+            or type(expected_revision) is not int
+            or expected_revision < 1
+        ):
+            raise RegistryAccessDenied("Stripe account binding is invalid")
+        try:
+            pk = scope.partition_key
+            sk = f"CONNECTION#{connection_id}"
+            current_record = self._backend.get(pk, sk)
+            current = _connection_from_record(scope, current_record)
+            registration_hash = current_record.get("registrationHash")
+            if (
+                current.provider != "stripe"
+                or current.status != "pending"
+                or current.revision != expected_revision
+                or current.provider_metadata.get("accountReference") is not None
+                or type(registration_hash) is not str
+                or re.fullmatch(r"[a-f0-9]{64}", registration_hash, re.ASCII) is None
+            ):
+                raise ValueError
+            sentinel = {
+                **_routing_sentinel(
+                    IntegrationConnection(
+                        scope=scope,
+                        connection_id=connection_id,
+                        provider="stripe",
+                        adapter_version=current.adapter_version,
+                        status="pending",
+                        mode=current.mode,
+                        capabilities=current.capabilities,
+                        provider_metadata={
+                            **dict(current.provider_metadata),
+                            "accountReference": account_reference,
+                            "accountOwnership": ownership,
+                        },
+                        revision=current.revision,
+                    )
+                ),
+                "registrationHash": registration_hash,
+            }
+            record = self._backend.bind_stripe_account(
+                pk,
+                sk,
+                account_reference,
+                sentinel,
+                ownership,
+                expected_revision,
+                registration_hash,
+                _routing_sentinel(current)["pk"],
+            )
+            return _connection_from_record(scope, record)
+        except RegistryError:
+            raise
+        except Exception:
+            raise RegistryConflict("Stripe account binding conflicted") from None
+
+    def disable_stripe_account(
+        self,
+        scope: IntegrationScope,
+        connection_id: object,
+        account_reference: object,
+        expected_revision: object,
+    ) -> IntegrationConnection:
+        connection_id = _safe_id(connection_id)
+        if (
+            type(account_reference) is not str
+            or _STRIPE_ACCOUNT.fullmatch(account_reference) is None
+            or type(expected_revision) is not int
+            or expected_revision < 1
+        ):
+            raise RegistryAccessDenied("Stripe account disable is invalid")
+        try:
+            pk = scope.partition_key
+            sk = f"CONNECTION#{connection_id}"
+            current_record = self._backend.get(pk, sk)
+            current = _connection_from_record(scope, current_record)
+            registration_hash = current_record.get("registrationHash")
+            if (
+                current.provider != "stripe"
+                or current.revision != expected_revision
+                or current.provider_metadata.get("accountReference")
+                != account_reference
+                or type(registration_hash) is not str
+            ):
+                raise ValueError
+            sentinel_pk = _routing_sentinel(current)["pk"]
+            record = self._backend.disable_stripe_account(
+                pk,
+                sk,
+                sentinel_pk,
+                expected_revision,
+                registration_hash,
+            )
+            return _connection_from_record(scope, record)
+        except RegistryError:
+            raise
+        except Exception:
+            raise RegistryConflict("Stripe account disable conflicted") from None
+
     def stripe_webhook_connection(
         self,
         *,
         environment: object,
         mode: object,
         account_reference: object,
+        event_type: object = None,
     ) -> IntegrationConnection:
         """Resolve a Connect account through its non-authorizing hashed claim."""
         if environment not in {"test", "production"}:
@@ -273,9 +385,18 @@ class ConnectionRegistry:
                 or connection.connection_id != connection_id
                 or connection.provider != "stripe"
                 or connection.mode != mode
-                or connection.status != "active"
-                or not _readiness_is_complete(
-                    connection.provider_metadata.get("readiness")
+                or (
+                    event_type == "account.application.deauthorized"
+                    and connection.status not in {"pending", "active"}
+                )
+                or (
+                    event_type != "account.application.deauthorized"
+                    and (
+                        connection.status != "active"
+                        or not _readiness_is_complete(
+                            connection.provider_metadata.get("readiness")
+                        )
+                    )
                 )
                 or connection.provider_metadata.get("accountReference")
                 != account_reference
@@ -476,11 +597,129 @@ class DynamoRegistryBackend:
             raise RegistryConflict("Integration update conflicted") from None
         return _deserialize(response.get("Attributes"))
 
+    def bind_stripe_account(
+        self,
+        pk: str,
+        sk: str,
+        account_reference: str,
+        sentinel: dict[str, Any],
+        ownership: str,
+        expected_revision: int,
+        registration_hash: str,
+        old_sentinel_pk: str,
+    ) -> dict[str, Any]:
+        values = _serialize_values(
+            {
+                ":account": account_reference,
+                ":ownership": ownership,
+                ":next_revision": expected_revision + 1,
+                ":expected_revision": expected_revision,
+                ":provider": "stripe",
+                ":registration_hash": registration_hash,
+            }
+        )
+        try:
+            self._client.transact_write_items(
+                TransactItems=[
+                    {
+                        "Update": {
+                            "TableName": self._table_name,
+                            "Key": _serialize({"pk": pk, "sk": sk}),
+                            "UpdateExpression": (
+                                "SET revision = :next_revision, "
+                                "providerMetadata.accountReference = :account, "
+                                "providerMetadata.accountOwnership = :ownership"
+                            ),
+                            "ConditionExpression": (
+                                "revision = :expected_revision AND provider = :provider "
+                                "AND registrationHash = :registration_hash "
+                                "AND attribute_not_exists(providerMetadata.accountReference)"
+                            ),
+                            "ExpressionAttributeValues": values,
+                        }
+                    },
+                    {
+                        "Delete": {
+                            "TableName": self._table_name,
+                            "Key": _serialize({"pk": old_sentinel_pk, "sk": "CLAIM"}),
+                            "ConditionExpression": "registrationHash = :registration_hash",
+                            "ExpressionAttributeValues": _serialize_values(
+                                {":registration_hash": registration_hash}
+                            ),
+                        }
+                    },
+                    {
+                        "Put": {
+                            "TableName": self._table_name,
+                            "Item": _serialize(sentinel),
+                            "ConditionExpression": (
+                                "attribute_not_exists(pk) AND attribute_not_exists(sk)"
+                            ),
+                        }
+                    },
+                ]
+            )
+            return self.get(pk, sk)
+        except Exception:
+            raise RegistryConflict("Stripe account binding conflicted") from None
+
+    def disable_stripe_account(
+        self,
+        pk: str,
+        sk: str,
+        sentinel_pk: str,
+        expected_revision: int,
+        registration_hash: str,
+    ) -> dict[str, Any]:
+        try:
+            self._client.transact_write_items(
+                TransactItems=[
+                    {
+                        "Update": {
+                            "TableName": self._table_name,
+                            "Key": _serialize({"pk": pk, "sk": sk}),
+                            "UpdateExpression": (
+                                "SET #status = :disabled, revision = :next_revision "
+                                "REMOVE providerMetadata.accountReference, "
+                                "providerMetadata.accountOwnership, providerMetadata.readiness"
+                            ),
+                            "ConditionExpression": (
+                                "revision = :expected_revision AND provider = :provider "
+                                "AND registrationHash = :registration_hash"
+                            ),
+                            "ExpressionAttributeNames": {"#status": "status"},
+                            "ExpressionAttributeValues": _serialize_values(
+                                {
+                                    ":disabled": "disabled",
+                                    ":next_revision": expected_revision + 1,
+                                    ":expected_revision": expected_revision,
+                                    ":provider": "stripe",
+                                    ":registration_hash": registration_hash,
+                                }
+                            ),
+                        }
+                    },
+                    {
+                        "Delete": {
+                            "TableName": self._table_name,
+                            "Key": _serialize({"pk": sentinel_pk, "sk": "CLAIM"}),
+                            "ConditionExpression": "registrationHash = :registration_hash",
+                            "ExpressionAttributeValues": _serialize_values(
+                                {":registration_hash": registration_hash}
+                            ),
+                        }
+                    },
+                ]
+            )
+            return self.get(pk, sk)
+        except Exception:
+            raise RegistryConflict("Stripe account disable conflicted") from None
+
 
 def _routing_sentinel(connection: IntegrationConnection) -> dict[str, Any]:
     account_reference = connection.provider_metadata.get("accountReference")
     if connection.provider != "stripe" or not isinstance(account_reference, str):
-        digest_source = connection.credential_reference
+        digest_source = f"{connection.scope.partition_key}\0{connection.connection_id}"
     else:
         digest_source = account_reference
     digest = hashlib.sha256(digest_source.encode("utf-8")).hexdigest()

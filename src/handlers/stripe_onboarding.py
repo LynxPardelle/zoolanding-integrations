@@ -42,14 +42,49 @@ def handle_request(
     def handle(payload: dict[str, Any]) -> dict[str, Any]:
         request = closed_object(payload, {"operation", "input"})
         operation = request["operation"]
-        if type(operation) is not str or operation not in {"start", "return"}:
+        if type(operation) is not str or operation not in {
+            "start",
+            "return",
+            "deauthorize",
+        }:
             raise validation_error()
-        required = {"bindingId"} if operation == "start" else {"bindingId", "state"}
-        input_value = closed_object(request["input"], required)
+        if operation in {"start", "deauthorize"}:
+            input_value = closed_object(request["input"], {"bindingId"})
+        else:
+            candidate = request["input"]
+            if not isinstance(candidate, dict) or set(candidate) not in (
+                {"bindingId", "state"},
+                {"bindingId", "state", "code"},
+                {"bindingId", "state", "error"},
+            ):
+                raise validation_error()
+            input_value = dict(candidate)
         binding_id = safe_id(input_value["bindingId"])
         if operation == "return" and (
             type(input_value["state"]) is not str
             or not 1 <= len(input_value["state"]) <= 1024
+        ):
+            raise validation_error()
+        if (
+            operation == "return"
+            and "code" in input_value
+            and (
+                type(input_value["code"]) is not str
+                or not 1 <= len(input_value["code"]) <= 1024
+                or any(ord(character) < 33 for character in input_value["code"])
+            )
+        ):
+            raise validation_error()
+        if (
+            operation == "return"
+            and "error" in input_value
+            and input_value["error"]
+            not in {
+                "access_denied",
+                "invalid_scope",
+                "server_error",
+                "temporarily_unavailable",
+            }
         ):
             raise validation_error()
         policies = policy_resolver.resolve(
@@ -72,11 +107,16 @@ def handle_request(
         )
         if operation == "start":
             return onboarding_service.start(resolved, context, now_epoch)
+        if operation == "deauthorize":
+            return onboarding_service.deauthorize(resolved, context, now_epoch)
         return onboarding_service.complete_return(
             resolved,
             context,
             input_value["state"],
             now_epoch,
+            **{
+                key: input_value[key] for key in ("code", "error") if key in input_value
+            },
         )
 
     return dispatch(event, PATH, handle)

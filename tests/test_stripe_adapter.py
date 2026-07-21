@@ -1,5 +1,6 @@
 import importlib
 import importlib.util
+import json
 import sys
 import unittest
 from types import SimpleNamespace
@@ -25,6 +26,21 @@ class StripeClient:
     def create_v1_handoff(self, **kwargs):
         self.calls.append(("v1", kwargs))
         return {"url": self.url}
+
+    def create_oauth_handoff(self, **kwargs):
+        self.calls.append(("oauth", kwargs))
+        return {"url": self.url}
+
+    def exchange_oauth_code(self, **kwargs):
+        self.calls.append(("oauth-exchange", kwargs))
+        return {"accountReference": "acct_synthetic"}
+
+    def deauthorize_oauth_account(self, **kwargs):
+        self.calls.append(("oauth-deauthorize", kwargs))
+
+    def create_controller_account(self, **kwargs):
+        self.calls.append(("controller-create", kwargs))
+        return {"id": "acct_synthetic"}
 
     def create_v2_handoff(self, **kwargs):
         self.calls.append(("v2", kwargs))
@@ -54,6 +70,94 @@ class StripeClient:
 
 
 class StripeAdapterTests(unittest.TestCase):
+    def test_client_factory_accepts_only_structured_platform_secret_and_bounded_retry_client(
+        self,
+    ):
+        stripe = stripe_module(self)
+        constructed = []
+
+        class HttpClient:
+            def __init__(self, *, _lib):
+                self.library = _lib
+
+        class OfficialClient:
+            def __init__(self, api_key, **kwargs):
+                constructed.append((api_key, kwargs))
+
+        fake_stripe = SimpleNamespace(
+            StripeClient=OfficialClient,
+            _http_client=SimpleNamespace(UrllibClient=HttpClient),
+        )
+
+        class Secrets:
+            def __init__(self, value):
+                self.value = value
+                self.calls = []
+
+            def get_secret_value(self, **kwargs):
+                self.calls.append(kwargs)
+                return {"SecretString": self.value}
+
+        value = json.dumps(
+            {
+                "clientId": "ca_syntheticclient1234",
+                "secretKey": "sk_test_syntheticsecret123456",
+            }
+        )
+        secrets = Secrets(value)
+        with patch.dict(sys.modules, {"stripe": fake_stripe}):
+            client = stripe.SecretsManagerStripeClientFactory(secrets).client_for(
+                connection(status="pending", account=None, ready=False)
+            )
+
+        self.assertIsInstance(client, stripe.StripeSdkClient)
+        self.assertEqual(
+            secrets.calls,
+            [{"SecretId": "/zoolanding/test/integrations/stripe/connect-platform"}],
+        )
+        self.assertEqual(constructed[0][0], "sk_test_syntheticsecret123456")
+        self.assertEqual(constructed[0][1]["client_id"], "ca_syntheticclient1234")
+        self.assertEqual(constructed[0][1]["max_network_retries"], 2)
+        self.assertIsInstance(constructed[0][1]["http_client"], HttpClient)
+
+        for invalid in (
+            "sk_test_syntheticsecret123456",
+            json.dumps({"secretKey": "sk_test_syntheticsecret123456"}),
+            json.dumps(
+                {
+                    "clientId": "ca_syntheticclient1234",
+                    "secretKey": "sk_live_syntheticsecret123456",
+                }
+            ),
+            json.dumps(
+                {
+                    "clientId": "ca_syntheticclient1234",
+                    "secretKey": "sk_test_syntheticsecret123456",
+                    "oauthToken": "synthetic",
+                }
+            ),
+        ):
+            with (
+                self.subTest(invalid=invalid),
+                patch.dict(sys.modules, {"stripe": fake_stripe}),
+                self.assertRaises(stripe.StripeAdapterError),
+            ):
+                stripe.SecretsManagerStripeClientFactory(Secrets(invalid)).client_for(
+                    connection(status="pending", account=None, ready=False)
+                )
+
+    def test_stdlib_transport_always_applies_the_five_second_network_timeout(self):
+        stripe = stripe_module(self)
+        with patch("urllib.request.urlopen", return_value="response") as opened:
+            self.assertEqual(stripe._TimedUrllib.urlopen("request"), "response")
+        opened.assert_called_once_with("request", timeout=5)
+
+        opener = SimpleNamespace(open=lambda *args, **kwargs: (args, kwargs))
+        timed = stripe._TimedOpener(opener)
+        args, kwargs = timed.open("request")
+        self.assertEqual(args, ("request",))
+        self.assertEqual(kwargs, {"timeout": 5})
+
     def test_webhook_verifier_uses_official_raw_signature_api_and_fixed_tolerance(self):
         stripe = stripe_module(self)
         calls = []
@@ -161,45 +265,97 @@ class StripeAdapterTests(unittest.TestCase):
             all(call["stripe_account"] == "acct_synthetic" for _, call in client.calls)
         )
 
-    def test_accounts_v1_is_the_fallback_and_direct_account_context_is_mandatory(self):
+    def test_pending_connection_accepts_only_deauthorization_webhook_refetch(self):
+        stripe = stripe_module(self)
+
+        class Client(StripeClient):
+            def retrieve_event(self, **kwargs):
+                self.calls.append(("event", kwargs))
+                return {
+                    "id": "evt-deauthorized",
+                    "type": "account.application.deauthorized",
+                    "created": 1_799_999_995,
+                    "livemode": False,
+                    "account": "acct_synthetic",
+                    "objectType": "account",
+                    "objectId": "ca_syntheticclient1234",
+                }
+
+        adapter = stripe.StripeAdapter(Client(), accounts_v2_verified=False)
+        pending = connection(status="pending", ready=False)
+        state = adapter.retrieve_webhook_state(
+            pending,
+            "evt-deauthorized",
+            "account.application.deauthorized",
+        )
+
+        account_hash = __import__("hashlib").sha256(b"acct_synthetic").hexdigest()
+        self.assertEqual(state["objectId"], account_hash)
+        self.assertEqual(state["canonical"], {"accountHash": account_hash})
+        with self.assertRaises(stripe.StripeAdapterError):
+            adapter.retrieve_webhook_state(
+                pending,
+                "evt-deauthorized",
+                "checkout.session.completed",
+            )
+
+    def test_strategy_selects_oauth_or_controller_without_browser_provider_fields(self):
         stripe = stripe_module(self)
         client = StripeClient()
         adapter = stripe.StripeAdapter(client, accounts_v2_verified=False)
-        callbacks = stripe.build_onboarding_callbacks("example.com")
+        callbacks = stripe.build_onboarding_callbacks(
+            "example.com", binding().provider_metadata["onboardingRoutes"]
+        )
 
-        url = adapter.create_onboarding_handoff(
+        url = adapter.create_oauth_handoff(
             binding(),
-            connection(),
+            connection(status="pending", account=None, ready=False),
             callbacks=callbacks,
             state="opaque-state",
         )
 
         self.assertEqual(url, "https://connect.stripe.com/setup/synthetic")
-        self.assertEqual(client.calls[0][0], "v1")
-        self.assertEqual(client.calls[0][1]["stripe_account"], "acct_synthetic")
-        self.assertEqual(client.calls[0][1]["charge_type"], "direct")
+        self.assertEqual(client.calls[0][0], "oauth")
+        self.assertNotIn("stripe_account", client.calls[0][1])
+
+        oauth_binding = binding()
+        controller_binding = oauth_binding.__class__(
+            scope=oauth_binding.scope,
+            binding_id=oauth_binding.binding_id,
+            provider=oauth_binding.provider,
+            adapter_version=oauth_binding.adapter_version,
+            connection_id=oauth_binding.connection_id,
+            status=oauth_binding.status,
+            mode=oauth_binding.mode,
+            capabilities=oauth_binding.capabilities,
+            provider_metadata={
+                **dict(oauth_binding.provider_metadata),
+                "accountStrategy": "controller-account-link-v1",
+            },
+        )
+        account = adapter.create_controller_account(
+            controller_binding,
+            connection(status="pending", account=None, ready=False),
+            idempotency_key="opaque-state",
+        )
+        self.assertEqual(account, "acct_synthetic")
+        self.assertEqual(client.calls[-1][0], "controller-create")
 
     def test_accounts_v2_requires_an_exact_verified_flag_otherwise_v1_remains_selected(
         self,
     ):
         stripe = stripe_module(self)
-        verified_client = StripeClient()
-        stripe.StripeAdapter(
-            verified_client, accounts_v2_verified=True
-        ).create_onboarding_handoff(
-            binding(),
-            connection(),
-            callbacks=stripe.build_onboarding_callbacks("example.com"),
-            state="opaque-state",
-        )
-        self.assertEqual(verified_client.calls[0][0], "v2")
+        with self.assertRaises(stripe.StripeAdapterError):
+            stripe.StripeAdapter(StripeClient(), accounts_v2_verified=True)
 
         with self.assertRaises(stripe.StripeAdapterError):
             stripe.StripeAdapter(StripeClient(), accounts_v2_verified="true")
 
     def test_callbacks_and_provider_urls_are_https_same_origin_and_public(self):
         stripe = stripe_module(self)
-        callbacks = stripe.build_onboarding_callbacks("example.com")
+        callbacks = stripe.build_onboarding_callbacks(
+            "example.com", binding().provider_metadata["onboardingRoutes"]
+        )
         self.assertEqual(
             callbacks.refresh_url,
             "https://example.com/admin/integrations/stripe/refresh",
@@ -221,9 +377,9 @@ class StripeAdapterTests(unittest.TestCase):
             ):
                 stripe.StripeAdapter(
                     StripeClient(unsafe_url), accounts_v2_verified=False
-                ).create_onboarding_handoff(
+                ).create_oauth_handoff(
                     binding(),
-                    connection(),
+                    connection(status="pending", account=None, ready=False),
                     callbacks=callbacks,
                     state="opaque-state",
                 )
@@ -343,6 +499,10 @@ class StripeAdapterTests(unittest.TestCase):
                 self.calls.append(("create", args))
                 return self.response
 
+            def __call__(self, *args):
+                self.calls.append(("call", args))
+                return self.response
+
             def update(self, *args):
                 self.calls.append(("update", args))
                 return self.response
@@ -355,7 +515,15 @@ class StripeAdapterTests(unittest.TestCase):
                 self.calls.append(("delete", args))
                 return self.response
 
+            def create_preview(self, *args):
+                self.calls.append(("create_preview", args))
+                return self.response
+
         class V1:
+            accounts = Resource({"id": "acct_synthetic"})
+            account_links = Resource(
+                {"url": "https://connect.stripe.com/setup/synthetic"}
+            )
             products = Resource({"id": "prod_synthetic01"})
             prices = Resource({"id": "price_synthetic01"})
             coupons = Resource({"id": "couponSynthetic01"})
@@ -387,6 +555,46 @@ class StripeAdapterTests(unittest.TestCase):
                 }
             )
             charges = Resource({"id": "ch_synthetic01"})
+            subscriptions = Resource(
+                {
+                    "id": "sub_synthetic01",
+                    "customer": "cus_synthetic01",
+                    "status": "active",
+                    "items": {
+                        "data": [
+                            {
+                                "id": "si_synthetic01",
+                                "price": "price_synthetic01",
+                                "quantity": 2,
+                            }
+                        ]
+                    },
+                    "schedule": None,
+                    "discounts": [],
+                    "pause_collection": None,
+                }
+            )
+            invoices = Resource({"id": "in_synthetic01"})
+            subscription_schedules = Resource(
+                {
+                    "id": "sub_sched_synthetic01",
+                    "current_phase": {
+                        "start_date": 1_800_000_000,
+                        "end_date": 1_900_000_000,
+                    },
+                }
+            )
+
+            class BillingPortal:
+                configurations = Resource({"id": "bpc_synthetic01"})
+                sessions = Resource(
+                    {
+                        "url": "https://billing.stripe.com/p/session/synthetic",
+                        "created": 1_800_000_000,
+                    }
+                )
+
+            billing_portal = BillingPortal()
 
             class Checkout:
                 sessions = Resource(
@@ -407,6 +615,11 @@ class StripeAdapterTests(unittest.TestCase):
 
         class OfficialClient:
             v1 = V1()
+            client_id = "ca_syntheticclient1234"
+            oauth = SimpleNamespace(
+                token=Resource({"stripe_user_id": "acct_synthetic"}),
+                deauthorize=Resource({"stripe_user_id": "acct_synthetic"}),
+            )
 
         sdk = stripe.StripeSdkClient(OfficialClient())
         options = {"stripe_account": "acct_synthetic", "idempotency_key": "idem"}
@@ -492,6 +705,92 @@ class StripeAdapterTests(unittest.TestCase):
         self.assertEqual(coupon_update[0], "update")
         self.assertEqual(coupon_update[1][1], {"name": "Summer promotion"})
         self.assertNotIn("displayDescription", repr(coupon_update))
+
+        oauth_url = sdk.create_oauth_handoff(
+            redirect_uri="https://example.com/admin/integrations/stripe/return",
+            state="opaque-state",
+        )["url"]
+        self.assertIn("client_id=ca_syntheticclient1234", oauth_url)
+        self.assertIn("state=opaque-state", oauth_url)
+        self.assertEqual(
+            sdk.exchange_oauth_code(
+                code="code_synthetic",
+                redirect_uri="https://example.com/admin/integrations/stripe/return",
+            ),
+            {"accountReference": "acct_synthetic"},
+        )
+        self.assertEqual(
+            OfficialClient.oauth.token.calls[-1][1][0],
+            {"grant_type": "authorization_code", "code": "code_synthetic"},
+        )
+        self.assertEqual(
+            sdk.create_controller_account(idempotency_key="idem"),
+            {"id": "acct_synthetic"},
+        )
+        controller_params = OfficialClient.v1.accounts.calls[-1][1][0]
+        self.assertEqual(
+            controller_params["controller"],
+            {
+                "fees": {"payer": "application"},
+                "losses": {"payments": "application"},
+                "requirement_collection": "application",
+                "stripe_dashboard": {"type": "express"},
+            },
+        )
+        self.assertEqual(
+            controller_params["capabilities"],
+            {
+                "card_payments": {"requested": True},
+                "transfers": {"requested": True},
+            },
+        )
+        self.assertIsNone(
+            sdk.deauthorize_oauth_account(stripe_account="acct_synthetic")
+        )
+        state = sdk.retrieve_subscription_operation_state(
+            stripe_account="acct_synthetic",
+            subscription_id="sub_synthetic01",
+        )
+        self.assertEqual(state["items"][0]["quantity"], 2)
+        shared = {
+            "stripe_account": "acct_synthetic",
+            "subscription_id": "sub_synthetic01",
+            "item_id": "si_synthetic01",
+            "price_id": "price_synthetic02",
+            "quantity": 2,
+            "preview_timestamp": 1_800_000_100,
+            "idempotency_key": "idem",
+        }
+        self.assertEqual(
+            sdk.preview_subscription_change(**shared),
+            {"previewTimestamp": 1_800_000_100},
+        )
+        sdk.apply_subscription_change(**shared)
+        preview_params = OfficialClient.v1.invoices.calls[-1][1][0]
+        apply_params = OfficialClient.v1.subscriptions.calls[-1][1][1]
+        self.assertEqual(
+            preview_params["subscription_details"]["items"][0],
+            apply_params["items"][0],
+        )
+        self.assertEqual(
+            preview_params["subscription_details"]["proration_date"],
+            apply_params["proration_date"],
+        )
+        configuration = sdk.create_portal_configuration(
+            stripe_account="acct_synthetic", idempotency_key="idem"
+        )
+        self.assertEqual(configuration, {"id": "bpc_synthetic01"})
+        features = OfficialClient.v1.billing_portal.configurations.calls[-1][1][0][
+            "features"
+        ]
+        self.assertEqual(set(features), {"invoice_history", "payment_method_update"})
+        portal = sdk.create_portal_session(
+            stripe_account="acct_synthetic",
+            customer_id="cus_synthetic01",
+            configuration_id="bpc_synthetic01",
+            idempotency_key="idem",
+        )
+        self.assertEqual(portal["expiresAt"], 1_800_001_800)
 
 
 if __name__ == "__main__":

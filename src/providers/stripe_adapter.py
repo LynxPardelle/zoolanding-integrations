@@ -5,8 +5,10 @@ from __future__ import annotations
 from dataclasses import dataclass
 import hashlib
 import ipaddress
+import json
 import re
-from typing import Any, Protocol
+from typing import Any, Mapping, Protocol
+import urllib.request
 from urllib.parse import urlencode, urlsplit, urlunsplit
 
 try:
@@ -81,12 +83,24 @@ class OnboardingCallbacks:
     return_url: str
 
 
-def build_onboarding_callbacks(domain: object) -> OnboardingCallbacks:
-    if type(domain) is not str or _DOMAIN.fullmatch(domain) is None:
+def build_onboarding_callbacks(domain: object, routes: object) -> OnboardingCallbacks:
+    if (
+        type(domain) is not str
+        or _DOMAIN.fullmatch(domain) is None
+        or not isinstance(routes, Mapping)
+        or set(routes) != {"returnPath", "refreshPath"}
+        or any(
+            type(routes[key]) is not str
+            or not routes[key].startswith("/")
+            or routes[key].startswith("//")
+            or any(character in routes[key] for character in "\\\t\r\n ?#:")
+            for key in ("returnPath", "refreshPath")
+        )
+    ):
         raise StripeAdapterError("Stripe onboarding is unavailable")
     return OnboardingCallbacks(
-        refresh_url=f"https://{domain}{_REFRESH_PATH}",
-        return_url=f"https://{domain}{_RETURN_PATH}",
+        refresh_url=f"https://{domain}{routes['refreshPath']}",
+        return_url=f"https://{domain}{routes['returnPath']}",
     )
 
 
@@ -98,7 +112,7 @@ class StripeAdapter:
         accounts_v2_verified: bool,
         client_factory: Any = None,
     ):
-        if type(accounts_v2_verified) is not bool or (client is None) == (
+        if accounts_v2_verified is not False or (client is None) == (
             client_factory is None
         ):
             raise StripeAdapterError("Stripe adapter is unavailable")
@@ -114,7 +128,7 @@ class StripeAdapter:
         except Exception:
             raise StripeAdapterError("Stripe operation is unavailable") from None
 
-    def create_onboarding_handoff(
+    def create_oauth_handoff(
         self,
         binding: IntegrationBinding,
         connection: IntegrationConnection,
@@ -122,9 +136,7 @@ class StripeAdapter:
         callbacks: OnboardingCallbacks,
         state: object,
     ) -> str:
-        account_reference = validate_stripe_context(
-            binding, connection, "connect-onboarding"
-        )
+        _validate_pending_onboarding_context(binding, connection, "oauth-standard-v1")
         _validated_callbacks(callbacks, connection.scope.domain)
         if (
             type(state) is not str
@@ -133,22 +145,104 @@ class StripeAdapter:
         ):
             raise StripeAdapterError("Stripe onboarding is unavailable")
         client = self._client_for(connection)
-        operation = (
-            client.create_v2_handoff
-            if self._accounts_v2_verified
-            else client.create_v1_handoff
-        )
         try:
-            response = operation(
-                stripe_account=account_reference,
-                charge_type="direct",
-                refresh_url=callbacks.refresh_url,
-                return_url=callbacks.return_url,
+            response = client.create_oauth_handoff(
+                redirect_uri=callbacks.return_url,
                 state=state,
             )
         except Exception:
             raise StripeAdapterError("Stripe onboarding is unavailable") from None
         return _provider_handoff_url(response)
+
+    def exchange_oauth_code(
+        self,
+        binding: IntegrationBinding,
+        connection: IntegrationConnection,
+        *,
+        code: object,
+        redirect_uri: object,
+    ) -> str:
+        _validate_pending_onboarding_context(binding, connection, "oauth-standard-v1")
+        if (
+            type(code) is not str
+            or not 1 <= len(code) <= 1024
+            or any(ord(character) < 33 for character in code)
+            or type(redirect_uri) is not str
+        ):
+            raise StripeAdapterError("Stripe onboarding is unavailable")
+        _validated_callbacks(
+            OnboardingCallbacks(redirect_uri, redirect_uri), connection.scope.domain
+        )
+        try:
+            response = self._client_for(connection).exchange_oauth_code(
+                code=code, redirect_uri=redirect_uri
+            )
+        except Exception:
+            raise StripeAdapterError("Stripe onboarding is unavailable") from None
+        return _provider_id(response, "accountReference", "acct_")
+
+    def create_controller_account(
+        self,
+        binding: IntegrationBinding,
+        connection: IntegrationConnection,
+        *,
+        idempotency_key: object,
+    ) -> str:
+        _validate_pending_onboarding_context(
+            binding, connection, "controller-account-link-v1"
+        )
+        try:
+            response = self._client_for(connection).create_controller_account(
+                idempotency_key=_provider_key(idempotency_key, "controller-account")
+            )
+        except Exception:
+            raise StripeAdapterError("Stripe onboarding is unavailable") from None
+        return _provider_id(response, "id", "acct_")
+
+    def create_account_link(
+        self,
+        binding: IntegrationBinding,
+        connection: IntegrationConnection,
+        *,
+        callbacks: OnboardingCallbacks,
+        state: object,
+        idempotency_key: object,
+    ) -> str:
+        account = validate_stripe_context(binding, connection, "connect-onboarding")
+        if (
+            binding.provider_metadata.get("accountStrategy")
+            != "controller-account-link-v1"
+        ):
+            raise StripeAdapterError("Stripe onboarding is unavailable")
+        _validated_callbacks(callbacks, connection.scope.domain)
+        try:
+            response = self._client_for(connection).create_v1_handoff(
+                stripe_account=account,
+                refresh_url=callbacks.refresh_url,
+                return_url=callbacks.return_url,
+                state=state,
+                idempotency_key=_provider_key(idempotency_key, "account-link"),
+            )
+        except Exception:
+            raise StripeAdapterError("Stripe onboarding is unavailable") from None
+        return _provider_handoff_url(response)
+
+    def deauthorize_oauth_account(
+        self,
+        binding: IntegrationBinding,
+        connection: IntegrationConnection,
+    ) -> None:
+        account = validate_stripe_context(binding, connection, "connect-onboarding")
+        if binding.provider_metadata.get("accountStrategy") != "oauth-standard-v1":
+            raise StripeAdapterError("Stripe deauthorization is unavailable")
+        try:
+            result = self._client_for(connection).deauthorize_oauth_account(
+                stripe_account=account
+            )
+        except Exception:
+            raise StripeAdapterError("Stripe deauthorization is unavailable") from None
+        if result is not None:
+            raise StripeAdapterError("Stripe deauthorization is unavailable")
 
     def retrieve_canonical_status(
         self,
@@ -361,13 +455,109 @@ class StripeAdapter:
             return "pending"
         return "unknown"
 
+    def retrieve_subscription_operation_state(self, resolved, subscription_id):
+        client, account = self._commerce_context(resolved, "subscriptions")
+        response = _provider_call(
+            client.retrieve_subscription_operation_state,
+            stripe_account=account,
+            subscription_id=subscription_id,
+        )
+        return _subscription_operation_state(response, subscription_id)
+
+    def preview_subscription_change(self, resolved, **kwargs):
+        client, account = self._commerce_context(resolved, "subscriptions")
+        response = _provider_call(
+            client.preview_subscription_change,
+            stripe_account=account,
+            **kwargs,
+        )
+        if response != {"previewTimestamp": kwargs["preview_timestamp"]}:
+            raise StripeAdapterError("Stripe subscription is unavailable")
+        return response
+
+    def apply_subscription_change(self, resolved, **kwargs):
+        client, account = self._commerce_context(resolved, "subscriptions")
+        response = _provider_call(
+            client.apply_subscription_change,
+            stripe_account=account,
+            **kwargs,
+        )
+        if response is not None:
+            raise StripeAdapterError("Stripe subscription is unavailable")
+
+    def schedule_subscription_change(self, resolved, **kwargs):
+        client, account = self._commerce_context(resolved, "subscriptions")
+        response = _provider_call(
+            client.schedule_subscription_change,
+            stripe_account=account,
+            **kwargs,
+        )
+        if response is not None:
+            raise StripeAdapterError("Stripe subscription is unavailable")
+
+    def update_subscription_discount(self, resolved, **kwargs):
+        client, account = self._commerce_context(resolved, "subscriptions")
+        response = _provider_call(
+            client.update_subscription_discount,
+            stripe_account=account,
+            **kwargs,
+        )
+        if response is not None:
+            raise StripeAdapterError("Stripe subscription is unavailable")
+
+    def update_subscription_pause(self, resolved, **kwargs):
+        client, account = self._commerce_context(resolved, "subscriptions")
+        response = _provider_call(
+            client.update_subscription_pause,
+            stripe_account=account,
+            **kwargs,
+        )
+        if response is not None:
+            raise StripeAdapterError("Stripe subscription is unavailable")
+
+    def create_portal_configuration(self, resolved, idempotency_key):
+        client, account = self._commerce_context(resolved, "customer-portal")
+        response = _provider_call(
+            client.create_portal_configuration,
+            stripe_account=account,
+            idempotency_key=_provider_key(idempotency_key, "portal-configuration"),
+        )
+        return _provider_id(response, "id", "bpc_")
+
+    def create_portal_session(self, resolved, **kwargs):
+        client, account = self._commerce_context(resolved, "customer-portal")
+        response = _provider_call(
+            client.create_portal_session,
+            stripe_account=account,
+            **kwargs,
+        )
+        result = {
+            "redirectUrl": _mapping_value(response, "redirectUrl"),
+            "expiresAt": _mapping_value(response, "expiresAt"),
+        }
+        url = result["redirectUrl"]
+        try:
+            parsed = urlsplit(url)
+            port = parsed.port
+        except (TypeError, ValueError):
+            raise StripeAdapterError("Stripe portal is unavailable") from None
+        if (
+            parsed.scheme != "https"
+            or parsed.hostname != "billing.stripe.com"
+            or port not in {None, 443}
+            or parsed.username is not None
+            or parsed.password is not None
+            or type(result["expiresAt"]) is not int
+        ):
+            raise StripeAdapterError("Stripe portal is unavailable")
+        return result
+
     def retrieve_webhook_state(
         self,
         connection: IntegrationConnection,
         event_id: object,
         event_type: object,
     ) -> dict[str, Any]:
-        client, account = self._webhook_context(connection)
         if (
             type(event_id) is not str
             or not 1 <= len(event_id) <= 128
@@ -375,6 +565,7 @@ class StripeAdapter:
             or event_type not in STRIPE_WEBHOOK_EVENT_TYPES
         ):
             raise StripeAdapterError("Stripe event is unavailable")
+        client, account = self._webhook_context(connection, event_type)
         event = _provider_call(
             client.retrieve_event,
             stripe_account=account,
@@ -389,7 +580,9 @@ class StripeAdapter:
         )
         object_id = selected["objectId"]
         mapping_hint = None
-        if selected["objectType"] == "checkout-session":
+        if selected["objectType"] == "account":
+            canonical = {"accountHash": object_id}
+        elif selected["objectType"] == "checkout-session":
             canonical = _provider_call(
                 client.retrieve_checkout_canonical,
                 stripe_account=account,
@@ -512,11 +705,19 @@ class StripeAdapter:
             "canonical": canonical,
         }
 
-    def _webhook_context(self, connection: IntegrationConnection):
+    def _webhook_context(
+        self, connection: IntegrationConnection, event_type: str
+    ) -> tuple[Any, str]:
         if (
             type(connection) is not IntegrationConnection
             or connection.provider != "stripe"
-            or connection.status != "active"
+            or (
+                connection.status != "active"
+                and not (
+                    event_type == "account.application.deauthorized"
+                    and connection.status == "pending"
+                )
+            )
         ):
             raise StripeAdapterError("Stripe event is unavailable")
         account = connection.provider_metadata.get("accountReference")
@@ -566,10 +767,34 @@ def validate_stripe_context(
     return account_reference
 
 
+def _validate_pending_onboarding_context(
+    binding: IntegrationBinding,
+    connection: IntegrationConnection,
+    strategy: str,
+) -> None:
+    if (
+        type(binding) is not IntegrationBinding
+        or type(connection) is not IntegrationConnection
+        or binding.scope != connection.scope
+        or binding.connection_id != connection.connection_id
+        or binding.provider != "stripe"
+        or connection.provider != "stripe"
+        or binding.mode != connection.mode
+        or binding.status != "active"
+        or connection.status != "pending"
+        or "connect-onboarding" not in binding.capabilities
+        or "connect-onboarding" not in connection.capabilities
+        or binding.provider_metadata.get("accountStrategy") != strategy
+        or connection.provider_metadata.get("accountReference") is not None
+    ):
+        raise StripeAdapterError("Stripe onboarding is unavailable")
+
+
 class SecretsManagerStripeClientFactory:
     """Read one scoped key only after the adapter validates the connection context."""
 
     _KEY = re.compile(r"sk_(test|live)_[A-Za-z0-9_]{16,240}", re.ASCII)
+    _CLIENT_ID = re.compile(r"ca_[A-Za-z0-9_]{8,240}", re.ASCII)
 
     def __init__(self, secrets_client: Any):
         if secrets_client is None:
@@ -586,24 +811,114 @@ class SecretsManagerStripeClientFactory:
         except Exception:
             raise StripeAdapterError("Stripe operation is unavailable") from None
         value = response.get("SecretString") if isinstance(response, dict) else None
-        match = self._KEY.fullmatch(value) if type(value) is str else None
+        try:
+            secret = json.loads(value) if type(value) is str else None
+        except (TypeError, ValueError):
+            secret = None
+        if not isinstance(secret, dict) or set(secret) != {"clientId", "secretKey"}:
+            raise StripeAdapterError("Stripe operation is unavailable")
+        client_id = secret.get("clientId")
+        secret_key = secret.get("secretKey")
+        match = self._KEY.fullmatch(secret_key) if type(secret_key) is str else None
         expected = "test" if connection.mode == "test" else "live"
-        if match is None or match.group(1) != expected:
+        if (
+            match is None
+            or match.group(1) != expected
+            or type(client_id) is not str
+            or self._CLIENT_ID.fullmatch(client_id) is None
+        ):
             raise StripeAdapterError("Stripe operation is unavailable")
         try:
             import stripe  # type: ignore
 
-            client = stripe.StripeClient(value)
+            http_client = stripe._http_client.UrllibClient(_lib=_TimedUrllib)
+            client = stripe.StripeClient(
+                secret_key,
+                client_id=client_id,
+                max_network_retries=2,
+                http_client=http_client,
+            )
         except Exception:
             raise StripeAdapterError("Stripe operation is unavailable") from None
-        return StripeSdkClient(client)
+        return StripeSdkClient(client, client_id=client_id)
+
+
+class _TimedOpener:
+    def __init__(self, opener: Any):
+        self._opener = opener
+
+    def open(self, request: Any):
+        return self._opener.open(request, timeout=5)
+
+
+class _TimedUrllib:
+    Request = urllib.request.Request
+    ProxyHandler = urllib.request.ProxyHandler
+
+    @staticmethod
+    def build_opener(*handlers: Any) -> _TimedOpener:
+        return _TimedOpener(urllib.request.build_opener(*handlers))
+
+    @staticmethod
+    def urlopen(request: Any):
+        return urllib.request.urlopen(request, timeout=5)
 
 
 class StripeSdkClient:
     """Small wrapper that keeps the pinned StripeClient request shapes in one place."""
 
-    def __init__(self, client: Any):
+    def __init__(self, client: Any, *, client_id: str | None = None):
         self.client = client
+        self.client_id = client_id or getattr(client, "client_id", None)
+
+    def create_oauth_handoff(self, **kwargs: Any) -> dict[str, Any]:
+        if (
+            type(self.client_id) is not str
+            or SecretsManagerStripeClientFactory._CLIENT_ID.fullmatch(self.client_id)
+            is None
+        ):
+            raise StripeAdapterError("Stripe onboarding is unavailable")
+        query = urlencode(
+            {
+                "response_type": "code",
+                "client_id": self.client_id,
+                "scope": "read_write",
+                "redirect_uri": kwargs["redirect_uri"],
+                "state": kwargs["state"],
+            }
+        )
+        return {"url": f"https://connect.stripe.com/oauth/authorize?{query}"}
+
+    def exchange_oauth_code(self, **kwargs: Any) -> dict[str, Any]:
+        response = self.client.oauth.token(
+            {"grant_type": "authorization_code", "code": kwargs["code"]}, {}
+        )
+        return {"accountReference": _mapping_value(response, "stripe_user_id")}
+
+    def deauthorize_oauth_account(self, **kwargs: Any) -> None:
+        response = self.client.oauth.deauthorize(
+            {"stripe_user_id": kwargs["stripe_account"]}, {}
+        )
+        if _mapping_value(response, "stripe_user_id") != kwargs["stripe_account"]:
+            raise StripeAdapterError("Stripe deauthorization is unavailable")
+
+    def create_controller_account(self, **kwargs: Any) -> dict[str, Any]:
+        response = self.client.v1.accounts.create(
+            {
+                "controller": {
+                    "fees": {"payer": "application"},
+                    "losses": {"payments": "application"},
+                    "requirement_collection": "application",
+                    "stripe_dashboard": {"type": "express"},
+                },
+                "capabilities": {
+                    "card_payments": {"requested": True},
+                    "transfers": {"requested": True},
+                },
+            },
+            {"idempotency_key": kwargs["idempotency_key"]},
+        )
+        return {"id": _mapping_value(response, "id")}
 
     def create_v1_handoff(self, **kwargs: Any) -> dict[str, Any]:
         return_url = _append_state(kwargs["return_url"], kwargs["state"])
@@ -614,7 +929,11 @@ class StripeSdkClient:
                 "return_url": return_url,
                 "type": "account_onboarding",
             },
-            {},
+            (
+                {"idempotency_key": kwargs["idempotency_key"]}
+                if "idempotency_key" in kwargs
+                else {}
+            ),
         )
         return {"url": _mapping_value(response, "url")}
 
@@ -773,6 +1092,176 @@ class StripeSdkClient:
             "status": _mapping_value(response, "status"),
         }
 
+    def retrieve_subscription_operation_state(self, **kwargs: Any) -> dict[str, Any]:
+        response = self.client.v1.subscriptions.retrieve(
+            kwargs["subscription_id"],
+            {},
+            {"stripe_account": kwargs["stripe_account"]},
+        )
+        items_value = _mapping_value(_mapping_value(response, "items"), "data")
+        discounts_value = _mapping_value(response, "discounts")
+        if not isinstance(items_value, list) or not isinstance(discounts_value, list):
+            raise StripeAdapterError("Stripe subscription is unavailable")
+        items = [
+            {
+                "itemId": _mapping_value(item, "id"),
+                "priceId": _reference_value(_mapping_value(item, "price")),
+                "quantity": _mapping_value(item, "quantity"),
+            }
+            for item in items_value
+        ]
+        discounts = [
+            _reference_value(_mapping_value(item, "promotion_code"))
+            for item in discounts_value
+        ]
+        pause = _mapping_value(response, "pause_collection")
+        pause_collection = None
+        if pause is not None:
+            pause_collection = {"behavior": _mapping_value(pause, "behavior")}
+            resumes_at = _mapping_value(pause, "resumes_at")
+            if resumes_at is not None:
+                pause_collection["resumesAt"] = resumes_at
+        return {
+            "subscriptionId": _mapping_value(response, "id"),
+            "customerId": _reference_value(_mapping_value(response, "customer")),
+            "status": _mapping_value(response, "status"),
+            "items": items,
+            "scheduleId": _reference_value(_mapping_value(response, "schedule")),
+            "discounts": discounts,
+            "pauseCollection": pause_collection,
+        }
+
+    def preview_subscription_change(self, **kwargs: Any) -> dict[str, Any]:
+        self.client.v1.invoices.create_preview(
+            {
+                "subscription": kwargs["subscription_id"],
+                "subscription_details": {
+                    "items": [
+                        {
+                            "id": kwargs["item_id"],
+                            "price": kwargs["price_id"],
+                            "quantity": kwargs["quantity"],
+                        }
+                    ],
+                    "proration_date": kwargs["preview_timestamp"],
+                },
+            },
+            {"stripe_account": kwargs["stripe_account"]},
+        )
+        return {"previewTimestamp": kwargs["preview_timestamp"]}
+
+    def apply_subscription_change(self, **kwargs: Any) -> None:
+        self.client.v1.subscriptions.update(
+            kwargs["subscription_id"],
+            {
+                "items": [
+                    {
+                        "id": kwargs["item_id"],
+                        "price": kwargs["price_id"],
+                        "quantity": kwargs["quantity"],
+                    }
+                ],
+                "proration_behavior": "create_prorations",
+                "proration_date": kwargs["preview_timestamp"],
+            },
+            _request_options(kwargs),
+        )
+
+    def schedule_subscription_change(self, **kwargs: Any) -> None:
+        options = _request_options(kwargs, suffix="create")
+        schedule = self.client.v1.subscription_schedules.create(
+            {"from_subscription": kwargs["subscription_id"]}, options
+        )
+        schedule_id = _mapping_value(schedule, "id")
+        current = _mapping_value(schedule, "current_phase")
+        start = _mapping_value(current, "start_date")
+        end = _mapping_value(current, "end_date")
+        if (
+            type(schedule_id) is not str
+            or type(start) is not int
+            or type(end) is not int
+        ):
+            raise StripeAdapterError("Stripe subscription is unavailable")
+        self.client.v1.subscription_schedules.update(
+            schedule_id,
+            {
+                "end_behavior": "release",
+                "phases": [
+                    {
+                        "start_date": start,
+                        "end_date": end,
+                        "items": [
+                            {
+                                "price": kwargs["current_price_id"],
+                                "quantity": kwargs["quantity"],
+                            }
+                        ],
+                    },
+                    {
+                        "items": [
+                            {
+                                "price": kwargs["price_id"],
+                                "quantity": kwargs["quantity"],
+                            }
+                        ]
+                    },
+                ],
+            },
+            _request_options(kwargs, suffix="update"),
+        )
+
+    def update_subscription_discount(self, **kwargs: Any) -> None:
+        promotion_code_id = kwargs["promotion_code_id"]
+        discounts = (
+            [] if promotion_code_id is None else [{"promotion_code": promotion_code_id}]
+        )
+        self.client.v1.subscriptions.update(
+            kwargs["subscription_id"],
+            {"discounts": discounts},
+            _request_options(kwargs),
+        )
+
+    def update_subscription_pause(self, **kwargs: Any) -> None:
+        self.client.v1.subscriptions.update(
+            kwargs["subscription_id"],
+            {
+                "pause_collection": (
+                    kwargs["pause_collection"]
+                    if kwargs["pause_collection"] is not None
+                    else ""
+                )
+            },
+            _request_options(kwargs),
+        )
+
+    def create_portal_configuration(self, **kwargs: Any) -> dict[str, Any]:
+        response = self.client.v1.billing_portal.configurations.create(
+            {
+                "features": {
+                    "invoice_history": {"enabled": True},
+                    "payment_method_update": {"enabled": True},
+                }
+            },
+            _request_options(kwargs),
+        )
+        return {"id": _mapping_value(response, "id")}
+
+    def create_portal_session(self, **kwargs: Any) -> dict[str, Any]:
+        response = self.client.v1.billing_portal.sessions.create(
+            {
+                "customer": kwargs["customer_id"],
+                "configuration": kwargs["configuration_id"],
+            },
+            _request_options(kwargs),
+        )
+        created = _mapping_value(response, "created")
+        if type(created) is not int:
+            raise StripeAdapterError("Stripe portal is unavailable")
+        return {
+            "redirectUrl": _mapping_value(response, "url"),
+            "expiresAt": created + 30 * 60,
+        }
+
     def retrieve_event(self, **kwargs: Any) -> dict[str, Any]:
         response = self.client.v1.events.retrieve(
             kwargs["event_id"], {}, {"stripe_account": kwargs["stripe_account"]}
@@ -781,21 +1270,25 @@ class StripeSdkClient:
         data = _mapping_value(response, "data")
         provider_object = _mapping_value(data, "object")
         object_type = (
-            "checkout-session"
-            if isinstance(event_type, str)
-            and event_type.startswith("checkout.session.")
+            "account"
+            if event_type == "account.application.deauthorized"
             else (
-                "refund"
-                if isinstance(event_type, str) and event_type.startswith("refund.")
+                "checkout-session"
+                if isinstance(event_type, str)
+                and event_type.startswith("checkout.session.")
                 else (
-                    "subscription"
-                    if isinstance(event_type, str)
-                    and event_type.startswith("customer.subscription.")
+                    "refund"
+                    if isinstance(event_type, str) and event_type.startswith("refund.")
                     else (
-                        "invoice"
+                        "subscription"
                         if isinstance(event_type, str)
-                        and event_type.startswith("invoice.")
-                        else None
+                        and event_type.startswith("customer.subscription.")
+                        else (
+                            "invoice"
+                            if isinstance(event_type, str)
+                            and event_type.startswith("invoice.")
+                            else None
+                        )
                     )
                 )
             )
@@ -925,15 +1418,19 @@ def _provider_call(operation, **kwargs):
 def _canonical_event(value, *, event_id, event_type, account, mode):
     keys = {"id", "type", "created", "livemode", "account", "objectType", "objectId"}
     expected_object_type = (
-        "checkout-session"
-        if event_type.startswith("checkout.session.")
+        "account"
+        if event_type == "account.application.deauthorized"
         else (
-            "refund"
-            if event_type.startswith("refund.")
+            "checkout-session"
+            if event_type.startswith("checkout.session.")
             else (
-                "subscription"
-                if event_type.startswith("customer.subscription.")
-                else "invoice"
+                "refund"
+                if event_type.startswith("refund.")
+                else (
+                    "subscription"
+                    if event_type.startswith("customer.subscription.")
+                    else "invoice"
+                )
             )
         )
     )
@@ -949,13 +1446,17 @@ def _canonical_event(value, *, event_id, event_type, account, mode):
         or not 0 <= value["created"] <= 9_999_999_999
     ):
         raise StripeAdapterError("Stripe event is unavailable")
-    _reference(value.get("objectId"))
+    if expected_object_type == "account":
+        object_id = hashlib.sha256(account.encode("ascii")).hexdigest()
+    else:
+        _reference(value.get("objectId"))
+        object_id = value["objectId"]
     return {
         "eventId": event_id,
         "eventType": event_type,
         "eventCreatedAt": value["created"],
         "objectType": expected_object_type,
-        "objectId": value["objectId"],
+        "objectId": object_id,
     }
 
 
@@ -1089,6 +1590,49 @@ def _invoice_canonical(value, expected_id):
     if value["subscriptionId"] is not None:
         _reference(value["subscriptionId"])
     return dict(value)
+
+
+def _subscription_operation_state(value, expected_id):
+    keys = {
+        "subscriptionId",
+        "customerId",
+        "status",
+        "items",
+        "scheduleId",
+        "discounts",
+        "pauseCollection",
+    }
+    if (
+        not isinstance(value, dict)
+        or set(value) != keys
+        or value.get("subscriptionId") != expected_id
+        or type(value.get("customerId")) is not str
+        or value.get("status")
+        not in {"active", "trialing", "past_due", "unpaid", "incomplete"}
+        or not isinstance(value.get("items"), list)
+        or not 1 <= len(value["items"]) <= 20
+        or any(
+            not isinstance(item, dict)
+            or set(item) != {"itemId", "priceId", "quantity"}
+            or type(item["itemId"]) is not str
+            or type(item["priceId"]) is not str
+            or type(item["quantity"]) is not int
+            or item["quantity"] < 1
+            for item in value["items"]
+        )
+        or (
+            value.get("scheduleId") is not None and type(value["scheduleId"]) is not str
+        )
+        or not isinstance(value.get("discounts"), list)
+        or len(value["discounts"]) > 20
+        or any(type(item) is not str for item in value["discounts"])
+        or (
+            value.get("pauseCollection") is not None
+            and not isinstance(value["pauseCollection"], dict)
+        )
+    ):
+        raise StripeAdapterError("Stripe subscription is unavailable")
+    return value
 
 
 def _reference(value):
@@ -1236,9 +1780,32 @@ def _reference_value(value: Any) -> Any:
 def _validated_callbacks(callbacks: OnboardingCallbacks, expected_domain: str) -> None:
     if type(callbacks) is not OnboardingCallbacks:
         raise StripeAdapterError("Stripe onboarding is unavailable")
-    expected = build_onboarding_callbacks(expected_domain)
-    if callbacks != expected:
+    if not all(
+        _same_origin_callback(url, expected_domain)
+        for url in (callbacks.refresh_url, callbacks.return_url)
+    ):
         raise StripeAdapterError("Stripe onboarding is unavailable")
+
+
+def _same_origin_callback(url: object, expected_domain: str) -> bool:
+    if type(url) is not str or len(url) > 2048:
+        return False
+    try:
+        parsed = urlsplit(url)
+        port = parsed.port
+    except ValueError:
+        return False
+    return (
+        parsed.scheme == "https"
+        and parsed.hostname == expected_domain
+        and port in {None, 443}
+        and parsed.username is None
+        and parsed.password is None
+        and parsed.path.startswith("/")
+        and not parsed.path.startswith("//")
+        and not parsed.query
+        and not parsed.fragment
+    )
 
 
 def _provider_handoff_url(value: object) -> str:

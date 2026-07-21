@@ -33,6 +33,7 @@ STRIPE_WEBHOOK_EVENT_TYPES = frozenset(
         "customer.subscription.deleted",
         "invoice.paid",
         "invoice.payment_failed",
+        "account.application.deauthorized",
     }
 )
 _SAFE_ID = re.compile(r"[a-z0-9][a-z0-9._-]{0,127}", re.ASCII)

@@ -23,6 +23,10 @@ class StripeCommandConflict(StripeCommandError):
     pass
 
 
+class StripeNeedsReview(StripeCommandError):
+    pass
+
+
 _CAPABILITIES = {
     "offer": "prices",
     "product-presentation": "prices",
@@ -30,6 +34,10 @@ _CAPABILITIES = {
     "discount-lifecycle": "coupons",
     "checkout": "checkout",
     "checkout-status": "checkout",
+    "subscription-change": "subscriptions",
+    "subscription-discount": "subscriptions",
+    "subscription-pause": "subscriptions",
+    "customer-portal": "customer-portal",
 }
 _CHECKOUT_MIN_TTL_SECONDS = 30 * 60
 _CHECKOUT_MAX_TTL_SECONDS = 24 * 60 * 60
@@ -37,7 +45,9 @@ _PROVIDER_IDEMPOTENCY_RETRY_SECONDS = 24 * 60 * 60
 
 
 class StripeCommandService:
-    def __init__(self, resolver, store, provider, routes, *, now_epoch):
+    def __init__(
+        self, resolver, store, provider, routes, *, now_epoch, tax_verifier=None
+    ):
         if any(
             value is None for value in (resolver, store, provider, routes, now_epoch)
         ):
@@ -47,6 +57,7 @@ class StripeCommandService:
         self._provider = provider
         self._routes = routes
         self._now_epoch = now_epoch
+        self._tax_verifier = tax_verifier
 
     def execute(self, kind: str, command: InternalCommand) -> dict[str, Any]:
         capability = _CAPABILITIES.get(kind)
@@ -83,6 +94,8 @@ class StripeCommandService:
             if status == "accepted":
                 if kind == "checkout":
                     return self._replay_checkout(command, resolved)
+                if kind == "customer-portal":
+                    return self._replay_portal(command, resolved)
                 return {
                     "commandId": existing["commandId"],
                     "status": "accepted",
@@ -123,6 +136,14 @@ class StripeCommandService:
 
         try:
             result, mappings, code_claim = self._perform(kind, command, resolved)
+        except StripeNeedsReview:
+            self._store.mark_needs_review(
+                command.scope,
+                command.connection_id,
+                command.idempotency_key,
+                request_hash,
+            )
+            return {"commandId": command.command_id, "status": "needs_review"}
         except StripeCommandConflict:
             self._store.mark_rejected(
                 command.scope,
@@ -156,6 +177,13 @@ class StripeCommandService:
                 "redirectUrl": result["redirectUrl"],
                 "expiresAt": result["expiresAt"],
             }
+        if kind == "customer-portal":
+            return {
+                "commandId": command.command_id,
+                "status": "accepted",
+                "redirectUrl": result["redirectUrl"],
+                "expiresAt": result["expiresAt"],
+            }
         return {"commandId": command.command_id, "status": "accepted"}
 
     def _perform(self, kind, command, resolved):
@@ -169,6 +197,14 @@ class StripeCommandService:
             return self._discount_lifecycle(command, resolved)
         if kind == "checkout":
             return self._checkout(command, resolved)
+        if kind == "subscription-change":
+            return self._subscription_change(command, resolved)
+        if kind == "subscription-discount":
+            return self._subscription_discount(command, resolved)
+        if kind == "subscription-pause":
+            return self._subscription_pause(command, resolved)
+        if kind == "customer-portal":
+            return self._customer_portal(command, resolved)
         raise StripeCommandError("Stripe command is unavailable")
 
     def _offer(self, command, resolved):
@@ -533,6 +569,211 @@ class StripeCommandService:
             "status": status,
         }
 
+    def _subscription_context(self, command, resolved):
+        mapping = self._mapping(command, "checkout", command.input["subscriptionId"])
+        if (
+            mapping is None
+            or mapping.get("resourceType") != "checkout"
+            or mapping.get("resourceId") != command.input["subscriptionId"]
+            or mapping.get("mode") not in {None, "subscription"}
+            or type(mapping.get("providerSubscriptionId")) is not str
+        ):
+            raise StripeNeedsReview("Stripe subscription needs review")
+        state = self._provider.retrieve_subscription_operation_state(
+            resolved, mapping["providerSubscriptionId"]
+        )
+        required = {
+            "subscriptionId",
+            "customerId",
+            "status",
+            "items",
+            "scheduleId",
+            "discounts",
+            "pauseCollection",
+        }
+        if (
+            not isinstance(state, dict)
+            or set(state) != required
+            or state["subscriptionId"] != mapping["providerSubscriptionId"]
+            or type(state["customerId"]) is not str
+            or state["status"]
+            not in {"active", "trialing", "past_due", "unpaid", "incomplete"}
+            or not isinstance(state["items"], list)
+            or not isinstance(state["discounts"], list)
+        ):
+            raise StripeNeedsReview("Stripe subscription needs review")
+        return mapping, state
+
+    def _subscription_change(self, command, resolved):
+        _, state = self._subscription_context(command, resolved)
+        value = command.input
+        target = self._mapping(command, "offer", value["targetOfferVersionId"])
+        if (
+            target is None
+            or target.get("status") != "active"
+            or type(target.get("priceId")) is not str
+        ):
+            raise StripeNeedsReview("Stripe subscription needs review")
+        if len(state["items"]) != 1:
+            raise StripeNeedsReview("Stripe subscription needs review")
+        item = state["items"][0]
+        if (
+            not isinstance(item, dict)
+            or set(item) != {"itemId", "priceId", "quantity"}
+            or type(item["itemId"]) is not str
+            or type(item["priceId"]) is not str
+            or type(item["quantity"]) is not int
+            or item["quantity"] < 1
+        ):
+            raise StripeNeedsReview("Stripe subscription needs review")
+        mode = value["planChangePolicy"]["mode"]
+        if mode == "disabled":
+            raise StripeNeedsReview("Stripe subscription needs review")
+        if mode == "next-renewal":
+            if state["scheduleId"] is not None:
+                raise StripeNeedsReview("Stripe subscription needs review")
+            self._provider.schedule_subscription_change(
+                resolved,
+                subscription_id=state["subscriptionId"],
+                item_id=item["itemId"],
+                current_price_id=item["priceId"],
+                price_id=target["priceId"],
+                quantity=item["quantity"],
+                idempotency_key=command.idempotency_key,
+            )
+            return None, [], None
+        if (
+            self._tax_verifier is None
+            or self._tax_verifier(resolved, state, target) is not True
+        ):
+            raise StripeNeedsReview("Stripe subscription needs review")
+        arguments = {
+            "subscription_id": state["subscriptionId"],
+            "item_id": item["itemId"],
+            "price_id": target["priceId"],
+            "quantity": item["quantity"],
+            "preview_timestamp": value["previewTimestamp"],
+            "idempotency_key": command.idempotency_key,
+        }
+        preview = self._provider.preview_subscription_change(resolved, **arguments)
+        if preview != {"previewTimestamp": value["previewTimestamp"]}:
+            raise StripeNeedsReview("Stripe subscription needs review")
+        self._provider.apply_subscription_change(resolved, **arguments)
+        return None, [], None
+
+    def _subscription_discount(self, command, resolved):
+        _, state = self._subscription_context(command, resolved)
+        value = command.input
+        discounts = state["discounts"]
+        if any(type(item) is not str for item in discounts) or len(discounts) > 1:
+            raise StripeNeedsReview("Stripe subscription needs review")
+        if value["action"] == "apply":
+            mapping = self._mapping(command, "discount", value["discountVersionId"])
+            if (
+                mapping is None
+                or mapping.get("status") != "active"
+                or type(mapping.get("promotionCodeId")) is not str
+            ):
+                raise StripeNeedsReview("Stripe subscription needs review")
+            promotion_code_id = mapping["promotionCodeId"]
+            if discounts == [promotion_code_id]:
+                return None, [], None
+            if discounts:
+                raise StripeNeedsReview("Stripe subscription needs review")
+        else:
+            if not discounts:
+                return None, [], None
+            promotion_code_id = discounts[0]
+            owner = self._store.object_owner(
+                command.scope,
+                command.connection_id,
+                "promotion-code",
+                promotion_code_id,
+            )
+            if (
+                owner is None
+                or owner.get("resourceType") != "discount"
+                or owner.get("promotionCodeId") != promotion_code_id
+            ):
+                raise StripeNeedsReview("Stripe subscription needs review")
+            promotion_code_id = None
+        self._provider.update_subscription_discount(
+            resolved,
+            subscription_id=state["subscriptionId"],
+            promotion_code_id=promotion_code_id,
+            idempotency_key=command.idempotency_key,
+        )
+        return None, [], None
+
+    def _subscription_pause(self, command, resolved):
+        _, state = self._subscription_context(command, resolved)
+        value = command.input
+        if value["action"] == "pause":
+            if (
+                value["pausePolicy"].get("enabled") is not True
+                or state["pauseCollection"] is not None
+            ):
+                raise StripeNeedsReview("Stripe subscription needs review")
+            pause_collection = {
+                "behavior": value["pausePolicy"]["newInvoiceBehavior"].replace("-", "_")
+            }
+        else:
+            if state["pauseCollection"] is None:
+                return None, [], None
+            pause_collection = None
+        self._provider.update_subscription_pause(
+            resolved,
+            subscription_id=state["subscriptionId"],
+            pause_collection=pause_collection,
+            idempotency_key=command.idempotency_key,
+        )
+        return None, [], None
+
+    def _customer_portal(self, command, resolved):
+        _, state = self._subscription_context(command, resolved)
+        configuration = self._mapping(
+            command, "portal-configuration", "restricted-default"
+        )
+        mappings = []
+        if configuration is None:
+            configuration_id = self._provider.create_portal_configuration(
+                resolved,
+                "portal-configuration-v1:" + command.connection_id,
+            )
+            configuration = {
+                "resourceType": "portal-configuration",
+                "resourceId": "restricted-default",
+                "revision": 1,
+                "contentHash": hashlib.sha256(
+                    b"payment-method-and-invoice-history-only-v1"
+                ).hexdigest(),
+                "configurationId": configuration_id,
+                "status": "active",
+            }
+            mappings.append(configuration)
+        if (
+            configuration.get("status") != "active"
+            or type(configuration.get("configurationId")) is not str
+        ):
+            raise StripeNeedsReview("Stripe subscription needs review")
+        result = self._provider.create_portal_session(
+            resolved,
+            customer_id=state["customerId"],
+            configuration_id=configuration["configurationId"],
+            idempotency_key=command.idempotency_key,
+        )
+        _portal_redirect(result)
+        return result, mappings, None
+
+    def _replay_portal(self, command, resolved):
+        result, _, _ = self._customer_portal(command, resolved)
+        return {
+            "commandId": command.command_id,
+            "status": "accepted",
+            "redirectUrl": result["redirectUrl"],
+            "expiresAt": result["expiresAt"],
+        }
+
     def _mapping(self, command, resource_type, resource_id):
         return self._store.get_mapping(
             command.scope, command.connection_id, resource_type, resource_id
@@ -589,6 +830,20 @@ def _operation_claim(command: InternalCommand) -> dict[str, Any]:
         resource_id = value["paymentAttemptId"]
         dimension = "immutable"
         revision = value["revision"]
+    elif command.kind in {
+        "subscription-change",
+        "subscription-discount",
+        "subscription-pause",
+        "customer-portal",
+    }:
+        resource_type = "subscription"
+        resource_id = value["subscriptionId"]
+        dimension = (
+            "portal"
+            if command.kind == "customer-portal"
+            else command.kind.removeprefix("subscription-")
+        )
+        revision = value.get("expectedRevision", 1)
     else:
         raise StripeCommandError("Stripe command is unavailable")
     if type(command.content_hash) is not str:
@@ -635,3 +890,24 @@ def _checkout_redirect(value, *, require_session=False):
         or (require_session and type(value["sessionId"]) is not str)
     ):
         raise StripeCommandError("Stripe checkout is unavailable")
+
+
+def _portal_redirect(value):
+    if not isinstance(value, dict) or set(value) != {"redirectUrl", "expiresAt"}:
+        raise StripeCommandError("Stripe portal is unavailable")
+    try:
+        parsed = urlsplit(value["redirectUrl"])
+        port = parsed.port
+    except (TypeError, ValueError):
+        raise StripeCommandError("Stripe portal is unavailable") from None
+    if (
+        parsed.scheme != "https"
+        or parsed.hostname != "billing.stripe.com"
+        or port not in {None, 443}
+        or parsed.username is not None
+        or parsed.password is not None
+        or not parsed.path.startswith("/")
+        or type(value["expiresAt"]) is not int
+        or value["expiresAt"] < 1
+    ):
+        raise StripeCommandError("Stripe portal is unavailable")

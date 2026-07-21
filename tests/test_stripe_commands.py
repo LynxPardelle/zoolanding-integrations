@@ -217,6 +217,23 @@ def checkout_with_add_on(*, add_on_currency="MXN"):
     return payload
 
 
+def subscription_command(kind, input_value, *, revision=2, operation=None):
+    payload = offer_command()
+    payload["input"] = input_value
+    content_hash = hashlib.sha256(
+        json.dumps(input_value, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
+    payload["idempotencyKey"] = integration_key(
+        payload["scope"],
+        payload["connectionId"],
+        operation or kind,
+        input_value["subscriptionId"],
+        revision,
+        content_hash,
+    )
+    return command(kind, payload)
+
+
 class Resolver:
     def __init__(self, *, tax_mode="stripe-tax"):
         self.calls = []
@@ -313,6 +330,22 @@ class Store:
 
     def code_owner(self, scope, connection_id, code_hash):
         return self.code_claims.get((scope.partition_key, connection_id, code_hash))
+
+    def object_owner(self, scope, connection_id, object_type, provider_id):
+        field = {
+            "promotion-code": "promotionCodeId",
+            "subscription": "providerSubscriptionId",
+        }.get(object_type)
+        if field is None:
+            return None
+        for (pk, selected_connection, _, _), mapping in self.mappings.items():
+            if (
+                pk == scope.partition_key
+                and selected_connection == connection_id
+                and mapping.get(field) == provider_id
+            ):
+                return dict(mapping)
+        return None
 
     def complete(
         self,
@@ -485,6 +518,51 @@ class Provider:
         self.calls.append(("checkout-status", session_id))
         return "pending"
 
+    def retrieve_subscription_operation_state(self, resolved_binding, subscription_id):
+        self.calls.append(("subscription-state", subscription_id))
+        return {
+            "subscriptionId": "sub_synthetic01",
+            "customerId": "cus_synthetic01",
+            "status": "active",
+            "items": [
+                {
+                    "itemId": "si_synthetic01",
+                    "priceId": "price_synthetic01",
+                    "quantity": 2,
+                }
+            ],
+            "scheduleId": None,
+            "discounts": [],
+            "pauseCollection": None,
+        }
+
+    def preview_subscription_change(self, resolved_binding, **kwargs):
+        self.calls.append(("subscription-preview", kwargs))
+        return {"previewTimestamp": kwargs["preview_timestamp"]}
+
+    def apply_subscription_change(self, resolved_binding, **kwargs):
+        self.calls.append(("subscription-apply", kwargs))
+
+    def schedule_subscription_change(self, resolved_binding, **kwargs):
+        self.calls.append(("subscription-schedule", kwargs))
+
+    def update_subscription_discount(self, resolved_binding, **kwargs):
+        self.calls.append(("subscription-discount", kwargs))
+
+    def update_subscription_pause(self, resolved_binding, **kwargs):
+        self.calls.append(("subscription-pause", kwargs))
+
+    def create_portal_configuration(self, resolved_binding, idempotency_key):
+        self.calls.append(("portal-configuration", idempotency_key))
+        return "bpc_synthetic01"
+
+    def create_portal_session(self, resolved_binding, **kwargs):
+        self.calls.append(("portal-session", kwargs))
+        return {
+            "redirectUrl": "https://billing.stripe.com/p/session/synthetic",
+            "expiresAt": 1_800_001_800,
+        }
+
 
 class Routes:
     def resolve(self, scope):
@@ -510,7 +588,255 @@ class StripeCommandTests(unittest.TestCase):
             self.provider,
             self.routes,
             now_epoch=lambda: self.now,
+            tax_verifier=lambda resolved_binding, state, target: True,
         )
+
+    def seed_subscription(self):
+        selected_scope = resolved().connection.scope
+        prefix = (selected_scope.partition_key, "stripe-primary")
+        self.store.mappings[(*prefix, "offer", "offer-v1")] = {
+            "resourceType": "offer",
+            "resourceId": "offer-v1",
+            "revision": 1,
+            "contentHash": "a" * 64,
+            "productId": "prod_synthetic01",
+            "priceId": "price_synthetic01",
+            "status": "active",
+        }
+        self.store.mappings[(*prefix, "offer", "offer-v2")] = {
+            "resourceType": "offer",
+            "resourceId": "offer-v2",
+            "revision": 1,
+            "contentHash": "b" * 64,
+            "productId": "prod_synthetic02",
+            "priceId": "price_synthetic02",
+            "status": "active",
+        }
+        self.store.mappings[(*prefix, "checkout", "subscription-1")] = {
+            "resourceType": "checkout",
+            "resourceId": "subscription-1",
+            "revision": 1,
+            "contentHash": "c" * 64,
+            "orderId": "order-1",
+            "paymentAttemptId": "subscription-1",
+            "reservationId": "reservation-1",
+            "offerVersionIds": ["offer-v1"],
+            "primaryOfferVersionId": "offer-v1",
+            "sessionId": "cs_test_synthetic01",
+            "providerSubscriptionId": "sub_synthetic01",
+            "status": "active",
+        }
+
+    def test_immediate_plan_change_previews_and_applies_identical_item_quantity_and_timestamp(
+        self,
+    ):
+        self.seed_subscription()
+        command_value = subscription_command(
+            "subscription-change",
+            {
+                "subscriptionId": "subscription-1",
+                "expectedRevision": 2,
+                "targetOfferVersionId": "offer-v2",
+                "planChangePolicy": {"mode": "immediate-prorated"},
+                "previewTimestamp": 1_800_000_100,
+            },
+            operation="subscription-change",
+        )
+
+        result = self.service.execute("subscription-change", command_value)
+
+        self.assertEqual(result["status"], "accepted")
+        preview = next(
+            call[1] for call in self.provider.calls if call[0] == "subscription-preview"
+        )
+        applied = next(
+            call[1] for call in self.provider.calls if call[0] == "subscription-apply"
+        )
+        comparable = {
+            "subscription_id",
+            "item_id",
+            "price_id",
+            "quantity",
+            "preview_timestamp",
+        }
+        self.assertEqual(
+            {key: preview[key] for key in comparable},
+            {key: applied[key] for key in comparable},
+        )
+
+    def test_subscription_network_429_or_5xx_is_sanitized_and_stops_after_24_hours(
+        self,
+    ):
+        for detail in ("429 provider detail", "500 provider detail"):
+            with self.subTest(detail=detail):
+                self.setUp()
+                self.seed_subscription()
+                value = subscription_command(
+                    "subscription-change",
+                    {
+                        "subscriptionId": "subscription-1",
+                        "expectedRevision": 2,
+                        "targetOfferVersionId": "offer-v2",
+                        "planChangePolicy": {"mode": "immediate-prorated"},
+                        "previewTimestamp": 1_800_000_100,
+                    },
+                    operation="subscription-change",
+                )
+
+                def fail(*args, **kwargs):
+                    raise RuntimeError(detail)
+
+                self.provider.preview_subscription_change = fail
+                first = self.service.execute("subscription-change", value)
+                self.now += 24 * 60 * 60
+                final = self.service.execute("subscription-change", value)
+
+                self.assertEqual(first["status"], "pending")
+                self.assertEqual(final["status"], "needs_review")
+                self.assertNotIn("provider detail", repr((first, final)))
+
+    def test_next_renewal_existing_schedule_or_multi_item_routes_to_review(self):
+        self.seed_subscription()
+        original = self.provider.retrieve_subscription_operation_state
+        for change in (
+            {"scheduleId": "sub_sched_synthetic01"},
+            {
+                "items": [
+                    {
+                        "itemId": "si_one00001",
+                        "priceId": "price_synthetic01",
+                        "quantity": 1,
+                    },
+                    {
+                        "itemId": "si_two00002",
+                        "priceId": "price_synthetic02",
+                        "quantity": 1,
+                    },
+                ]
+            },
+        ):
+            with self.subTest(change=change):
+                self.setUp()
+                self.seed_subscription()
+                self.provider.retrieve_subscription_operation_state = (
+                    lambda *args, change=change: {
+                        **original(self.resolver.resolve(), "subscription-1"),
+                        **change,
+                    }
+                )
+                value = subscription_command(
+                    "subscription-change",
+                    {
+                        "subscriptionId": "subscription-1",
+                        "expectedRevision": 2,
+                        "targetOfferVersionId": "offer-v2",
+                        "planChangePolicy": {"mode": "next-renewal"},
+                    },
+                    operation="subscription-change",
+                )
+                self.assertEqual(
+                    self.service.execute("subscription-change", value)["status"],
+                    "needs_review",
+                )
+                self.assertNotIn(
+                    "subscription-schedule", [call[0] for call in self.provider.calls]
+                )
+
+    def test_discount_pause_and_portal_use_exact_mappings_and_restricted_configuration(
+        self,
+    ):
+        self.seed_subscription()
+        selected_scope = resolved().connection.scope
+        self.store.mappings[
+            (selected_scope.partition_key, "stripe-primary", "discount", "discount-v1")
+        ] = {
+            "resourceType": "discount",
+            "resourceId": "discount-v1",
+            "revision": 1,
+            "contentHash": "d" * 64,
+            "couponId": "couponSynthetic01",
+            "promotionCodeId": "promo_synthetic01",
+            "status": "active",
+        }
+        discount = subscription_command(
+            "subscription-discount",
+            {
+                "subscriptionId": "subscription-1",
+                "expectedRevision": 2,
+                "action": "apply",
+                "discountVersionId": "discount-v1",
+            },
+            operation="apply",
+        )
+        pause = subscription_command(
+            "subscription-pause",
+            {
+                "subscriptionId": "subscription-1",
+                "expectedRevision": 3,
+                "action": "pause",
+                "pausePolicy": {
+                    "enabled": True,
+                    "newInvoiceBehavior": "keep-as-draft",
+                    "existingInvoiceBehavior": "unchanged",
+                    "accessBehavior": "suspend",
+                    "resume": {"mode": "manual"},
+                    "onResume": {
+                        "collection": "restore",
+                        "access": "restore-if-suspended",
+                    },
+                },
+            },
+            revision=3,
+            operation="pause",
+        )
+
+        self.assertEqual(
+            self.service.execute("subscription-discount", discount)["status"],
+            "accepted",
+        )
+        self.assertEqual(
+            self.service.execute("subscription-pause", pause)["status"], "accepted"
+        )
+        discount_call = next(
+            call[1]
+            for call in self.provider.calls
+            if call[0] == "subscription-discount"
+        )
+        pause_call = next(
+            call[1] for call in self.provider.calls if call[0] == "subscription-pause"
+        )
+        self.assertEqual(discount_call["promotion_code_id"], "promo_synthetic01")
+        self.assertEqual(pause_call["pause_collection"], {"behavior": "keep_as_draft"})
+
+        portal_payload = offer_command()
+        portal_payload["input"] = {"subscriptionId": "subscription-1"}
+        portal_hash = hashlib.sha256(
+            json.dumps(
+                portal_payload["input"], sort_keys=True, separators=(",", ":")
+            ).encode()
+        ).hexdigest()
+        portal_payload["idempotencyKey"] = integration_key(
+            portal_payload["scope"],
+            "stripe-primary",
+            "customer-portal",
+            "subscription-1",
+            1,
+            portal_hash,
+        )
+        portal = command("customer-portal", portal_payload)
+        first = self.service.execute("customer-portal", portal)
+        second = self.service.execute("customer-portal", portal)
+        self.assertEqual(
+            first["redirectUrl"], "https://billing.stripe.com/p/session/synthetic"
+        )
+        self.assertEqual(second["status"], "accepted")
+        self.assertEqual(
+            [call[0] for call in self.provider.calls].count("portal-configuration"), 1
+        )
+        self.assertEqual(
+            [call[0] for call in self.provider.calls].count("portal-session"), 2
+        )
+        self.assertNotIn("billing.stripe.com", repr(self.store.persisted_values))
 
     def provision_offer(self):
         return self.service.execute("offer", command("offer", offer_command()))

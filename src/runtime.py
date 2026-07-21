@@ -54,6 +54,21 @@ class RuntimeCompositionError(RuntimeError):
     pass
 
 
+class PublishedTaxPolicyVerifier:
+    """Test is locally safe; production remains closed until tax proof is published."""
+
+    def __call__(self, resolved: Any, state: Any, target: Any) -> bool:
+        del state, target
+        scope = getattr(getattr(resolved, "connection", None), "scope", None)
+        if getattr(scope, "environment", None) == "test":
+            return True
+        metadata = getattr(getattr(resolved, "binding", None), "provider_metadata", {})
+        return bool(
+            metadata.get("taxMode") in {"manual-rate", "stripe-tax"}
+            and metadata.get("taxApprovalId")
+        )
+
+
 def browser_runtime() -> dict[str, Any]:
     boto3 = _boto3()
     dynamodb = boto3.resource("dynamodb")
@@ -156,6 +171,7 @@ def stripe_command_runtime() -> dict[str, Any]:
             provider,
             PublishedCheckoutRouteResolver(policies),
             now_epoch=lambda: int(time.time()),
+            tax_verifier=PublishedTaxPolicyVerifier(),
         )
     }
 
