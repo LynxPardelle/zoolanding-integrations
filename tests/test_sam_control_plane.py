@@ -76,6 +76,14 @@ class SamControlPlaneTests(unittest.TestCase):
         self.assertIn(
             "secretsmanager:DescribeSecret", self._role("ConnectionAdminRole")
         )
+        connection_admin_role = self._role("ConnectionAdminRole")
+        self.assertIn(
+            "/zoolanding/${EnvironmentName}/integrations/*", connection_admin_role
+        )
+        self.assertIn(
+            "/zoolanding/${EnvironmentName}/*/*/notifications/smtp/*",
+            connection_admin_role,
+        )
         self.assertIn(
             "secretsmanager:GetSecretValue", self._role("StripeOnboardingRole")
         )
@@ -100,7 +108,9 @@ class SamControlPlaneTests(unittest.TestCase):
         for role in ("StripeOnboardingRole", "InternalProviderCommandRole"):
             rendered = self._role(role)
             self.assertIn("${AWS::Partition}", rendered)
-            self.assertIn("/zoolanding/${EnvironmentName}/integrations/*/*/stripe/*", rendered)
+            self.assertIn(
+                "/zoolanding/${EnvironmentName}/integrations/*/*/stripe/*", rendered
+            )
             self.assertNotIn("PrefixArn", rendered)
         self.assertIn("Runtime: python3.13", self.text)
         self.assertNotIn("Cache", self.text)
@@ -112,6 +122,44 @@ class SamControlPlaneTests(unittest.TestCase):
             ],
             {"AttributeName": "expiresAt", "Enabled": True},
         )
+
+    def test_webhook_worker_and_relay_are_separate_least_privilege_functions(self):
+        webhook = self.resources["StripeWebhookFunction"]["Properties"]
+        worker = self.resources["WebhookIngressStreamFunction"]["Properties"]
+        relay = self.resources["IntegrationOutgoingStreamFunction"]["Properties"]
+        self.assertEqual(webhook["Handler"], "handlers.stripe_webhook.lambda_handler")
+        public_event = self._api_event("StripeWebhookFunction")
+        self.assertEqual(public_event["Properties"]["Path"], "/webhooks/stripe/connect")
+        self.assertEqual(public_event["Properties"]["Method"], "post")
+        self.assertNotIn("Auth", public_event["Properties"])
+        self.assertEqual(
+            worker["Handler"], "handlers.stripe_event_worker.lambda_handler"
+        )
+        self.assertEqual(
+            relay["Handler"], "handlers.integration_outbox_relay.lambda_handler"
+        )
+        self.assertEqual(
+            worker["Environment"]["Variables"]["WEBHOOK_RECEIPT_TABLE_NAME"],
+            {"Ref": "WebhookReceiptTable"},
+        )
+        self.assertEqual(
+            relay["Environment"]["Variables"]["INTEGRATION_EVENTS_TOPIC_ARN"],
+            {"Ref": "IntegrationEventsTopic"},
+        )
+        ingress_role = self._role("StripeWebhookRole")
+        worker_role = self._role("WebhookIngressStreamRole")
+        relay_role = self._role("IntegrationOutgoingStreamRole")
+        self.assertIn(
+            "/zoolanding/${EnvironmentName}/integrations/stripe/connect-webhook",
+            ingress_role,
+        )
+        self.assertNotIn("sns:Publish", ingress_role)
+        self.assertIn("dynamodb:TransactWriteItems", worker_role)
+        self.assertIn("secretsmanager:GetSecretValue", worker_role)
+        self.assertNotIn("sns:Publish", worker_role)
+        self.assertIn("sns:Publish", relay_role)
+        self.assertNotIn("secretsmanager:GetSecretValue", relay_role)
+        self.assertNotIn("handlers.pending_stream", self.text)
 
     def _api_event(self, logical_id):
         events = self.resources[logical_id]["Properties"]["Events"]

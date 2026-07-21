@@ -23,9 +23,10 @@ try:
     from providers.stripe_adapter import (
         SecretsManagerStripeClientFactory,
         StripeAdapter,
+        StripeWebhookVerifier,
     )
     from stripe_commands import StripeCommandService
-    from stripe_store import DynamoStripeCommandStore
+    from stripe_store import DynamoStripeCommandStore, DynamoStripeWebhookStore
 except ModuleNotFoundError:
     from src.common.auth_admin import DynamoAuthStore
     from src.common.published_policy import (
@@ -43,9 +44,10 @@ except ModuleNotFoundError:
     from src.providers.stripe_adapter import (
         SecretsManagerStripeClientFactory,
         StripeAdapter,
+        StripeWebhookVerifier,
     )
     from src.stripe_commands import StripeCommandService
-    from src.stripe_store import DynamoStripeCommandStore
+    from src.stripe_store import DynamoStripeCommandStore, DynamoStripeWebhookStore
 
 
 class RuntimeCompositionError(RuntimeError):
@@ -156,6 +158,77 @@ def stripe_command_runtime() -> dict[str, Any]:
             now_epoch=lambda: int(time.time()),
         )
     }
+
+
+def stripe_webhook_runtime() -> dict[str, Any]:
+    boto3 = _boto3()
+    environment = _environment()
+    secret_id = f"/zoolanding/{environment}/integrations/stripe/connect-webhook"
+    try:
+        response = boto3.client("secretsmanager").get_secret_value(SecretId=secret_id)
+    except Exception:
+        raise RuntimeCompositionError("Runtime dependencies are unavailable") from None
+    secret = response.get("SecretString") if isinstance(response, dict) else None
+    return {
+        "verifier": StripeWebhookVerifier(secret),
+        "registry": _registry(boto3),
+        "store": DynamoStripeWebhookStore(
+            _required("WEBHOOK_RECEIPT_TABLE_NAME"),
+            client=boto3.client("dynamodb"),
+        ),
+        "environment": environment,
+        "now_epoch": int(time.time()),
+    }
+
+
+def stripe_event_worker_runtime() -> Any:
+    try:
+        from handlers.stripe_event_worker import StripeEventWorker
+    except ModuleNotFoundError:
+        from src.handlers.stripe_event_worker import StripeEventWorker
+    boto3 = _boto3()
+    provider = StripeAdapter(
+        accounts_v2_verified=False,
+        client_factory=SecretsManagerStripeClientFactory(
+            boto3.client("secretsmanager")
+        ),
+    )
+    return StripeEventWorker(
+        _registry(boto3),
+        DynamoStripeWebhookStore(
+            _required("WEBHOOK_RECEIPT_TABLE_NAME"),
+            client=boto3.client("dynamodb"),
+        ),
+        DynamoStripeCommandStore(
+            _required("INTEGRATION_REGISTRY_TABLE_NAME"),
+            client=boto3.client("dynamodb"),
+        ),
+        provider,
+    )
+
+
+def integration_outbox_relay_runtime() -> Any:
+    try:
+        from handlers.integration_outbox_relay import (
+            IntegrationOutboxRelay,
+            SnsIntegrationEventPublisher,
+        )
+    except ModuleNotFoundError:
+        from src.handlers.integration_outbox_relay import (
+            IntegrationOutboxRelay,
+            SnsIntegrationEventPublisher,
+        )
+    boto3 = _boto3()
+    return IntegrationOutboxRelay(
+        DynamoStripeWebhookStore(
+            _required("WEBHOOK_RECEIPT_TABLE_NAME"),
+            client=boto3.client("dynamodb"),
+        ),
+        SnsIntegrationEventPublisher(
+            _required("INTEGRATION_EVENTS_TOPIC_ARN"),
+            client=boto3.client("sns"),
+        ),
+    )
 
 
 def _registry(boto3: Any) -> ConnectionRegistry:

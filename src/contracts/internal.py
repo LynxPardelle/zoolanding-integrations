@@ -6,6 +6,7 @@ from dataclasses import dataclass
 import hashlib
 import json
 import re
+import unicodedata
 from typing import Any, Mapping
 from urllib.parse import urlsplit
 
@@ -15,11 +16,15 @@ except ModuleNotFoundError:
     from src.domain.integrations import IntegrationScope
 
 
-_SAFE_ID = re.compile(r"[a-z0-9][a-z0-9._-]{0,127}", re.ASCII)
+_SAFE_ID = re.compile(r"[a-z0-9][a-z0-9._-]{0,63}", re.ASCII)
 _HASH = re.compile(r"[a-f0-9]{64}", re.ASCII)
 _CURRENCY = re.compile(r"[A-Z]{3}", re.ASCII)
 _COUPON_CODE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}", re.ASCII)
 _COUNTRY = re.compile(r"[A-Z]{2}", re.ASCII)
+_URL_LIKE = re.compile(
+    r"(?:[a-z][a-z0-9+.-]*://|www\.|\b(?:[a-z0-9-]+\.)+[a-z]{2,63}(?:[/?:#]\S*)?)",
+    re.IGNORECASE,
+)
 _STRIPE_ACCOUNT = re.compile(r"acct_[A-Za-z0-9]{8,64}", re.ASCII)
 _PROVIDER_CAPABILITIES = {
     "stripe": frozenset(
@@ -156,8 +161,8 @@ def validate_connection_registration(value: object) -> ConnectionRegistration:
         f"/zoolanding/{scope.environment}/integrations/{scope.tenant_id}/"
         f"{scope.draft_id}/stripe/{connection_id}"
         if provider == "stripe"
-        else f"/zoolanding/{scope.environment}/integrations/{scope.tenant_id}/"
-        f"{scope.draft_id}/smtp/{connection_id}"
+        else f"/zoolanding/{scope.environment}/{scope.tenant_id}/"
+        f"{scope.draft_id}/notifications/smtp/{connection_id}"
     )
     if reference != expected_reference:
         raise ContractError("registration reference is invalid")
@@ -189,9 +194,7 @@ def validate_service_result(
     command = expected if type(expected) is InternalCommand else None
     expected_command_id = command.command_id if command is not None else expected
     if command is not None and command.kind == "checkout-status":
-        result = _closed(
-            value, {"orderId", "paymentAttemptId", "revision", "status"}
-        )
+        result = _closed(value, {"orderId", "paymentAttemptId", "revision", "status"})
         if (
             result["orderId"] != command.input["orderId"]
             or result["paymentAttemptId"] != command.input["paymentAttemptId"]
@@ -273,8 +276,8 @@ def validate_connection_resolution_result(
         f"{expected.scope.tenant_id}/{expected.scope.draft_id}/stripe/"
         f"{expected.connection_id}"
         if provider == "stripe"
-        else f"/zoolanding/{expected.scope.environment}/integrations/"
-        f"{expected.scope.tenant_id}/{expected.scope.draft_id}/smtp/"
+        else f"/zoolanding/{expected.scope.environment}/"
+        f"{expected.scope.tenant_id}/{expected.scope.draft_id}/notifications/smtp/"
         f"{expected.connection_id}"
     )
     if reference != expected_reference:
@@ -302,10 +305,7 @@ def _snapshot_input(kind: str, value: object) -> tuple[Any, str]:
     required = {"resourceId", "revision", "schemaVersion", "snapshot", "contentHash"}
     if kind == "offer":
         required.add("operation")
-    item = _closed(
-        value,
-        required,
-    )
+    item = _closed(value, required, {"operation"} if kind == "discount" else None)
     _id(item["resourceId"])
     _positive_int(item["revision"])
     if item["schemaVersion"] != 1:
@@ -316,6 +316,10 @@ def _snapshot_input(kind: str, value: object) -> tuple[Any, str]:
         if type(operation) is not str or operation not in {"provision", "deactivate"}:
             raise ContractError("offer operation is invalid")
         snapshot_kind = "offer" if operation == "provision" else "offer-lifecycle"
+    elif kind == "discount" and "operation" in item:
+        if item["operation"] != "presentation":
+            raise ContractError("discount operation is invalid")
+        snapshot_kind = "discount-presentation"
     snapshot = _snapshot(snapshot_kind, item["snapshot"])
     content_hash = item["contentHash"]
     if type(content_hash) is not str or _HASH.fullmatch(content_hash) is None:
@@ -341,21 +345,20 @@ def _snapshot(kind: str, value: object) -> dict[str, Any]:
         )
         if item["schemaVersion"] != 1 or item["billingScheme"] != "per_unit":
             raise ContractError("offer billing is invalid")
-        _nonnegative_int(item["amountMinor"])
+        _amount_minor(item["amountMinor"])
         if (
             type(item["currency"]) is not str
             or _CURRENCY.fullmatch(item["currency"]) is None
         ):
             raise ContractError("offer currency is invalid")
         if type(item["saleType"]) is not str or item["saleType"] not in {
-            "one_time", "recurring"
+            "one_time",
+            "recurring",
         }:
             raise ContractError("offer sale type is invalid")
         recurrence = item["recurrence"]
         if item["saleType"] == "recurring":
-            recurrence = _closed(
-                recurrence, {"interval", "intervalCount", "usageType"}
-            )
+            recurrence = _closed(recurrence, {"interval", "intervalCount", "usageType"})
             if (
                 recurrence["interval"] not in {"month", "year"}
                 or recurrence["intervalCount"] != 1
@@ -377,6 +380,12 @@ def _snapshot(kind: str, value: object) -> dict[str, Any]:
             raise ContractError("offer lifecycle is invalid")
         return item
     if kind == "product-presentation":
+        item = _closed(value, {"displayName"}, {"displayDescription"})
+        _plain_text(item["displayName"], 160)
+        if "displayDescription" in item:
+            _plain_text(item["displayDescription"], 1000)
+        return item
+    if kind == "discount-presentation":
         item = _closed(value, {"displayName"}, {"displayDescription"})
         _plain_text(item["displayName"], 160)
         if "displayDescription" in item:
@@ -405,7 +414,10 @@ def _snapshot(kind: str, value: object) -> dict[str, Any]:
         }:
             raise ContractError("discount duration is invalid")
         discount_value = item["value"]
-        if isinstance(discount_value, dict) and discount_value.get("type") == "percentage":
+        if (
+            isinstance(discount_value, dict)
+            and discount_value.get("type") == "percentage"
+        ):
             discount_value = _closed(discount_value, {"type", "basisPoints"})
             basis_points = discount_value["basisPoints"]
             if type(basis_points) is not int or not 1 <= basis_points <= 10_000:
@@ -416,14 +428,16 @@ def _snapshot(kind: str, value: object) -> dict[str, Any]:
             )
             if discount_value["type"] != "fixed_amount":
                 raise ContractError("discount value is invalid")
-            _positive_int(discount_value["amountMinor"])
+            if _amount_minor(discount_value["amountMinor"]) == 0:
+                raise ContractError("discount value is invalid")
             if (
                 type(discount_value["currency"]) is not str
                 or _CURRENCY.fullmatch(discount_value["currency"]) is None
             ):
                 raise ContractError("discount value is invalid")
         if item["duration"] == "repeating":
-            _positive_int(item["durationInMonths"])
+            if not 1 <= _positive_int(item["durationInMonths"]) <= 36:
+                raise ContractError("discount duration is invalid")
         elif item["durationInMonths"] is not None:
             raise ContractError("discount duration is invalid")
         eligible = item["eligibleOfferVersionIds"]
@@ -436,9 +450,12 @@ def _snapshot(kind: str, value: object) -> dict[str, Any]:
             raise ContractError("discount eligibility is invalid")
         for offer_id in eligible:
             _id(offer_id)
-        for integer_field in ("redemptionLimit", "redeemByEpoch"):
-            if item[integer_field] is not None:
-                _positive_int(item[integer_field])
+        if item["redemptionLimit"] is not None and not (
+            1 <= _positive_int(item["redemptionLimit"]) <= 1_000_000
+        ):
+            raise ContractError("discount redemption limit is invalid")
+        if item["redeemByEpoch"] is not None:
+            _positive_int(item["redeemByEpoch"])
         code = item["customerFacingCode"]
         if code is not None and (
             type(code) is not str or _COUPON_CODE.fullmatch(code) is None
@@ -635,19 +652,34 @@ def _validate_checkout(item: Mapping[str, Any]) -> None:
 
     sellable_types = {line["sellableType"] for line in item["offerBindings"]}
     sale_types = {line["snapshot"]["saleType"] for line in item["offerBindings"]}
+    recurring_count = sum(
+        line["snapshot"]["saleType"] == "recurring" for line in item["offerBindings"]
+    )
     offer_ids = [line["offerVersionId"] for line in item["offerBindings"]]
     if (
         len(set(offer_ids)) != len(offer_ids)
-        or ("recurring" in sale_types and len(offer_ids) != 1)
+        or recurring_count > 1
         or ("physical" in sellable_types and "recurring" in sale_types)
         or ("physical" in sellable_types and "subscription" in sellable_types)
         or ("physical" in sellable_types and shipping["collection"] != "required")
         or ("physical" not in sellable_types and shipping["collection"] != "none")
-        or ("recurring" in sale_types and "one_time" in sale_types)
         or any(
             line["sellableType"] == "subscription"
             and line["snapshot"]["saleType"] != "recurring"
             for line in item["offerBindings"]
+        )
+        or any(
+            line["snapshot"]["saleType"] == "recurring"
+            and line["sellableType"] != "subscription"
+            for line in item["offerBindings"]
+        )
+        or (
+            recurring_count == 1
+            and any(
+                line["snapshot"]["saleType"] == "one_time"
+                and line["sellableType"] != "add_on"
+                for line in item["offerBindings"]
+            )
         )
     ):
         raise ContractError("checkout cart is invalid")
@@ -697,6 +729,8 @@ def _command_identity(kind: str, item: Mapping[str, Any]) -> tuple[str, str, int
     operation = kind
     if kind == "offer":
         operation = item["operation"]
+    elif kind == "discount" and item.get("operation") == "presentation":
+        operation = "discount-presentation"
     elif kind == "discount-lifecycle":
         operation = item["snapshot"]["targetState"]
     elif kind in {"subscription-discount", "subscription-pause"}:
@@ -749,7 +783,9 @@ def _provider_redirect(value: object, kind: str) -> bool:
         port = parsed.port
     except ValueError:
         return False
-    expected_host = "checkout.stripe.com" if kind == "checkout" else "billing.stripe.com"
+    expected_host = (
+        "checkout.stripe.com" if kind == "checkout" else "billing.stripe.com"
+    )
     return (
         parsed.scheme == "https"
         and parsed.hostname == expected_host
@@ -814,24 +850,32 @@ def _capabilities(value: object) -> tuple[str, ...]:
 
 
 def _positive_int(value: object) -> int:
-    if type(value) is not int or value < 1:
+    if type(value) is not int or not 1 <= value <= 9_999_999_999:
         raise ContractError("command integer is invalid")
     return value
 
 
 def _nonnegative_int(value: object) -> int:
-    if type(value) is not int or value < 0:
+    if type(value) is not int or not 0 <= value <= 9_999_999_999:
         raise ContractError("command integer is invalid")
     return value
+
+
+def _amount_minor(value: object) -> int:
+    amount = _nonnegative_int(value)
+    if amount > 99_999_999:
+        raise ContractError("command amount is invalid")
+    return amount
 
 
 def _plain_text(value: object, maximum: int) -> str:
     if (
         type(value) is not str
         or not 1 <= len(value) <= maximum
-        or any(ord(character) < 32 for character in value)
+        or any(unicodedata.category(character) in {"Cc", "Cf"} for character in value)
         or "<" in value
         or ">" in value
+        or _URL_LIKE.search(value) is not None
     ):
         raise ContractError("presentation text is invalid")
     return value

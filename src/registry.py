@@ -35,6 +35,7 @@ class RegistryConflict(RegistryError):
 
 
 _SAFE_ID = re.compile(r"[a-z0-9][a-z0-9._-]{0,63}", re.ASCII)
+_STRIPE_ACCOUNT = re.compile(r"acct_[A-Za-z0-9]{8,64}", re.ASCII)
 
 
 @dataclass(frozen=True, slots=True)
@@ -74,11 +75,14 @@ class ConnectionRegistry:
         records = tuple(
             {**record, "registrationHash": registration_hash} for record in records
         )
-        sentinel = {
-            **_routing_sentinel(connection),
-            "registrationHash": registration_hash,
-        }
-        replay = self._exact_replay(records, sentinel)
+        sentinels = tuple(
+            {**sentinel, "registrationHash": registration_hash}
+            for sentinel in (
+                _routing_sentinel(connection),
+                *_isolation_sentinels(connection),
+            )
+        )
+        replay = self._exact_replay(records, sentinels)
         if replay is True:
             return
         if replay is False:
@@ -86,11 +90,11 @@ class ConnectionRegistry:
         try:
             self._backend.put_registration(
                 records,
-                sentinel,
+                sentinels,
                 token,
             )
         except RegistryConflict:
-            if self._exact_replay(records, sentinel) is True:
+            if self._exact_replay(records, sentinels) is True:
                 return
             raise
         except Exception:
@@ -99,9 +103,9 @@ class ConnectionRegistry:
     def _exact_replay(
         self,
         records: tuple[dict[str, Any], ...],
-        sentinel: dict[str, Any],
+        sentinels: tuple[dict[str, Any], ...],
     ) -> bool | None:
-        expected = records + (sentinel,)
+        expected = records + sentinels
         try:
             existing = tuple(
                 self._backend.get(item["pk"], item["sk"]) for item in expected
@@ -204,6 +208,87 @@ class ConnectionRegistry:
         except Exception:
             raise RegistryConflict("Integration update conflicted") from None
 
+    def stripe_webhook_connection(
+        self,
+        *,
+        environment: object,
+        mode: object,
+        account_reference: object,
+    ) -> IntegrationConnection:
+        """Resolve a Connect account through its non-authorizing hashed claim."""
+        if environment not in {"test", "production"}:
+            raise RegistryAccessDenied("Stripe webhook routing is unavailable")
+        expected_mode = "test" if environment == "test" else "live"
+        if mode != expected_mode or (
+            type(account_reference) is not str
+            or _STRIPE_ACCOUNT.fullmatch(account_reference) is None
+        ):
+            raise RegistryAccessDenied("Stripe webhook routing is unavailable")
+        digest = hashlib.sha256(account_reference.encode("ascii")).hexdigest()
+        claim_pk = f"ROUTING#{environment}#{mode}#{digest}"
+        try:
+            claim = self._backend.get(claim_pk, "CLAIM")
+            if not isinstance(claim, Mapping):
+                raise ValueError
+            expected_claim_keys = {
+                "pk",
+                "sk",
+                "itemType",
+                "authorizes",
+                "environment",
+                "tenantId",
+                "draftId",
+                "domain",
+                "provider",
+                "connectionId",
+                "registrationHash",
+            }
+            if (
+                set(claim) != expected_claim_keys
+                or claim.get("pk") != claim_pk
+                or claim.get("sk") != "CLAIM"
+                or claim.get("itemType") != "AccountRoutingSentinel"
+                or claim.get("authorizes") is not False
+                or claim.get("environment") != environment
+                or claim.get("provider") != "stripe"
+                or type(claim.get("registrationHash")) is not str
+                or re.fullmatch(r"[a-f0-9]{64}", claim["registrationHash"], re.ASCII)
+                is None
+            ):
+                raise ValueError
+            routed_scope = IntegrationScope(
+                environment=claim["environment"],
+                tenant_id=claim["tenantId"],
+                draft_id=claim["draftId"],
+                domain=claim["domain"],
+            )
+            connection_id = _safe_id(claim["connectionId"])
+            record = self._backend.get(
+                routed_scope.partition_key, f"CONNECTION#{connection_id}"
+            )
+            connection = _connection_from_record(routed_scope, record)
+            if (
+                not isinstance(record, Mapping)
+                or record.get("registrationHash") != claim["registrationHash"]
+                or connection.connection_id != connection_id
+                or connection.provider != "stripe"
+                or connection.mode != mode
+                or connection.status != "active"
+                or not _readiness_is_complete(
+                    connection.provider_metadata.get("readiness")
+                )
+                or connection.provider_metadata.get("accountReference")
+                != account_reference
+            ):
+                raise ValueError
+            return connection
+        except RegistryAccessDenied:
+            raise
+        except Exception:
+            raise RegistryAccessDenied(
+                "Stripe webhook routing is unavailable"
+            ) from None
+
 
 class BindingResolver:
     def __init__(self, registry: ConnectionRegistry):
@@ -265,10 +350,10 @@ class DynamoRegistryBackend:
     def put_registration(
         self,
         records: tuple[dict[str, Any], ...],
-        sentinel: dict[str, Any],
+        sentinels: tuple[dict[str, Any], ...],
         idempotency_key: str,
     ) -> None:
-        items = records + (sentinel,)
+        items = records + sentinels
         transact_items = [
             {
                 "Put": {
@@ -408,6 +493,34 @@ def _routing_sentinel(connection: IntegrationConnection) -> dict[str, Any]:
         "provider": connection.provider,
         "connectionId": connection.connection_id,
     }
+
+
+def _isolation_sentinels(
+    connection: IntegrationConnection,
+) -> tuple[dict[str, Any], ...]:
+    if (
+        connection.scope.environment != "production"
+        or connection.provider != "email.smtp"
+    ):
+        return ()
+    domain = connection.provider_metadata.get("canonicalSendingDomain")
+    if type(domain) is not str:
+        raise RegistryAccessDenied("Integration registration is invalid")
+    digest = hashlib.sha256(domain.casefold().encode("ascii")).hexdigest()
+    return (
+        {
+            "pk": f"ISOLATION#production#email.smtp#domain#{digest}",
+            "sk": "CLAIM",
+            "itemType": "ConnectionIsolationSentinel",
+            "authorizes": False,
+            "environment": connection.scope.environment,
+            "tenantId": connection.scope.tenant_id,
+            "draftId": connection.scope.draft_id,
+            "provider": "email.smtp",
+            "claimType": "canonical-sending-domain",
+            "connectionId": connection.connection_id,
+        },
+    )
 
 
 def _registration_hash(records: tuple[dict[str, Any], ...]) -> str:

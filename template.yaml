@@ -314,7 +314,8 @@ Resources:
               - Effect: Allow
                 Action: secretsmanager:DescribeSecret
                 Resource:
-                  Fn::Sub: arn:${AWS::Partition}:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:/zoolanding/${EnvironmentName}/integrations/*
+                  - Fn::Sub: arn:${AWS::Partition}:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:/zoolanding/${EnvironmentName}/integrations/*
+                  - Fn::Sub: arn:${AWS::Partition}:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:/zoolanding/${EnvironmentName}/*/*/notifications/smtp/*
 
   InternalConnectionResolveRole:
     Type: AWS::IAM::Role
@@ -385,6 +386,15 @@ Resources:
         Fn::Sub: /aws/lambda/${AWS::StackName}-webhook-ingress-stream
       RetentionInDays: 30
 
+  StripeWebhookLogGroup:
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      LogGroupName:
+        Fn::Sub: /aws/lambda/${AWS::StackName}-stripe-webhook
+      RetentionInDays: 30
+
   IntegrationOutgoingLogGroup:
     Type: AWS::Logs::LogGroup
     DeletionPolicy: Retain
@@ -393,6 +403,42 @@ Resources:
       LogGroupName:
         Fn::Sub: /aws/lambda/${AWS::StackName}-integration-outgoing-stream
       RetentionInDays: 30
+
+  StripeWebhookRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: StripeWebhookIngress
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource:
+                  Fn::Sub: arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/${AWS::StackName}-stripe-webhook:*
+              - Effect: Allow
+                Action: dynamodb:GetItem
+                Resource:
+                  Fn::GetAtt: [IntegrationRegistryTable, Arn]
+              - Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                  - dynamodb:TransactWriteItems
+                Resource:
+                  Fn::GetAtt: [WebhookReceiptTable, Arn]
+              - Effect: Allow
+                Action: secretsmanager:GetSecretValue
+                Resource:
+                  Fn::Sub: arn:${AWS::Partition}:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:/zoolanding/${EnvironmentName}/integrations/stripe/connect-webhook*
 
   WebhookIngressStreamRole:
     Type: AWS::IAM::Role
@@ -425,6 +471,19 @@ Resources:
                   Fn::GetAtt:
                     - WebhookIngressFailureQueue
                     - Arn
+              - Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                  - dynamodb:PutItem
+                  - dynamodb:UpdateItem
+                  - dynamodb:TransactWriteItems
+                Resource:
+                  - Fn::GetAtt: [WebhookReceiptTable, Arn]
+                  - Fn::GetAtt: [IntegrationRegistryTable, Arn]
+              - Effect: Allow
+                Action: secretsmanager:GetSecretValue
+                Resource:
+                  Fn::Sub: arn:${AWS::Partition}:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:/zoolanding/${EnvironmentName}/integrations/*/*/stripe/*
               - Effect: Allow
                 Action:
                   - logs:CreateLogStream
@@ -463,6 +522,16 @@ Resources:
                   Fn::GetAtt:
                     - IntegrationOutgoingFailureQueue
                     - Arn
+              - Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                  - dynamodb:UpdateItem
+                Resource:
+                  Fn::GetAtt: [WebhookReceiptTable, Arn]
+              - Effect: Allow
+                Action: sns:Publish
+                Resource:
+                  Ref: IntegrationEventsTopic
               - Effect: Allow
                 Action:
                   - logs:CreateLogStream
@@ -843,23 +912,53 @@ Resources:
             Auth:
               Authorizer: AWS_IAM
 
+  StripeWebhookFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName:
+        Fn::Sub: ${AWS::StackName}-stripe-webhook
+      CodeUri: src/
+      Handler: handlers.stripe_webhook.lambda_handler
+      Description: Verifies and durably admits allowlisted Stripe Connect events.
+      Role:
+        Fn::GetAtt: [StripeWebhookRole, Arn]
+      LoggingConfig:
+        LogFormat: JSON
+        LogGroup:
+          Ref: StripeWebhookLogGroup
+      Environment:
+        Variables:
+          WEBHOOK_RECEIPT_TABLE_NAME:
+            Ref: WebhookReceiptTable
+      Events:
+        StripeConnectWebhook:
+          Type: Api
+          Properties:
+            RestApiId:
+              Ref: IntegrationApi
+            Path: /webhooks/stripe/connect
+            Method: post
+
   WebhookIngressStreamFunction:
     Type: AWS::Serverless::Function
-    DependsOn:
-      - WebhookIngressLogGroup
     Properties:
       FunctionName:
         Fn::Sub: ${AWS::StackName}-webhook-ingress-stream
       CodeUri: src/
-      Handler: handlers.pending_stream.lambda_handler
-      Description: Fails closed until verified webhook event processing is implemented.
+      Handler: handlers.stripe_event_worker.lambda_handler
+      Description: Re-fetches canonical Stripe state and commits closed Commerce events.
       Role:
         Fn::GetAtt:
           - WebhookIngressStreamRole
           - Arn
       Environment:
         Variables:
-          STREAM_KIND: ingress
+          WEBHOOK_RECEIPT_TABLE_NAME:
+            Ref: WebhookReceiptTable
+      LoggingConfig:
+        LogFormat: JSON
+        LogGroup:
+          Ref: WebhookIngressLogGroup
       Events:
         PendingIngress:
           Type: DynamoDB
@@ -888,21 +987,26 @@ Resources:
 
   IntegrationOutgoingStreamFunction:
     Type: AWS::Serverless::Function
-    DependsOn:
-      - IntegrationOutgoingLogGroup
     Properties:
       FunctionName:
         Fn::Sub: ${AWS::StackName}-integration-outgoing-stream
       CodeUri: src/
-      Handler: handlers.pending_stream.lambda_handler
-      Description: Fails closed until verified Integration Events relay is implemented.
+      Handler: handlers.integration_outbox_relay.lambda_handler
+      Description: Relays closed Integration Events to the scoped SNS topic.
       Role:
         Fn::GetAtt:
           - IntegrationOutgoingStreamRole
           - Arn
       Environment:
         Variables:
-          STREAM_KIND: outgoing
+          WEBHOOK_RECEIPT_TABLE_NAME:
+            Ref: WebhookReceiptTable
+          INTEGRATION_EVENTS_TOPIC_ARN:
+            Ref: IntegrationEventsTopic
+      LoggingConfig:
+        LogFormat: JSON
+        LogGroup:
+          Ref: IntegrationOutgoingLogGroup
       Events:
         PendingOutgoing:
           Type: DynamoDB

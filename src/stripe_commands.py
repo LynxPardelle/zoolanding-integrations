@@ -33,11 +33,14 @@ _CAPABILITIES = {
 }
 _CHECKOUT_MIN_TTL_SECONDS = 30 * 60
 _CHECKOUT_MAX_TTL_SECONDS = 24 * 60 * 60
+_PROVIDER_IDEMPOTENCY_RETRY_SECONDS = 24 * 60 * 60
 
 
 class StripeCommandService:
     def __init__(self, resolver, store, provider, routes, *, now_epoch):
-        if any(value is None for value in (resolver, store, provider, routes, now_epoch)):
+        if any(
+            value is None for value in (resolver, store, provider, routes, now_epoch)
+        ):
             raise StripeCommandError("Stripe command service is unavailable")
         self._resolver = resolver
         self._store = store
@@ -47,7 +50,11 @@ class StripeCommandService:
 
     def execute(self, kind: str, command: InternalCommand) -> dict[str, Any]:
         capability = _CAPABILITIES.get(kind)
-        if capability is None or type(command) is not InternalCommand or command.kind != kind:
+        if (
+            capability is None
+            or type(command) is not InternalCommand
+            or command.kind != kind
+        ):
             raise StripeCommandError("Stripe command is unavailable")
         resolved = self._resolver.resolve(
             command.scope,
@@ -59,13 +66,8 @@ class StripeCommandService:
             return self._checkout_status(command, resolved)
 
         now_epoch = self._now_epoch()
-        if kind == "checkout" and not (
-            now_epoch + _CHECKOUT_MIN_TTL_SECONDS
-            <= command.input["checkoutExpiresAt"]
-            <= now_epoch + _CHECKOUT_MAX_TTL_SECONDS
-        ):
-            raise StripeCommandConflict("Stripe command conflicted")
         request_hash = _request_hash(command)
+        operation_claim = _operation_claim(command)
         existing = self._store.claim(
             command.scope,
             command.connection_id,
@@ -73,18 +75,61 @@ class StripeCommandService:
             request_hash,
             command.command_id,
             technical_expiry(now_epoch),
+            now_epoch,
+            operation_claim,
         )
-        if existing is not None and existing.get("status") == "accepted":
-            if kind == "checkout":
-                return self._replay_checkout(command, resolved)
-            return {
-                "commandId": existing["commandId"],
-                "status": "accepted",
-            }
+        if existing is not None:
+            status = existing.get("status")
+            if status == "accepted":
+                if kind == "checkout":
+                    return self._replay_checkout(command, resolved)
+                return {
+                    "commandId": existing["commandId"],
+                    "status": "accepted",
+                }
+            if status == "rejected":
+                raise StripeCommandConflict("Stripe command conflicted")
+            if status == "needs_review":
+                return {"commandId": command.command_id, "status": "needs_review"}
+            attempted_at = existing.get("attemptedAt")
+            if (
+                type(attempted_at) is not int
+                or attempted_at < 0
+                or attempted_at > now_epoch
+                or now_epoch - attempted_at >= _PROVIDER_IDEMPOTENCY_RETRY_SECONDS
+            ):
+                self._store.mark_needs_review(
+                    command.scope,
+                    command.connection_id,
+                    command.idempotency_key,
+                    request_hash,
+                )
+                return {"commandId": command.command_id, "status": "needs_review"}
+            if status == "pending":
+                return {"commandId": command.command_id, "status": "pending"}
+
+        if kind == "checkout" and not (
+            now_epoch + _CHECKOUT_MIN_TTL_SECONDS
+            <= command.input["checkoutExpiresAt"]
+            <= now_epoch + _CHECKOUT_MAX_TTL_SECONDS
+        ):
+            self._store.mark_rejected(
+                command.scope,
+                command.connection_id,
+                command.idempotency_key,
+                request_hash,
+            )
+            raise StripeCommandConflict("Stripe command conflicted")
 
         try:
             result, mappings, code_claim = self._perform(kind, command, resolved)
         except StripeCommandConflict:
+            self._store.mark_rejected(
+                command.scope,
+                command.connection_id,
+                command.idempotency_key,
+                request_hash,
+            )
             raise
         except Exception:
             self._store.mark_unknown(
@@ -144,12 +189,18 @@ class StripeCommandService:
                 mapping["priceId"],
                 command.idempotency_key,
             )
-            return None, [{
-                **mapping,
-                "status": "inactive",
-                "lifecycleRevision": value["revision"],
-                "lifecycleHash": value["contentHash"],
-            }], None
+            return (
+                None,
+                [
+                    {
+                        **mapping,
+                        "status": "inactive",
+                        "lifecycleRevision": value["revision"],
+                        "lifecycleHash": value["contentHash"],
+                    }
+                ],
+                None,
+            )
 
         if mapping is not None:
             exact_replay = _same_immutable_version(
@@ -188,10 +239,9 @@ class StripeCommandService:
         if mapping is None or mapping.get("status") != "active":
             raise StripeCommandConflict("Stripe command conflicted")
         previous_revision = mapping.get("presentationRevision", 0)
-        if (
-            value["revision"] == previous_revision
-            and value["contentHash"] == mapping.get("presentationHash")
-        ):
+        if value["revision"] == previous_revision and value[
+            "contentHash"
+        ] == mapping.get("presentationHash"):
             return None, [], None
         if value["revision"] <= previous_revision:
             raise StripeCommandConflict("Stripe command conflicted")
@@ -201,19 +251,29 @@ class StripeCommandService:
             value["snapshot"],
             command.idempotency_key,
         )
-        return None, [{
-            **mapping,
-            "presentationRevision": value["revision"],
-            "presentationHash": value["contentHash"],
-        }], None
+        return (
+            None,
+            [
+                {
+                    **mapping,
+                    "presentationRevision": value["revision"],
+                    "presentationHash": value["contentHash"],
+                }
+            ],
+            None,
+        )
 
     def _discount(self, command, resolved):
         value = command.input
+        if value.get("operation") == "presentation":
+            return self._discount_presentation(command, resolved)
         snapshot = value["snapshot"]
         code = snapshot.get("customerFacingCode")
         code_hash = _code_hash(code) if code is not None else None
         if code_hash is not None:
-            owner = self._store.code_owner(command.scope, command.connection_id, code_hash)
+            owner = self._store.code_owner(
+                command.scope, command.connection_id, code_hash
+            )
             if owner is not None and owner != value["resourceId"]:
                 raise StripeCommandConflict("Stripe command conflicted")
         existing = self._mapping(command, "discount", value["resourceId"])
@@ -246,11 +306,48 @@ class StripeCommandService:
             "couponId": provider_mapping["couponId"],
             "promotionCodeId": provider_mapping["promotionCodeId"],
             "eligibleOfferVersionIds": list(snapshot["eligibleOfferVersionIds"]),
+            "duration": snapshot["duration"],
+            "durationInMonths": snapshot["durationInMonths"],
+            "redeemByEpoch": snapshot["redeemByEpoch"],
+            "redemptionLimit": snapshot["redemptionLimit"],
+            "value": dict(snapshot["value"]),
             "status": "active",
         }
         if code_hash is not None:
             mapping["codeHash"] = code_hash
         return None, [mapping], code_hash
+
+    def _discount_presentation(self, command, resolved):
+        value = command.input
+        mapping = self._mapping(command, "discount", value["resourceId"])
+        if mapping is None or mapping.get("status") != "active":
+            raise StripeCommandConflict("Stripe command conflicted")
+        previous_revision = mapping.get("presentationRevision", 0)
+        if value["revision"] == previous_revision and value[
+            "contentHash"
+        ] == mapping.get("presentationHash"):
+            return None, [], None
+        if value["revision"] <= previous_revision:
+            raise StripeCommandConflict("Stripe command conflicted")
+        self._provider.update_discount_presentation(
+            resolved,
+            mapping["couponId"],
+            value["snapshot"],
+            command.idempotency_key,
+        )
+        return (
+            None,
+            [
+                {
+                    **mapping,
+                    "presentationRevision": value["revision"],
+                    "presentationHash": value["contentHash"],
+                    "displayName": value["snapshot"]["displayName"],
+                    "displayDescription": value["snapshot"].get("displayDescription"),
+                }
+            ],
+            None,
+        )
 
     def _discount_lifecycle(self, command, resolved):
         value = command.input
@@ -274,15 +371,24 @@ class StripeCommandService:
             command.idempotency_key,
         )
         code_claim = mapping.get("codeHash") if target == "active" else None
-        return None, [{
-            **mapping,
-            "status": target,
-            "lifecycleRevision": value["revision"],
-            "lifecycleHash": value["contentHash"],
-        }], code_claim
+        return (
+            None,
+            [
+                {
+                    **mapping,
+                    "status": target,
+                    "lifecycleRevision": value["revision"],
+                    "lifecycleHash": value["contentHash"],
+                }
+            ],
+            code_claim,
+        )
 
     def _checkout(self, command, resolved):
         value = command.input
+        tax_mode = resolved.binding.provider_metadata.get("taxMode")
+        if value["taxPolicy"]["mode"] == "automatic" and tax_mode != "stripe-tax":
+            raise StripeCommandConflict("Stripe command conflicted")
         existing_checkout = self._mapping(
             command, "checkout", value["paymentAttemptId"]
         )
@@ -295,6 +401,14 @@ class StripeCommandService:
                 "offerVersionIds": [
                     line["offerVersionId"] for line in value["offerBindings"]
                 ],
+                "primaryOfferVersionId": next(
+                    (
+                        line["offerVersionId"]
+                        for line in value["offerBindings"]
+                        if line["snapshot"]["saleType"] == "recurring"
+                    ),
+                    None,
+                ),
                 "contentHash": command.content_hash,
             }
             if any(
@@ -309,6 +423,8 @@ class StripeCommandService:
             return result, [], None
         lines = []
         offer_ids = []
+        primary_offer_ids = []
+        currencies = set()
         for line in value["offerBindings"]:
             offer = self._mapping(command, "offer", line["offerVersionId"])
             if (
@@ -320,6 +436,12 @@ class StripeCommandService:
                 raise StripeCommandConflict("Stripe command conflicted")
             lines.append({"price": offer["priceId"], "quantity": line["quantity"]})
             offer_ids.append(line["offerVersionId"])
+            currencies.add(line["snapshot"]["currency"])
+            if line["snapshot"]["saleType"] == "recurring":
+                primary_offer_ids.append(line["offerVersionId"])
+
+        if len(currencies) != 1 or len(primary_offer_ids) > 1:
+            raise StripeCommandConflict("Stripe command conflicted")
 
         promotion_code_id = None
         discount_id = value.get("discountVersionId")
@@ -329,6 +451,16 @@ class StripeCommandService:
                 raise StripeCommandConflict("Stripe command conflicted")
             eligible = discount["eligibleOfferVersionIds"]
             if eligible and any(offer_id not in eligible for offer_id in offer_ids):
+                raise StripeCommandConflict("Stripe command conflicted")
+            redeem_by = discount.get("redeemByEpoch")
+            if redeem_by is not None and redeem_by <= self._now_epoch():
+                raise StripeCommandConflict("Stripe command conflicted")
+            discount_value = discount.get("value")
+            if not isinstance(discount_value, dict):
+                raise StripeCommandConflict("Stripe command conflicted")
+            if discount_value.get("type") == "fixed_amount" and currencies != {
+                discount_value.get("currency")
+            }:
                 raise StripeCommandConflict("Stripe command conflicted")
             promotion_code_id = discount["promotionCodeId"]
 
@@ -344,11 +476,7 @@ class StripeCommandService:
         _checkout_redirect(result, require_session=True)
         if result["expiresAt"] != value["checkoutExpiresAt"]:
             raise StripeCommandError("Stripe checkout is unavailable")
-        mode = (
-            "subscription"
-            if value["offerBindings"][0]["snapshot"]["saleType"] == "recurring"
-            else "payment"
-        )
+        mode = "subscription" if primary_offer_ids else "payment"
         mapping = {
             "resourceType": "checkout",
             "resourceId": value["paymentAttemptId"],
@@ -357,6 +485,9 @@ class StripeCommandService:
             "reservationId": value["reservationIds"][0],
             "revision": value["revision"],
             "offerVersionIds": offer_ids,
+            "primaryOfferVersionId": (
+                primary_offer_ids[0] if primary_offer_ids else None
+            ),
             "contentHash": command.content_hash,
             "mode": mode,
             "sessionId": result["sessionId"],
@@ -366,9 +497,7 @@ class StripeCommandService:
         return result, [mapping], None
 
     def _replay_checkout(self, command, resolved):
-        mapping = self._mapping(
-            command, "checkout", command.input["paymentAttemptId"]
-        )
+        mapping = self._mapping(command, "checkout", command.input["paymentAttemptId"])
         if mapping is None:
             raise StripeCommandConflict("Stripe command conflicted")
         result = self._provider.retrieve_checkout_handoff(
@@ -431,6 +560,48 @@ def _code_hash(value: str) -> str:
     return hashlib.sha256(value.casefold().encode("utf-8")).hexdigest()
 
 
+def _operation_claim(command: InternalCommand) -> dict[str, Any]:
+    value = command.input
+    if command.kind == "offer":
+        resource_type = "offer"
+        resource_id = value["resourceId"]
+        dimension = "immutable" if value["operation"] == "provision" else "lifecycle"
+        revision = value["revision"]
+    elif command.kind == "product-presentation":
+        resource_type = "offer"
+        resource_id = value["resourceId"]
+        dimension = "presentation"
+        revision = value["revision"]
+    elif command.kind == "discount":
+        resource_type = "discount"
+        resource_id = value["resourceId"]
+        dimension = (
+            "presentation" if value.get("operation") == "presentation" else "immutable"
+        )
+        revision = value["revision"]
+    elif command.kind == "discount-lifecycle":
+        resource_type = "discount"
+        resource_id = value["resourceId"]
+        dimension = "lifecycle"
+        revision = value["revision"]
+    elif command.kind == "checkout":
+        resource_type = "checkout"
+        resource_id = value["paymentAttemptId"]
+        dimension = "immutable"
+        revision = value["revision"]
+    else:
+        raise StripeCommandError("Stripe command is unavailable")
+    if type(command.content_hash) is not str:
+        raise StripeCommandError("Stripe command is unavailable")
+    return {
+        "resourceType": resource_type,
+        "resourceId": resource_id,
+        "dimension": dimension,
+        "revision": revision,
+        "contentHash": command.content_hash,
+    }
+
+
 def _same_immutable_version(mapping, revision, content_hash):
     current_revision = mapping.get("revision", 0)
     if revision < current_revision or mapping.get("contentHash") != content_hash:
@@ -439,13 +610,17 @@ def _same_immutable_version(mapping, revision, content_hash):
 
 
 def _current_mapping(mapping, revision):
-    if mapping is None or revision <= mapping.get("lifecycleRevision", mapping.get("revision", 0)):
+    if mapping is None or revision <= mapping.get(
+        "lifecycleRevision", mapping.get("revision", 0)
+    ):
         raise StripeCommandConflict("Stripe command conflicted")
     return mapping
 
 
 def _checkout_redirect(value, *, require_session=False):
-    expected = {"redirectUrl", "expiresAt"} | ({"sessionId"} if require_session else set())
+    expected = {"redirectUrl", "expiresAt"} | (
+        {"sessionId"} if require_session else set()
+    )
     if not isinstance(value, dict) or set(value) != expected:
         raise StripeCommandError("Stripe checkout is unavailable")
     try:

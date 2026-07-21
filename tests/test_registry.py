@@ -51,7 +51,9 @@ def connection(
     )
 
 
-def binding(resolved_scope=None, *, capabilities=None, mode="test"):
+def binding(
+    resolved_scope=None, *, capabilities=None, mode="test", tax_mode="unconfigured"
+):
     return IntegrationBinding.from_mapping(
         resolved_scope or scope(),
         {
@@ -66,7 +68,7 @@ def binding(resolved_scope=None, *, capabilities=None, mode="test"):
                 "accountModel": "merchant",
                 "chargeType": "direct",
                 "feePayer": "connected-account",
-                "taxMode": "unconfigured",
+                "taxMode": tax_mode,
                 "platformFeeMode": "disabled",
                 "webhookIngress": "direct-integrations-api",
             },
@@ -80,9 +82,14 @@ class MemoryBackend:
         self.registrations = []
         self.get_calls = []
 
-    def put_registration(self, records, sentinel, idempotency_key):
-        self.registrations.append((records, sentinel, idempotency_key))
-        for record in records + (sentinel,):
+    def put_registration(self, records, sentinels, idempotency_key):
+        self.registrations.append((records, sentinels, idempotency_key))
+        for record in records + sentinels:
+            if (record["pk"], record["sk"]) in self.records:
+                from src.registry import RegistryConflict
+
+                raise RegistryConflict("conditional conflict")
+        for record in records + sentinels:
             self.records[(record["pk"], record["sk"])] = record
 
     def get(self, pk, sk):
@@ -135,7 +142,8 @@ class RegistryTests(unittest.TestCase):
 
         registry.register(candidate, binding(prod_scope, mode="live"), "request-1")
 
-        records, sentinel, token = backend.registrations[0]
+        records, sentinels, token = backend.registrations[0]
+        sentinel = sentinels[0]
         self.assertEqual(records[0]["pk"], prod_scope.partition_key)
         self.assertEqual(records[0]["revision"], 1)
         self.assertEqual(token, "request-1")
@@ -147,6 +155,72 @@ class RegistryTests(unittest.TestCase):
         self.assertNotIn("acct_synthetic", str(sentinel))
         self.assertRegex(records[0]["registrationHash"], r"^[a-f0-9]{64}$")
         self.assertEqual(records[0]["registrationHash"], sentinel["registrationHash"])
+
+    def test_production_smtp_domain_is_atomically_isolated_but_test_domain_is_shared(
+        self,
+    ):
+        def pair(draft_id, environment, domain):
+            selected_scope = scope(draft_id, environment=environment, domain=domain)
+            mode = "live" if environment == "production" else "test"
+            sending_domain = (
+                domain if environment == "production" else "zoolandingpage.com.mx"
+            )
+            selected_connection = IntegrationConnection(
+                scope=selected_scope,
+                connection_id="billing-mailbox",
+                provider="email.smtp",
+                adapter_version="v1",
+                status="active",
+                mode=mode,
+                capabilities=frozenset({"send"}),
+                provider_metadata={
+                    "adapterId": "smtp2go-smtp-v1",
+                    "host": "mail.smtp2go.com",
+                    "port": 465,
+                    "canonicalSendingDomain": sending_domain,
+                    "accountOwnershipState": "audited",
+                },
+            )
+            selected_binding = IntegrationBinding(
+                scope=selected_scope,
+                binding_id="billing-mailbox",
+                provider="email.smtp",
+                adapter_version="v1",
+                connection_id="billing-mailbox",
+                status="active",
+                mode=mode,
+                capabilities=frozenset({"send"}),
+                provider_metadata={},
+            )
+            return selected_connection, selected_binding
+
+        backend = MemoryBackend()
+        registry = registry_module(self).ConnectionRegistry(backend)
+        first = pair("draft-one", "production", "shared.example.com")
+        second = pair("draft-two", "production", "shared.example.com")
+        registry.register(*first, "smtp-prod-one")
+        with self.assertRaises(registry_module(self).RegistryConflict):
+            registry.register(*second, "smtp-prod-two")
+
+        _, production_claims, _ = backend.registrations[0]
+        self.assertEqual(len(production_claims), 2)
+        isolation = production_claims[1]
+        self.assertEqual(isolation["itemType"], "ConnectionIsolationSentinel")
+        self.assertNotIn("shared.example.com", repr(isolation))
+        self.assertFalse(isolation["authorizes"])
+
+        test_backend = MemoryBackend()
+        test_registry = registry_module(self).ConnectionRegistry(test_backend)
+        test_registry.register(
+            *pair("draft-one", "test", "one.example.com"), "smtp-test-one"
+        )
+        test_registry.register(
+            *pair("draft-two", "test", "two.example.com"), "smtp-test-two"
+        )
+        self.assertEqual(len(test_backend.registrations), 2)
+        self.assertTrue(
+            all(len(sentinels) == 1 for _, sentinels, _ in test_backend.registrations)
+        )
 
     def test_exact_replay_is_noop_but_same_id_rebind_is_rejected(self):
         registry_api = registry_module(self)
@@ -202,7 +276,9 @@ class RegistryTests(unittest.TestCase):
         registry_api.ConnectionRegistry(backend).register(
             not_ready, binding(), "request-not-ready"
         )
-        resolver = registry_api.BindingResolver(registry_api.ConnectionRegistry(backend))
+        resolver = registry_api.BindingResolver(
+            registry_api.ConnectionRegistry(backend)
+        )
         with self.assertRaises(registry_api.RegistryAccessDenied):
             resolver.resolve(
                 scope(), "stripe-primary", provider="stripe", capability="checkout"
@@ -306,6 +382,53 @@ class RegistryTests(unittest.TestCase):
         with self.assertRaises(registry_api.RegistryAccessDenied):
             registry_api.ConnectionRegistry(backend).connection(scope(), "strípe")
         self.assertEqual(backend.get_calls, [])
+
+    def test_stripe_webhook_routing_resolves_only_the_hashed_active_account_claim(self):
+        registry_api = registry_module(self)
+        backend = MemoryBackend()
+        registry = registry_api.ConnectionRegistry(backend)
+        registry.register(connection(), binding(), "request-1")
+
+        routed = registry.stripe_webhook_connection(
+            environment="test",
+            mode="test",
+            account_reference="acct_synthetic",
+        )
+
+        digest = hashlib.sha256(b"acct_synthetic").hexdigest()
+        self.assertEqual(routed.scope, scope())
+        self.assertEqual(routed.connection_id, "stripe-primary")
+        self.assertIn((f"ROUTING#test#test#{digest}", "CLAIM"), backend.get_calls)
+        self.assertNotIn("acct_synthetic", repr(backend.get_calls))
+
+    def test_stripe_webhook_routing_rejects_mode_scope_and_account_tampering(self):
+        registry_api = registry_module(self)
+        backend = MemoryBackend()
+        registry = registry_api.ConnectionRegistry(backend)
+        registry.register(connection(), binding(), "request-1")
+        digest = hashlib.sha256(b"acct_synthetic").hexdigest()
+        sentinel_key = (f"ROUTING#test#test#{digest}", "CLAIM")
+
+        for changed in (
+            {**backend.records[sentinel_key], "draftId": "draft-other"},
+            {**backend.records[sentinel_key], "provider": "email.smtp"},
+            {**backend.records[sentinel_key], "authorizes": True},
+        ):
+            with self.subTest(changed=changed):
+                backend.records[sentinel_key] = changed
+                with self.assertRaises(registry_api.RegistryAccessDenied):
+                    registry.stripe_webhook_connection(
+                        environment="test",
+                        mode="test",
+                        account_reference="acct_synthetic",
+                    )
+
+        with self.assertRaises(registry_api.RegistryAccessDenied):
+            registry.stripe_webhook_connection(
+                environment="production",
+                mode="test",
+                account_reference="acct_synthetic",
+            )
 
 
 if __name__ == "__main__":

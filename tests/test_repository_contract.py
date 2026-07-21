@@ -128,7 +128,32 @@ class RepositoryContractTests(unittest.TestCase):
             "internal_stripe_checkout_status",
         ):
             module = importlib.import_module(f"src.handlers.{name}")
-            self.assertIn("stripe_command_runtime", module._runtime_dependencies.__code__.co_names)
+            self.assertIn(
+                "stripe_command_runtime", module._runtime_dependencies.__code__.co_names
+            )
+
+    def test_stripe_webhook_runtime_is_available_to_the_public_ingress_handler(self):
+        runtime = importlib.import_module("src.runtime")
+        handler = importlib.import_module("src.handlers.stripe_webhook")
+        self.assertTrue(callable(getattr(runtime, "stripe_webhook_runtime", None)))
+        self.assertIn(
+            "stripe_webhook_runtime", handler._runtime_dependencies.__code__.co_names
+        )
+
+    def test_worker_and_outbox_relay_have_separate_runtime_composition(self):
+        runtime = importlib.import_module("src.runtime")
+        worker = importlib.import_module("src.handlers.stripe_event_worker")
+        relay = importlib.import_module("src.handlers.integration_outbox_relay")
+        self.assertTrue(callable(getattr(runtime, "stripe_event_worker_runtime", None)))
+        self.assertTrue(
+            callable(getattr(runtime, "integration_outbox_relay_runtime", None))
+        )
+        self.assertIn(
+            "stripe_event_worker_runtime", worker._runtime_worker.__code__.co_names
+        )
+        self.assertIn(
+            "integration_outbox_relay_runtime", relay._runtime_relay.__code__.co_names
+        )
 
 
 if __name__ == "__main__":

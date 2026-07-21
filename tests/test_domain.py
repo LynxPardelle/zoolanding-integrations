@@ -257,7 +257,7 @@ class IntegrationDomainTests(unittest.TestCase):
         )
         self.assertEqual(
             connection.credential_reference,
-            "/zoolanding/test/integrations/tenant-example/draft-email/smtp/billing-mailbox",
+            "/zoolanding/test/tenant-example/draft-email/notifications/smtp/billing-mailbox",
         )
         self.assertEqual(connection.provider_metadata["adapterId"], "smtp2go-smtp-v1")
 

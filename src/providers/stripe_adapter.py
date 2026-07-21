@@ -11,8 +11,10 @@ from urllib.parse import urlencode, urlsplit, urlunsplit
 
 try:
     from domain.integrations import IntegrationBinding, IntegrationConnection
+    from domain.operations import STRIPE_WEBHOOK_EVENT_TYPES
 except ModuleNotFoundError:
     from src.domain.integrations import IntegrationBinding, IntegrationConnection
+    from src.domain.operations import STRIPE_WEBHOOK_EVENT_TYPES
 
 
 _DOMAIN = re.compile(
@@ -21,6 +23,7 @@ _DOMAIN = re.compile(
     re.ASCII,
 )
 _ACCOUNT_REFERENCE = re.compile(r"acct_[A-Za-z0-9]{8,64}", re.ASCII)
+_MAPPING_HINT = re.compile(r"[a-z0-9][a-z0-9._-]{0,63}", re.ASCII)
 _PROVIDER_HOST = "connect.stripe.com"
 _REFRESH_PATH = "/admin/integrations/stripe/refresh"
 _RETURN_PATH = "/admin/integrations/stripe/return"
@@ -28,6 +31,38 @@ _RETURN_PATH = "/admin/integrations/stripe/return"
 
 class StripeAdapterError(RuntimeError):
     pass
+
+
+class StripeWebhookVerifier:
+    """Official SDK signature verifier over the unmodified request bytes."""
+
+    _SECRET = re.compile(r"whsec_[A-Za-z0-9_]{16,240}", re.ASCII)
+
+    def __init__(self, secret: object):
+        if type(secret) is not str or self._SECRET.fullmatch(secret) is None:
+            raise StripeAdapterError("Stripe webhook verification is unavailable")
+        self._secret = secret
+
+    def verify(self, raw: object, signature: object) -> Any:
+        if (
+            type(raw) is not bytes
+            or not raw
+            or len(raw) > 1024 * 1024
+            or type(signature) is not str
+            or not 1 <= len(signature) <= 4096
+        ):
+            raise StripeAdapterError("Stripe webhook verification failed")
+        try:
+            import stripe  # type: ignore
+
+            return stripe.Webhook.construct_event(
+                payload=raw,
+                sig_header=signature,
+                secret=self._secret,
+                tolerance=300,
+            )
+        except Exception:
+            raise StripeAdapterError("Stripe webhook verification failed") from None
 
 
 class StripeClient(Protocol):
@@ -63,9 +98,8 @@ class StripeAdapter:
         accounts_v2_verified: bool,
         client_factory: Any = None,
     ):
-        if (
-            type(accounts_v2_verified) is not bool
-            or (client is None) == (client_factory is None)
+        if type(accounts_v2_verified) is not bool or (client is None) == (
+            client_factory is None
         ):
             raise StripeAdapterError("Stripe adapter is unavailable")
         self._client = client
@@ -151,7 +185,8 @@ class StripeAdapter:
             or type(payouts_enabled) is not bool
             or type(details_submitted) is not bool
             or not isinstance(capabilities, dict)
-            or capabilities.get("card_payments") not in {
+            or capabilities.get("card_payments")
+            not in {
                 "active",
                 "inactive",
                 "pending",
@@ -202,9 +237,7 @@ class StripeAdapter:
         )
         return _provider_id(response, "id", "price_")
 
-    def deactivate_offer(
-        self, resolved, product_id, price_id, idempotency_key
-    ) -> None:
+    def deactivate_offer(self, resolved, product_id, price_id, idempotency_key) -> None:
         client, account = self._commerce_context(resolved, "prices")
         _provider_call(
             client.deactivate_offer,
@@ -260,6 +293,24 @@ class StripeAdapter:
             idempotency_key=_provider_key(idempotency_key, "discount-lifecycle"),
         )
 
+    def update_discount_presentation(
+        self,
+        resolved,
+        coupon_id,
+        snapshot,
+        idempotency_key,
+    ) -> None:
+        client, account = self._commerce_context(resolved, "coupons")
+        response = _provider_call(
+            client.update_discount_presentation,
+            stripe_account=account,
+            coupon_id=coupon_id,
+            snapshot=snapshot,
+            idempotency_key=_provider_key(idempotency_key, "discount-presentation"),
+        )
+        if response is not None:
+            raise StripeAdapterError("Stripe operation is unavailable")
+
     def create_checkout(
         self,
         resolved,
@@ -270,9 +321,7 @@ class StripeAdapter:
         idempotency_key,
     ):
         client, account = self._commerce_context(resolved, "checkout")
-        params = _checkout_params(
-            lines, promotion_code_id, command_input, routes
-        )
+        params = _checkout_params(lines, promotion_code_id, command_input, routes)
         response = _provider_call(
             client.create_checkout,
             stripe_account=account,
@@ -305,9 +354,175 @@ class StripeAdapter:
             session_status == "complete" and payment_status == "unpaid"
         ):
             return "terminal_unpaid"
-        if session_status == "open" and payment_status in {"unpaid", "no_payment_required"}:
+        if session_status == "open" and payment_status in {
+            "unpaid",
+            "no_payment_required",
+        }:
             return "pending"
         return "unknown"
+
+    def retrieve_webhook_state(
+        self,
+        connection: IntegrationConnection,
+        event_id: object,
+        event_type: object,
+    ) -> dict[str, Any]:
+        client, account = self._webhook_context(connection)
+        if (
+            type(event_id) is not str
+            or not 1 <= len(event_id) <= 128
+            or type(event_type) is not str
+            or event_type not in STRIPE_WEBHOOK_EVENT_TYPES
+        ):
+            raise StripeAdapterError("Stripe event is unavailable")
+        event = _provider_call(
+            client.retrieve_event,
+            stripe_account=account,
+            event_id=event_id,
+        )
+        selected = _canonical_event(
+            event,
+            event_id=event_id,
+            event_type=event_type,
+            account=account,
+            mode=connection.mode,
+        )
+        object_id = selected["objectId"]
+        mapping_hint = None
+        if selected["objectType"] == "checkout-session":
+            canonical = _provider_call(
+                client.retrieve_checkout_canonical,
+                stripe_account=account,
+                session_id=object_id,
+            )
+            canonical = _checkout_canonical(canonical, object_id)
+            mapping_hint = _mapping_hint(canonical.pop("mappingHint"))
+            if canonical["paymentIntentId"] is not None:
+                payment_intent = _provider_call(
+                    client.retrieve_payment_intent,
+                    stripe_account=account,
+                    payment_intent_id=canonical["paymentIntentId"],
+                )
+                mapping_hint = _merge_mapping_hint(
+                    mapping_hint,
+                    _payment_intent_canonical(
+                        payment_intent, canonical["paymentIntentId"]
+                    ),
+                )
+            if canonical["subscriptionId"] is not None:
+                subscription = _subscription_canonical(
+                    _provider_call(
+                        client.retrieve_subscription_canonical,
+                        stripe_account=account,
+                        subscription_id=canonical["subscriptionId"],
+                    ),
+                    canonical["subscriptionId"],
+                )
+                mapping_hint = _merge_mapping_hint(
+                    mapping_hint, subscription.pop("mappingHint")
+                )
+                canonical["latestInvoiceId"] = subscription["latestInvoiceId"]
+                if subscription["latestInvoiceId"] is not None:
+                    _invoice_canonical(
+                        _provider_call(
+                            client.retrieve_invoice_canonical,
+                            stripe_account=account,
+                            invoice_id=subscription["latestInvoiceId"],
+                        ),
+                        subscription["latestInvoiceId"],
+                    )
+        elif selected["objectType"] == "refund":
+            canonical = _refund_canonical(
+                _provider_call(
+                    client.retrieve_refund_canonical,
+                    stripe_account=account,
+                    refund_id=object_id,
+                ),
+                object_id,
+            )
+            if canonical["paymentIntentId"] is not None:
+                payment_intent = _provider_call(
+                    client.retrieve_payment_intent,
+                    stripe_account=account,
+                    payment_intent_id=canonical["paymentIntentId"],
+                )
+                mapping_hint = _payment_intent_canonical(
+                    payment_intent, canonical["paymentIntentId"]
+                )
+            elif canonical["chargeId"] is not None:
+                charge = _provider_call(
+                    client.retrieve_charge,
+                    stripe_account=account,
+                    charge_id=canonical["chargeId"],
+                )
+                if _mapping_value(charge, "chargeId") != canonical["chargeId"]:
+                    raise StripeAdapterError("Stripe event is unavailable")
+        elif selected["objectType"] == "subscription":
+            canonical = _subscription_canonical(
+                _provider_call(
+                    client.retrieve_subscription_canonical,
+                    stripe_account=account,
+                    subscription_id=object_id,
+                ),
+                object_id,
+            )
+            mapping_hint = canonical.pop("mappingHint")
+            if canonical["latestInvoiceId"] is not None:
+                _invoice_canonical(
+                    _provider_call(
+                        client.retrieve_invoice_canonical,
+                        stripe_account=account,
+                        invoice_id=canonical["latestInvoiceId"],
+                    ),
+                    canonical["latestInvoiceId"],
+                )
+        else:
+            canonical = _invoice_canonical(
+                _provider_call(
+                    client.retrieve_invoice_canonical,
+                    stripe_account=account,
+                    invoice_id=object_id,
+                ),
+                object_id,
+            )
+            subscription_id = canonical["subscriptionId"]
+            canonical["subscription"] = (
+                _subscription_canonical(
+                    _provider_call(
+                        client.retrieve_subscription_canonical,
+                        stripe_account=account,
+                        subscription_id=subscription_id,
+                    ),
+                    subscription_id,
+                )
+                if subscription_id is not None
+                else None
+            )
+            if canonical["subscription"] is not None:
+                mapping_hint = canonical["subscription"].pop("mappingHint")
+        return {
+            "eventId": selected["eventId"],
+            "eventType": selected["eventType"],
+            "eventCreatedAt": selected["eventCreatedAt"],
+            "mode": connection.mode,
+            "accountHash": hashlib.sha256(account.encode("ascii")).hexdigest(),
+            "objectType": selected["objectType"],
+            "objectId": object_id,
+            "mappingHint": mapping_hint,
+            "canonical": canonical,
+        }
+
+    def _webhook_context(self, connection: IntegrationConnection):
+        if (
+            type(connection) is not IntegrationConnection
+            or connection.provider != "stripe"
+            or connection.status != "active"
+        ):
+            raise StripeAdapterError("Stripe event is unavailable")
+        account = connection.provider_metadata.get("accountReference")
+        if type(account) is not str or _ACCOUNT_REFERENCE.fullmatch(account) is None:
+            raise StripeAdapterError("Stripe event is unavailable")
+        return self._client_for(connection), account
 
     def _commerce_context(self, resolved, capability):
         try:
@@ -408,9 +623,7 @@ class StripeSdkClient:
         raise StripeAdapterError("Stripe onboarding is unavailable")
 
     def retrieve_v1_account(self, **kwargs: Any) -> dict[str, Any]:
-        response = self.client.v1.accounts.retrieve(
-            kwargs["stripe_account"], {}, {}
-        )
+        response = self.client.v1.accounts.retrieve(kwargs["stripe_account"], {}, {})
         return {
             key: _mapping_value(response, key)
             for key in (
@@ -495,7 +708,9 @@ class StripeSdkClient:
             "max_redemptions": snapshot["redemptionLimit"],
             "redeem_by": snapshot["redeemByEpoch"],
         }
-        coupon_params.update({key: value for key, value in optional.items() if value is not None})
+        coupon_params.update(
+            {key: value for key, value in optional.items() if value is not None}
+        )
         if kwargs["product_ids"]:
             coupon_params["applies_to"] = {"products": kwargs["product_ids"]}
         coupon = self.client.v1.coupons.create(
@@ -503,9 +718,7 @@ class StripeSdkClient:
             _request_options(kwargs, suffix="coupon"),
         )
         coupon_id = _mapping_value(coupon, "id")
-        promotion_params = {
-            "promotion": {"type": "coupon", "coupon": coupon_id}
-        }
+        promotion_params = {"promotion": {"type": "coupon", "coupon": coupon_id}}
         if snapshot["customerFacingCode"] is not None:
             promotion_params["code"] = snapshot["customerFacingCode"]
         promotion = self.client.v1.promotion_codes.create(
@@ -531,6 +744,13 @@ class StripeSdkClient:
                 _request_options(kwargs, suffix="coupon"),
             )
 
+    def update_discount_presentation(self, **kwargs: Any) -> None:
+        self.client.v1.coupons.update(
+            kwargs["coupon_id"],
+            {"name": kwargs["snapshot"]["displayName"]},
+            _request_options(kwargs),
+        )
+
     def create_checkout(self, **kwargs: Any) -> dict[str, Any]:
         response = self.client.v1.checkout.sessions.create(
             kwargs["params"], _request_options(kwargs)
@@ -553,6 +773,145 @@ class StripeSdkClient:
             "status": _mapping_value(response, "status"),
         }
 
+    def retrieve_event(self, **kwargs: Any) -> dict[str, Any]:
+        response = self.client.v1.events.retrieve(
+            kwargs["event_id"], {}, {"stripe_account": kwargs["stripe_account"]}
+        )
+        event_type = _mapping_value(response, "type")
+        data = _mapping_value(response, "data")
+        provider_object = _mapping_value(data, "object")
+        object_type = (
+            "checkout-session"
+            if isinstance(event_type, str)
+            and event_type.startswith("checkout.session.")
+            else (
+                "refund"
+                if isinstance(event_type, str) and event_type.startswith("refund.")
+                else (
+                    "subscription"
+                    if isinstance(event_type, str)
+                    and event_type.startswith("customer.subscription.")
+                    else (
+                        "invoice"
+                        if isinstance(event_type, str)
+                        and event_type.startswith("invoice.")
+                        else None
+                    )
+                )
+            )
+        )
+        return {
+            "id": _mapping_value(response, "id"),
+            "type": event_type,
+            "created": _mapping_value(response, "created"),
+            "livemode": _mapping_value(response, "livemode"),
+            "account": _mapping_value(response, "account"),
+            "objectType": object_type,
+            "objectId": _mapping_value(provider_object, "id"),
+        }
+
+    def retrieve_checkout_canonical(self, **kwargs: Any) -> dict[str, Any]:
+        response = self.client.v1.checkout.sessions.retrieve(
+            kwargs["session_id"], {}, {"stripe_account": kwargs["stripe_account"]}
+        )
+        return {
+            "sessionId": _mapping_value(response, "id"),
+            "status": _mapping_value(response, "status"),
+            "paymentStatus": _mapping_value(response, "payment_status"),
+            "mode": _mapping_value(response, "mode"),
+            "paymentIntentId": _reference_value(
+                _mapping_value(response, "payment_intent")
+            ),
+            "subscriptionId": _reference_value(
+                _mapping_value(response, "subscription")
+            ),
+            "latestInvoiceId": None,
+            "mappingHint": _metadata_mapping_hint(response),
+        }
+
+    def retrieve_payment_intent(self, **kwargs: Any) -> dict[str, Any]:
+        response = self.client.v1.payment_intents.retrieve(
+            kwargs["payment_intent_id"],
+            {},
+            {"stripe_account": kwargs["stripe_account"]},
+        )
+        return {
+            "paymentIntentId": _mapping_value(response, "id"),
+            "mappingHint": _metadata_mapping_hint(response),
+        }
+
+    def retrieve_refund_canonical(self, **kwargs: Any) -> dict[str, Any]:
+        response = self.client.v1.refunds.retrieve(
+            kwargs["refund_id"], {}, {"stripe_account": kwargs["stripe_account"]}
+        )
+        currency = _mapping_value(response, "currency")
+        payment_intent_id = _reference_value(_mapping_value(response, "payment_intent"))
+        return {
+            "refundId": _mapping_value(response, "id"),
+            "status": _mapping_value(response, "status"),
+            "amountMinor": _mapping_value(response, "amount"),
+            "currency": currency.upper() if isinstance(currency, str) else currency,
+            "paymentIntentId": payment_intent_id,
+            "chargeId": (
+                None
+                if payment_intent_id is not None
+                else _reference_value(_mapping_value(response, "charge"))
+            ),
+        }
+
+    def retrieve_charge(self, **kwargs: Any) -> dict[str, Any]:
+        response = self.client.v1.charges.retrieve(
+            kwargs["charge_id"], {}, {"stripe_account": kwargs["stripe_account"]}
+        )
+        return {"chargeId": _mapping_value(response, "id")}
+
+    def retrieve_subscription_canonical(self, **kwargs: Any) -> dict[str, Any]:
+        response = self.client.v1.subscriptions.retrieve(
+            kwargs["subscription_id"],
+            {},
+            {"stripe_account": kwargs["stripe_account"]},
+        )
+        items = _mapping_value(_mapping_value(response, "items"), "data")
+        if not isinstance(items, list) or len(items) != 1:
+            raise StripeAdapterError("Stripe event is unavailable")
+        item = items[0]
+        price_id = _reference_value(_mapping_value(item, "price"))
+        period_end = _mapping_value(response, "current_period_end")
+        if type(period_end) is not int:
+            period_end = _mapping_value(item, "current_period_end")
+        pause = _mapping_value(response, "pause_collection")
+        sanitized_pause = None
+        if pause is not None:
+            behavior = _mapping_value(pause, "behavior")
+            resumes_at = _mapping_value(pause, "resumes_at")
+            sanitized_pause = {"behavior": behavior}
+            if resumes_at is not None:
+                sanitized_pause["resumesAt"] = resumes_at
+        return {
+            "subscriptionId": _mapping_value(response, "id"),
+            "status": _mapping_value(response, "status"),
+            "currentPeriodEnd": period_end,
+            "latestInvoiceId": _reference_value(
+                _mapping_value(response, "latest_invoice")
+            ),
+            "priceId": price_id,
+            "pauseCollection": sanitized_pause,
+            "mappingHint": _metadata_mapping_hint(response),
+        }
+
+    def retrieve_invoice_canonical(self, **kwargs: Any) -> dict[str, Any]:
+        response = self.client.v1.invoices.retrieve(
+            kwargs["invoice_id"], {}, {"stripe_account": kwargs["stripe_account"]}
+        )
+        return {
+            "invoiceId": _mapping_value(response, "id"),
+            "status": _mapping_value(response, "status"),
+            "paid": _mapping_value(response, "paid"),
+            "subscriptionId": _reference_value(
+                _mapping_value(response, "subscription")
+            ),
+        }
+
 
 def _provider_call(operation, **kwargs):
     try:
@@ -561,6 +920,209 @@ def _provider_call(operation, **kwargs):
         raise
     except Exception:
         raise StripeAdapterError("Stripe operation is unavailable") from None
+
+
+def _canonical_event(value, *, event_id, event_type, account, mode):
+    keys = {"id", "type", "created", "livemode", "account", "objectType", "objectId"}
+    expected_object_type = (
+        "checkout-session"
+        if event_type.startswith("checkout.session.")
+        else (
+            "refund"
+            if event_type.startswith("refund.")
+            else (
+                "subscription"
+                if event_type.startswith("customer.subscription.")
+                else "invoice"
+            )
+        )
+    )
+    if (
+        not isinstance(value, dict)
+        or set(value) != keys
+        or value.get("id") != event_id
+        or value.get("type") != event_type
+        or value.get("account") != account
+        or value.get("livemode") is not (mode == "live")
+        or value.get("objectType") != expected_object_type
+        or type(value.get("created")) is not int
+        or not 0 <= value["created"] <= 9_999_999_999
+    ):
+        raise StripeAdapterError("Stripe event is unavailable")
+    _reference(value.get("objectId"))
+    return {
+        "eventId": event_id,
+        "eventType": event_type,
+        "eventCreatedAt": value["created"],
+        "objectType": expected_object_type,
+        "objectId": value["objectId"],
+    }
+
+
+def _checkout_canonical(value, expected_id):
+    keys = {
+        "sessionId",
+        "status",
+        "paymentStatus",
+        "mode",
+        "paymentIntentId",
+        "subscriptionId",
+        "latestInvoiceId",
+        "mappingHint",
+    }
+    if (
+        not isinstance(value, dict)
+        or set(value) != keys
+        or value.get("sessionId") != expected_id
+        or value.get("status") not in {"open", "complete", "expired"}
+        or value.get("paymentStatus")
+        not in {"paid", "unpaid", "no_payment_required", "failed"}
+        or value.get("mode") not in {"payment", "subscription"}
+    ):
+        raise StripeAdapterError("Stripe event is unavailable")
+    for key in ("paymentIntentId", "subscriptionId", "latestInvoiceId"):
+        if value[key] is not None:
+            _reference(value[key])
+    if value["mode"] == "payment" and value["subscriptionId"] is not None:
+        raise StripeAdapterError("Stripe event is unavailable")
+    return dict(value)
+
+
+def _payment_intent_canonical(value, expected_id):
+    if (
+        not isinstance(value, dict)
+        or set(value) != {"paymentIntentId", "mappingHint"}
+        or value.get("paymentIntentId") != expected_id
+    ):
+        raise StripeAdapterError("Stripe event is unavailable")
+    return _mapping_hint(value.get("mappingHint"))
+
+
+def _refund_canonical(value, expected_id):
+    keys = {
+        "refundId",
+        "status",
+        "amountMinor",
+        "currency",
+        "paymentIntentId",
+        "chargeId",
+    }
+    if (
+        not isinstance(value, dict)
+        or set(value) != keys
+        or value.get("refundId") != expected_id
+        or value.get("status") not in {"pending", "succeeded", "failed", "canceled"}
+        or type(value.get("amountMinor")) is not int
+        or value["amountMinor"] <= 0
+        or type(value.get("currency")) is not str
+        or re.fullmatch(r"[A-Z]{3}", value["currency"], re.ASCII) is None
+        or (value.get("paymentIntentId") is None) == (value.get("chargeId") is None)
+    ):
+        raise StripeAdapterError("Stripe event is unavailable")
+    _reference(value.get("paymentIntentId") or value.get("chargeId"))
+    return dict(value)
+
+
+def _subscription_canonical(value, expected_id):
+    keys = {
+        "subscriptionId",
+        "status",
+        "currentPeriodEnd",
+        "latestInvoiceId",
+        "priceId",
+        "pauseCollection",
+        "mappingHint",
+    }
+    if (
+        not isinstance(value, dict)
+        or set(value) != keys
+        or value.get("subscriptionId") != expected_id
+        or value.get("status")
+        not in {
+            "incomplete",
+            "incomplete_expired",
+            "trialing",
+            "active",
+            "past_due",
+            "canceled",
+            "unpaid",
+            "paused",
+        }
+        or type(value.get("currentPeriodEnd")) is not int
+        or not 0 <= value["currentPeriodEnd"] <= 9_999_999_999
+    ):
+        raise StripeAdapterError("Stripe event is unavailable")
+    _reference(value.get("priceId"))
+    if value["latestInvoiceId"] is not None:
+        _reference(value["latestInvoiceId"])
+    pause = value["pauseCollection"]
+    if pause is not None and (
+        not isinstance(pause, dict)
+        or set(pause) not in ({"behavior"}, {"behavior", "resumesAt"})
+        or pause.get("behavior") not in {"void", "keep_as_draft", "mark_uncollectible"}
+        or (
+            "resumesAt" in pause
+            and (
+                type(pause["resumesAt"]) is not int
+                or not 0 <= pause["resumesAt"] <= 9_999_999_999
+            )
+        )
+    ):
+        raise StripeAdapterError("Stripe event is unavailable")
+    return {
+        **value,
+        "mappingHint": _mapping_hint(value["mappingHint"]),
+        "pauseCollection": None if pause is None else dict(pause),
+    }
+
+
+def _invoice_canonical(value, expected_id):
+    keys = {"invoiceId", "status", "paid", "subscriptionId"}
+    if (
+        not isinstance(value, dict)
+        or set(value) != keys
+        or value.get("invoiceId") != expected_id
+        or value.get("status") not in {"draft", "open", "paid", "uncollectible", "void"}
+        or type(value.get("paid")) is not bool
+    ):
+        raise StripeAdapterError("Stripe event is unavailable")
+    if value["subscriptionId"] is not None:
+        _reference(value["subscriptionId"])
+    return dict(value)
+
+
+def _reference(value):
+    if (
+        type(value) is not str
+        or not 1 <= len(value) <= 255
+        or re.fullmatch(r"[A-Za-z0-9_:-]+", value, re.ASCII) is None
+    ):
+        raise StripeAdapterError("Stripe event is unavailable")
+    return value
+
+
+def _mapping_hint(value):
+    if value is None:
+        return None
+    if type(value) is not str or _MAPPING_HINT.fullmatch(value) is None:
+        raise StripeAdapterError("Stripe event is unavailable")
+    return value
+
+
+def _merge_mapping_hint(current, candidate):
+    current = _mapping_hint(current)
+    candidate = _mapping_hint(candidate)
+    if current is not None and candidate is not None and current != candidate:
+        raise StripeAdapterError("Stripe event is unavailable")
+    return current if current is not None else candidate
+
+
+def _metadata_mapping_hint(value):
+    metadata = _mapping_value(value, "metadata")
+    if metadata is None:
+        return None
+    hint = _mapping_value(metadata, "payment_attempt_id")
+    return _mapping_hint(hint)
 
 
 def _provider_key(value: object, operation: str) -> str:
@@ -600,18 +1162,18 @@ def _checkout_params(lines, promotion_code_id, command_input, routes):
         or set(routes) != {"successUrl", "cancelUrl"}
     ):
         raise StripeAdapterError("Stripe checkout is unavailable")
-    recurring = {
+    recurring_count = sum(
         line["snapshot"]["saleType"] == "recurring"
         for line in command_input["offerBindings"]
-    }
-    if len(recurring) != 1:
+    )
+    if len(lines) != len(command_input["offerBindings"]) or recurring_count > 1:
         raise StripeAdapterError("Stripe checkout is unavailable")
     metadata = {
         "order_id": command_input["orderId"],
         "payment_attempt_id": command_input["paymentAttemptId"],
         "revision": str(command_input["revision"]),
     }
-    mode = "subscription" if recurring == {True} else "payment"
+    mode = "subscription" if recurring_count == 1 else "payment"
     params = {
         "mode": mode,
         "line_items": lines,
@@ -621,9 +1183,7 @@ def _checkout_params(lines, promotion_code_id, command_input, routes):
         "expires_at": command_input["checkoutExpiresAt"],
         "client_reference_id": command_input["orderId"],
         "metadata": metadata,
-        "automatic_tax": {
-            "enabled": command_input["taxPolicy"]["mode"] == "automatic"
-        },
+        "automatic_tax": {"enabled": command_input["taxPolicy"]["mode"] == "automatic"},
     }
     params["subscription_data" if mode == "subscription" else "payment_intent_data"] = {
         "metadata": metadata
@@ -665,6 +1225,12 @@ def _mapping_value(value: Any, key: str) -> Any:
     if callable(getter):
         return getter(key)
     return None
+
+
+def _reference_value(value: Any) -> Any:
+    if value is None or isinstance(value, str):
+        return value
+    return _mapping_value(value, "id")
 
 
 def _validated_callbacks(callbacks: OnboardingCallbacks, expected_domain: str) -> None:

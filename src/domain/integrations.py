@@ -356,8 +356,8 @@ class IntegrationConnection:
                 f"{self.scope.draft_id}/stripe/{self.connection_id}"
             )
         return (
-            f"/zoolanding/{self.scope.environment}/integrations/{self.scope.tenant_id}/"
-            f"{self.scope.draft_id}/smtp/{self.connection_id}"
+            f"/zoolanding/{self.scope.environment}/{self.scope.tenant_id}/"
+            f"{self.scope.draft_id}/notifications/smtp/{self.connection_id}"
         )
 
     def to_record(self) -> dict[str, Any]:

@@ -43,7 +43,9 @@ def canonical_hash(schema_version, snapshot):
     ).hexdigest()
 
 
-def integration_key(scope, connection_id, operation, resource_id, revision, content_hash):
+def integration_key(
+    scope, connection_id, operation, resource_id, revision, content_hash
+):
     digest = hashlib.sha256(
         json.dumps(
             {
@@ -125,6 +127,22 @@ class CommandService:
 
 
 class InternalContractTests(unittest.TestCase):
+    def test_internal_command_identifiers_are_bounded_to_commerce_limit(self):
+        module = contracts_module(self)
+        self.assertEqual(module._id("a" * 64), "a" * 64)
+        with self.assertRaises(module.ContractError):
+            module._id("a" * 65)
+
+        accepted = offer_command()
+        accepted["commandId"] = "a" * 64
+        self.assertEqual(
+            module.validate_command("offer", accepted).command_id, "a" * 64
+        )
+        rejected = offer_command()
+        rejected["commandId"] = "a" * 65
+        with self.assertRaises(module.ContractError):
+            module.validate_command("offer", rejected)
+
     def test_offer_snapshot_is_closed_hashed_and_rejects_provider_ids_or_urls(self):
         contracts = contracts_module(self)
         parsed = contracts.validate_command("offer", offer_command())
@@ -243,6 +261,74 @@ class InternalContractTests(unittest.TestCase):
         multiple_recurring_offers["input"]["offerBindings"].append(second)
         with self.assertRaises(contracts.ContractError):
             contracts.validate_command("checkout", multiple_recurring_offers)
+
+        recurring_with_add_on = json.loads(json.dumps(payload))
+        add_on = dict(recurring_with_add_on["input"]["offerBindings"][0])
+        add_on["offerVersionId"] = "offer-addon-v1"
+        add_on["sellableType"] = "add_on"
+        add_on["snapshot"] = {
+            **add_on["snapshot"],
+            "saleType": "one_time",
+            "recurrence": None,
+            "amountMinor": 20_000,
+        }
+        add_on["contentHash"] = canonical_hash(1, add_on["snapshot"])
+        recurring_with_add_on["input"]["offerBindings"].append(add_on)
+        mixed_hash = hashlib.sha256(
+            json.dumps(
+                recurring_with_add_on["input"],
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest()
+        recurring_with_add_on["idempotencyKey"] = integration_key(
+            recurring_with_add_on["scope"],
+            recurring_with_add_on["connectionId"],
+            "checkout",
+            "attempt-1",
+            1,
+            mixed_hash,
+        )
+        parsed_mixed = contracts.validate_command("checkout", recurring_with_add_on)
+        self.assertEqual(len(parsed_mixed.input["offerBindings"]), 2)
+
+        recurring_with_service = json.loads(json.dumps(recurring_with_add_on))
+        recurring_with_service["input"]["offerBindings"][1]["sellableType"] = "service"
+        recurring_with_service["idempotencyKey"] = integration_key(
+            recurring_with_service["scope"],
+            recurring_with_service["connectionId"],
+            "checkout",
+            "attempt-1",
+            1,
+            hashlib.sha256(
+                json.dumps(
+                    recurring_with_service["input"],
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ).encode("utf-8")
+            ).hexdigest(),
+        )
+        with self.assertRaises(contracts.ContractError):
+            contracts.validate_command("checkout", recurring_with_service)
+
+        recurring_add_on = json.loads(json.dumps(payload))
+        recurring_add_on["input"]["offerBindings"][0]["sellableType"] = "add_on"
+        recurring_add_on["idempotencyKey"] = integration_key(
+            recurring_add_on["scope"],
+            recurring_add_on["connectionId"],
+            "checkout",
+            "attempt-1",
+            1,
+            hashlib.sha256(
+                json.dumps(
+                    recurring_add_on["input"],
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ).encode("utf-8")
+            ).hexdigest(),
+        )
+        with self.assertRaises(contracts.ContractError):
+            contracts.validate_command("checkout", recurring_add_on)
 
     def test_typed_redirect_and_checkout_status_responses_are_safe(self):
         contracts = contracts_module(self)
@@ -406,9 +492,9 @@ class InternalContractTests(unittest.TestCase):
             "paymentCollection": "immediate_card_link",
         }
         content_hash = hashlib.sha256(
-            json.dumps(
-                payload["input"], sort_keys=True, separators=(",", ":")
-            ).encode("utf-8")
+            json.dumps(payload["input"], sort_keys=True, separators=(",", ":")).encode(
+                "utf-8"
+            )
         ).hexdigest()
         payload["idempotencyKey"] = integration_key(
             payload["scope"],
@@ -464,6 +550,121 @@ class InternalContractTests(unittest.TestCase):
         }
         with self.assertRaises(contracts.ContractError):
             contracts.validate_command("discount", unhashable_discount)
+
+    def test_economic_integers_are_bounded_and_presentation_text_rejects_urls_and_bidi(
+        self,
+    ):
+        contracts = contracts_module(self)
+        for amount in (100_000_000, 2**63):
+            payload = offer_command()
+            payload["input"]["snapshot"]["amountMinor"] = amount
+            payload["input"]["contentHash"] = canonical_hash(
+                1, payload["input"]["snapshot"]
+            )
+            payload["idempotencyKey"] = integration_key(
+                payload["scope"],
+                payload["connectionId"],
+                "provision",
+                "offer-v1",
+                1,
+                payload["input"]["contentHash"],
+            )
+            with (
+                self.subTest(amount=amount),
+                self.assertRaises(contracts.ContractError),
+            ):
+                contracts.validate_command("offer", payload)
+
+        for unsafe in (
+            "https://example.com/offer",
+            "www.example.com",
+            "example.com/offer",
+            "safe\u202Eevil",
+            "safe\u200Bhidden",
+        ):
+            payload = offer_command()
+            snapshot = {"displayName": unsafe}
+            content_hash = canonical_hash(1, snapshot)
+            payload["input"] = {
+                "resourceId": "offer-v1",
+                "revision": 1,
+                "schemaVersion": 1,
+                "snapshot": snapshot,
+                "contentHash": content_hash,
+            }
+            payload["idempotencyKey"] = integration_key(
+                payload["scope"],
+                payload["connectionId"],
+                "product-presentation",
+                "offer-v1",
+                1,
+                content_hash,
+            )
+            with (
+                self.subTest(unsafe=unsafe),
+                self.assertRaises(contracts.ContractError),
+            ):
+                contracts.validate_command("product-presentation", payload)
+
+        zero_discount = offer_command()
+        discount_snapshot = {
+            "schemaVersion": 1,
+            "customerFacingCode": None,
+            "duration": "once",
+            "durationInMonths": None,
+            "eligibleOfferVersionIds": [],
+            "redeemByEpoch": None,
+            "redemptionLimit": None,
+            "value": {"type": "fixed_amount", "amountMinor": 0, "currency": "MXN"},
+        }
+        discount_hash = canonical_hash(1, discount_snapshot)
+        zero_discount["input"] = {
+            "resourceId": "discount-v1",
+            "revision": 1,
+            "schemaVersion": 1,
+            "snapshot": discount_snapshot,
+            "contentHash": discount_hash,
+        }
+        zero_discount["idempotencyKey"] = integration_key(
+            zero_discount["scope"],
+            zero_discount["connectionId"],
+            "discount",
+            "discount-v1",
+            1,
+            discount_hash,
+        )
+        with self.assertRaises(contracts.ContractError):
+            contracts.validate_command("discount", zero_discount)
+
+    def test_discount_presentation_uses_the_existing_route_with_an_independent_hash(
+        self,
+    ):
+        contracts = contracts_module(self)
+        payload = offer_command()
+        snapshot = {
+            "displayName": "Summer promotion",
+            "displayDescription": "Applies to the selected plan.",
+        }
+        content_hash = canonical_hash(1, snapshot)
+        payload["input"] = {
+            "operation": "presentation",
+            "resourceId": "discount-v1",
+            "revision": 1,
+            "schemaVersion": 1,
+            "snapshot": snapshot,
+            "contentHash": content_hash,
+        }
+        payload["idempotencyKey"] = integration_key(
+            payload["scope"],
+            payload["connectionId"],
+            "discount-presentation",
+            "discount-v1",
+            1,
+            content_hash,
+        )
+
+        parsed = contracts.validate_command("discount", payload)
+        self.assertEqual(parsed.input["operation"], "presentation")
 
     def test_offer_seam_enforces_exact_aws_caller_and_validates_response(self):
         handler = handler_module(self, "internal_stripe_offer")
