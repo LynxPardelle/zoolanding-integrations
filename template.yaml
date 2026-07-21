@@ -23,6 +23,13 @@ Parameters:
   InternalCallerArns:
     Type: String
     MinLength: 20
+  SmtpTestSharedAccountClaimHash:
+    Type: String
+    AllowedPattern: '^[a-f0-9]{64}$'
+    NoEcho: true
+  SmtpActivationCallerArns:
+    Type: String
+    MinLength: 20
 
 Globals:
   Function:
@@ -364,6 +371,36 @@ Resources:
       ManagedPolicyArns:
         - Ref: ControlPlaneLoggingPolicy
         - Ref: IntegrationRegistryReadPolicy
+
+  SmtpConnectionActivationRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - Ref: ControlPlaneLoggingPolicy
+      Policies:
+        - PolicyName: ActivateSmtpConnectionMetadata
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                  - dynamodb:TransactWriteItems
+                Resource:
+                  Fn::GetAtt:
+                    - IntegrationRegistryTable
+                    - Arn
+              - Effect: Allow
+                Action: secretsmanager:DescribeSecret
+                Resource:
+                  Fn::Sub: arn:${AWS::Partition}:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:/zoolanding/${EnvironmentName}/*/*/notifications/smtp/*
 
   InternalProviderCommandRole:
     Type: AWS::IAM::Role
@@ -1029,6 +1066,10 @@ Resources:
       Role:
         Fn::GetAtt: [InternalConnectionResolveRole, Arn]
       LoggingConfig: *ControlPlaneLogging
+      Environment:
+        Variables:
+          SMTP_TEST_SHARED_ACCOUNT_CLAIM_HASH:
+            Ref: SmtpTestSharedAccountClaimHash
       Events:
         InternalCommand:
           Type: Api
@@ -1036,6 +1077,31 @@ Resources:
             RestApiId:
               Ref: IntegrationApi
             Path: /internal/v1/integrations/connection-resolve
+            Method: post
+            Auth:
+              Authorizer: AWS_IAM
+
+  InternalSmtpConnectionActivateFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src/
+      Handler: handlers.internal_smtp_connection_activate.lambda_handler
+      Role:
+        Fn::GetAtt: [SmtpConnectionActivationRole, Arn]
+      LoggingConfig: *ControlPlaneLogging
+      Environment:
+        Variables:
+          SMTP_TEST_SHARED_ACCOUNT_CLAIM_HASH:
+            Ref: SmtpTestSharedAccountClaimHash
+          SMTP_ACTIVATION_CALLER_ARNS:
+            Ref: SmtpActivationCallerArns
+      Events:
+        InternalCommand:
+          Type: Api
+          Properties:
+            RestApiId:
+              Ref: IntegrationApi
+            Path: /internal/v1/integrations/smtp-connection-activate
             Method: post
             Auth:
               Authorizer: AWS_IAM

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import hashlib
+import re
 from typing import Any
 
 try:
@@ -44,6 +46,7 @@ class ConnectionRegistrationService:
             if item.binding_id == registration.connection_id
             and item.connection_id == registration.connection_id
             and item.provider == registration.provider
+            and item.status == "active"
             and item.mode == registration.mode
             and item.capabilities == frozenset(registration.capabilities)
         )
@@ -57,12 +60,12 @@ class ConnectionRegistrationService:
                 "adapterId": "smtp2go-smtp-v1",
                 "host": "mail.smtp2go.com",
                 "port": 465,
+                "tlsMode": "implicit",
                 "canonicalSendingDomain": (
                     "zoolandingpage.com.mx"
                     if scope.environment == "test"
                     else scope.domain
                 ),
-                "accountOwnershipState": "audited",
             }
         )
         try:
@@ -87,10 +90,22 @@ class ConnectionRegistrationService:
 
 
 class ConnectionResolutionService:
-    def __init__(self, binding_resolver: Any):
-        if binding_resolver is None:
+    def __init__(
+        self, binding_resolver: Any, required_test_account_claim_hash: str | None = None
+    ):
+        if binding_resolver is None or (
+            required_test_account_claim_hash is not None
+            and (
+                type(required_test_account_claim_hash) is not str
+                or re.fullmatch(
+                    r"[a-f0-9]{64}", required_test_account_claim_hash, re.ASCII
+                )
+                is None
+            )
+        ):
             raise InternalConnectionError("Connection resolution is unavailable")
         self._bindings = binding_resolver
+        self._test_account_hash = required_test_account_claim_hash
 
     def resolve(self, command: InternalCommand) -> dict[str, Any]:
         if type(command) is not InternalCommand or command.kind != "connection-resolve":
@@ -113,11 +128,40 @@ class ConnectionResolutionService:
             "credentialReference": connection.credential_reference,
         }
         if connection.provider == "email.smtp":
+            metadata = connection.provider_metadata
+            account_hash = metadata["accountIsolationHash"]
+            if (
+                type(self._test_account_hash) is not str
+                or len(self._test_account_hash) != 64
+                or (
+                    command.scope.environment == "test"
+                    and account_hash != self._test_account_hash
+                )
+                or (
+                    command.scope.environment == "production"
+                    and account_hash == self._test_account_hash
+                )
+            ):
+                raise InternalConnectionError("Connection resolution failed")
+            namespace = hashlib.sha256(
+                (
+                    command.scope.partition_key
+                    + "\0"
+                    + connection.connection_id
+                    + "\0"
+                    + metadata["credentialIsolationHash"]
+                ).encode("ascii")
+            ).hexdigest()
+            result["adapterId"] = metadata["adapterId"]
             result["endpoint"] = {
-                "host": connection.provider_metadata["host"],
-                "port": connection.provider_metadata["port"],
-                "canonicalSendingDomain": connection.provider_metadata[
-                    "canonicalSendingDomain"
-                ],
+                "host": metadata["host"],
+                "port": metadata["port"],
+                "tlsMode": metadata["tlsMode"],
+                "canonicalSendingDomain": metadata["canonicalSendingDomain"],
             }
+            result["senderPolicy"] = {
+                "fromLocalPart": metadata["fromLocalPart"],
+                "replyToLocalPart": metadata["replyToLocalPart"],
+            }
+            result["rateCircuitNamespace"] = f"smtp-rate-v1:{namespace}"
         return result

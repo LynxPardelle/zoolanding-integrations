@@ -57,6 +57,12 @@ class ConnectionAdmin:
 def _validate_secret_metadata(
     connection: IntegrationConnection, metadata: object
 ) -> None:
+    validated_secret_tags(connection, metadata)
+
+
+def validated_secret_tags(
+    connection: IntegrationConnection, metadata: object
+) -> dict[str, str]:
     if (
         not isinstance(metadata, dict)
         or metadata.get("Name") != connection.credential_reference
@@ -95,3 +101,4 @@ def _validate_secret_metadata(
     )
     if any(tags.get(key) != value for key, value in required.items()):
         raise ConnectionAdminError("Credential metadata is invalid")
+    return tags

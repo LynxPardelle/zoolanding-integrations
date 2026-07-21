@@ -4,7 +4,10 @@ from __future__ import annotations
 
 from typing import Any
 
-from .providers.stripe_adapter import build_onboarding_callbacks
+try:
+    from providers.stripe_adapter import build_onboarding_callbacks
+except ModuleNotFoundError:
+    from .providers.stripe_adapter import build_onboarding_callbacks
 
 
 class StripeOnboardingService:

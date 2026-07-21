@@ -102,6 +102,7 @@ class RepositoryContractTests(unittest.TestCase):
             "handlers.connection_action",
             "handlers.stripe_onboarding",
             "handlers.internal_connection_register",
+            "handlers.internal_smtp_connection_activate",
             "handlers.internal_connection_resolve",
         )
         environment = dict(os.environ)
@@ -118,6 +119,17 @@ class RepositoryContractTests(unittest.TestCase):
                     timeout=10,
                 )
                 self.assertEqual(result.returncode, 0, result.stderr)
+
+        runtime_result = subprocess.run(
+            [sys.executable, "-c", "import runtime"],
+            cwd=ROOT,
+            env=environment,
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=10,
+        )
+        self.assertEqual(runtime_result.returncode, 0, runtime_result.stderr)
 
     def test_repository_has_no_dev_or_deployment_surface(self):
         self.assertFalse((ROOT / "samconfig.toml").exists())

@@ -1,13 +1,13 @@
 # Zoolanding Integrations
 
-Generic, server-only connection, provider-mapping, confirmed-provider-event, and bulk subscription-migration service for Zoolanding drafts. Phase 5 is implemented and verified locally; nothing in this repository is deployed or provider-activated.
+Generic, server-only connection, provider-mapping, confirmed-provider-event, bulk subscription-migration, and SMTP connection-metadata service for Zoolanding drafts. Phases 5 and 6 are implemented and verified locally; nothing in this repository is deployed or provider-activated.
 
 ## Implemented local scope
 
 - Immutable published-policy resolution for exact environment, tenant, draft, domain, and published version.
 - Provider-neutral `IntegrationConnection` and `IntegrationBinding` records with draft-partitioned Registry mappings and 90-day technical receipts.
 - Generic Auth Admin authorization with separate human `integration:read` and `integration:manage` capabilities. Provider capabilities never authorize a person.
-- Generic connection registration and resolution for Stripe and the code-owned SMTP adapter metadata. Secret values are never accepted, stored, returned, or logged.
+- Generic connection registration and resolution for Stripe and the code-owned SMTP adapter metadata. SMTP registration remains pending until a separate AWS_IAM activation proves fresh credential tags and operator evidence; secret values are never accepted, stored, returned, or logged.
 - Stripe Connect onboarding through one explicit Accounts v1 strategy per binding: externally owned Standard-account OAuth or a platform-created controller account with code-owned controller properties.
 - Stripe Product/Price, presentation, Coupon/PromotionCode lifecycle, hosted Checkout, Checkout status, subscription change/discount/pause-collection, and restricted Customer Portal commands.
 - Signed Connect webhook ingress, immutable hashed account routing, global replay protection, canonical provider re-fetch, exact normalized Commerce events, and a separate outgoing Stream relay.
@@ -33,6 +33,7 @@ Public provider ingress:
 AWS_IAM internal routes:
 
 - `POST /internal/v1/integrations/connection-register`
+- `POST /internal/v1/integrations/smtp-connection-activate`
 - `POST /internal/v1/integrations/connection-resolve`
 - `POST /internal/v1/stripe/offer`
 - `POST /internal/v1/stripe/product-presentation`
@@ -64,7 +65,17 @@ The four migration routes are implemented typed boundaries. Preview is provider-
 
 ## Credential, account, and tax boundaries
 
-Stripe Connect uses one code-derived, environment-scoped structured platform credential reference. Test and production remain separate; drafts and browser requests never choose its location or supply its values. SMTP credentials remain independently referenced per draft connection. The Registry stores only approved reference metadata and non-secret state.
+Stripe Connect uses one code-derived, environment-scoped structured platform credential reference. Test and production remain separate; drafts and browser requests never choose its location or supply its values. SMTP credentials remain independently referenced per draft connection. The Registry stores only approved reference metadata, hashes, and non-secret state.
+
+SMTP registration fixes `smtp2go-smtp-v1`, `mail.smtp2go.com:465`, and implicit TLS in code. It does not claim account ownership or readiness, and a disabled published binding cannot register. Activation is a separate AWS_IAM-only command with its own operator-role allowlist; general internal callers, including Notifications, cannot activate. It freshly rechecks the stored binding and rejects a disabled or mismatched binding before `DescribeSecret` or any claim write. It then calls `DescribeSecret`, never `GetSecretValue`, and requires the exact secret scope tags plus opaque account- and credential-isolation tags. The operator supplies conservative `fromLocalPart` and `replyToLocalPart` values and an opaque ownership-evidence ID; raw isolation and evidence IDs are hashed before Registry writes.
+
+Test connections send through the server-owned shared sender domain while retaining each draft's independent canonical scope domain. Their account-isolation hash must equal the deployment parameter `SmtpTestSharedAccountClaimHash`, while credential claims remain globally unique. Production rejects that test account claim and atomically reserves a unique credential hash, account hash, and canonical sending domain. Exact activation replay is a no-op; changed evidence or a reused claim conflicts.
+
+The private resolve result is available only for an active `email.smtp` binding with the exact `send` capability and scope. It returns the fixed adapter and TLS endpoint, local-part sender policy, deterministic credential reference, and opaque rate/circuit namespace. It never returns isolation/evidence hashes, full email addresses, credentials, or secret values. Browser connection projections remain limited to connection ID, provider, status, mode, capabilities, and revision.
+
+The generic browser `disable` and `requestReconnect` operations reject SMTP connections before any Registry mutation. Emergency SMTP shutdown uses a disabled published policy plus `zoolanding:enabled=false` on the credential lifecycle tag. Credential rotation, reconnection, ownership transfer, and claim release require a later dedicated transactional workflow; Phase 6 does not pretend those operations are supported. Stripe browser disable and reconnect behavior is unchanged.
+
+Before a later deployment, provision the SMTP secret at `/zoolanding/{environment}/{tenantId}/{draftId}/notifications/smtp/{connectionId}` with the existing scope, purpose, connection, and enabled tags plus `zoolanding:smtp-account-isolation-id` and `zoolanding:smtp-credential-isolation-id`. Set `SmtpTestSharedAccountClaimHash` to the lowercase SHA-256 of the approved opaque test account-isolation ID, and set `SmtpActivationCallerArns` only to the approved operator role identities—not Notifications or general service roles. Do not place raw isolation IDs or real role ARNs in templates, drafts, logs, or versioned files.
 
 Every binding must select its Accounts v1 strategy explicitly. Accounts v2 activation remains blocked until the approved Mexico Sandbox proof covers the required capabilities and topology. Account ownership, provider account references, routing claims, controller properties, tokens, and credential values never enter draft configuration or browser responses.
 
@@ -80,7 +91,7 @@ Hosted Checkout and Customer Portal URLs are validated ephemeral `no-store` resp
 
 ## Local verification
 
-The current Phase 5 tree passed 266 unit/contract tests on Python 3.13, dependency audit, Python compilation, SAM lint, and an uncached SAM build of all 23 functions. No deployment or provider-backed proof is claimed.
+The current Phase 6 tree passes 282 unit/contract tests, dependency audit, Python compilation, SAM lint, and an uncached SAM build of all 24 functions. No deployment, SMTP send, secret read, or provider-backed proof is claimed.
 
 ```powershell
 python -m pip install --requirement requirements-dev.txt
@@ -95,7 +106,7 @@ A local SAM build requires the official Python 3.13 installation, including its 
 
 ## Closed rollout boundary
 
-- Phase 5 bulk subscription migration is locally implemented. Provider-backed behavior and operational scale remain unproven until deployment and controlled environment testing.
+- Phase 5 bulk subscription migration and the Phase 6 SMTP activation/resolution boundary are locally implemented. Provider-backed behavior and operational scale remain unproven until deployment and controlled environment testing.
 - Phase 8 owns AWS deployment, exact cross-service IAM identities, queues/tables/topics, alarms, quotas, environment credentials, webhook configuration, and provider-backed end-to-end/failure testing.
 - Phase 9 owns per-draft pilot configuration, production tax/live approval, and activation.
 

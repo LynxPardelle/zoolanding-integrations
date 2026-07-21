@@ -140,15 +140,15 @@ class ConnectionAdminTests(unittest.TestCase):
             connection_id="billing-mailbox",
             provider="email.smtp",
             adapter_version="v1",
-            status="active",
+            status="pending",
             mode="test",
             capabilities=frozenset({"send"}),
             provider_metadata={
                 "adapterId": "smtp2go-smtp-v1",
                 "host": "mail.smtp2go.com",
                 "port": 465,
+                "tlsMode": "implicit",
                 "canonicalSendingDomain": "zoolandingpage.com.mx",
-                "accountOwnershipState": "audited",
             },
         )
         smtp_binding = IntegrationBinding(

@@ -42,6 +42,7 @@ try:
     )
     from stripe_commands import StripeCommandService
     from stripe_store import DynamoStripeCommandStore, DynamoStripeWebhookStore
+    from smtp_activation import SmtpConnectionActivationService
     from subscription_migrations import (
         SubscriptionMigrationService,
         SubscriptionMigrationStatusService,
@@ -79,6 +80,7 @@ except ModuleNotFoundError:
     )
     from src.stripe_commands import StripeCommandService
     from src.stripe_store import DynamoStripeCommandStore, DynamoStripeWebhookStore
+    from src.smtp_activation import SmtpConnectionActivationService
     from src.subscription_migrations import (
         SubscriptionMigrationService,
         SubscriptionMigrationStatusService,
@@ -295,7 +297,21 @@ def connection_registration_runtime() -> dict[str, Any]:
 
 def connection_resolution_runtime() -> dict[str, Any]:
     return {
-        "service": ConnectionResolutionService(BindingResolver(_registry(_boto3())))
+        "service": ConnectionResolutionService(
+            BindingResolver(_registry(_boto3())),
+            _required("SMTP_TEST_SHARED_ACCOUNT_CLAIM_HASH"),
+        )
+    }
+
+
+def smtp_connection_activation_runtime() -> dict[str, Any]:
+    boto3 = _boto3()
+    return {
+        "service": SmtpConnectionActivationService(
+            _registry(boto3),
+            boto3.client("secretsmanager"),
+            _required("SMTP_TEST_SHARED_ACCOUNT_CLAIM_HASH"),
+        )
     }
 
 

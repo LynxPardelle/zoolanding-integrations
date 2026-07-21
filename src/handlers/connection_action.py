@@ -63,8 +63,10 @@ def handle_request(
             store=auth_store,
             now_epoch=now_epoch,
         )
+        current = registry.connection(policies.scope, connection_id)
+        if current.provider == "email.smtp":
+            raise validation_error()
         if operation == "disable":
-            current = registry.connection(policies.scope, connection_id)
             account_reference = current.provider_metadata.get("accountReference")
             if current.provider == "stripe" and type(account_reference) is str:
                 connection = registry.disable_stripe_account(

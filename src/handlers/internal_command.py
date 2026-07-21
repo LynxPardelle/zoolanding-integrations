@@ -52,9 +52,17 @@ def handle_internal_command(
 
 
 def configured_callers() -> set[str]:
+    return _configured_callers("INTERNAL_CALLER_ARNS")
+
+
+def configured_smtp_activation_callers() -> set[str]:
+    return _configured_callers("SMTP_ACTIVATION_CALLER_ARNS")
+
+
+def _configured_callers(variable_name: str) -> set[str]:
     values = {
         value.strip()
-        for value in os.getenv("INTERNAL_CALLER_ARNS", "").split(",")
+        for value in os.getenv(variable_name, "").split(",")
         if value.strip()
     }
     if any("*" in value for value in values):

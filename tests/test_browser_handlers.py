@@ -1,6 +1,7 @@
 import importlib
 import importlib.util
 import json
+import copy
 import unittest
 
 from tests.test_authorization import auth_store, event as auth_event, policies
@@ -251,6 +252,63 @@ class BrowserHandlerTests(unittest.TestCase):
                 )
                 self.assertEqual(response["statusCode"], 422)
         self.assertEqual(registry.updated, [])
+
+    def test_browser_cannot_mutate_smtp_status_or_orphan_isolation_claims(self):
+        from src.contracts.internal import validate_smtp_connection_activation
+        from src.registry import ConnectionRegistry
+        from src.smtp_activation import SmtpConnectionActivationService
+        from tests.test_registry import MemoryBackend
+        from tests.test_smtp_activation import (
+            TEST_ACCOUNT_HASH,
+            Secrets,
+            activation_payload,
+            binding as smtp_binding,
+            pending_connection,
+            secret_metadata,
+        )
+
+        selected_scope = policies().scope
+        smtp = pending_connection(selected_scope)
+        backend = MemoryBackend()
+        registry = ConnectionRegistry(backend)
+        registry.register(smtp, smtp_binding(selected_scope), "register-smtp")
+        SmtpConnectionActivationService(
+            registry, Secrets(secret_metadata(smtp)), TEST_ACCOUNT_HASH
+        ).activate(
+            validate_smtp_connection_activation(
+                activation_payload(selected_scope)
+            )
+        )
+        before = copy.deepcopy(backend.records)
+        handler = handler_module(self, "connection_action")
+        for operation in ("disable", "requestReconnect"):
+            response = handler.handle_request(
+                request(
+                    handler.PATH,
+                    {
+                        "operation": operation,
+                        "input": {
+                            "connectionId": "billing-mailbox",
+                            "expectedRevision": 2,
+                        },
+                    },
+                ),
+                policy_resolver=Resolver(),
+                auth_store=auth_store(),
+                registry=registry,
+                environment="test",
+                now_epoch=1_000,
+            )
+            self.assertEqual(response["statusCode"], 422)
+            self.assertEqual(backend.records, before)
+        current = registry.connection(selected_scope, "billing-mailbox")
+        self.assertEqual((current.status, current.revision), ("active", 2))
+        self.assertTrue(
+            any(
+                item.get("claimType") == "credential-isolation"
+                for item in backend.records.values()
+            )
+        )
 
     def test_onboarding_lambda_entrypoint_uses_runtime_dependencies(self):
         handler = handler_module(self, "stripe_onboarding")

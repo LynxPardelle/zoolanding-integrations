@@ -39,6 +39,7 @@ class SamControlPlaneTests(unittest.TestCase):
             "InternalStripeMigrationsControlFunction": "/internal/v1/stripe/migrations/control",
             "InternalStripeMigrationsStatusFunction": "/internal/v1/stripe/migrations/status",
             "InternalConnectionRegisterFunction": "/internal/v1/integrations/connection-register",
+            "InternalSmtpConnectionActivateFunction": "/internal/v1/integrations/smtp-connection-activate",
             "InternalConnectionResolveFunction": "/internal/v1/integrations/connection-resolve",
         }
         for logical_id, path in expected_browser.items():
@@ -61,6 +62,7 @@ class SamControlPlaneTests(unittest.TestCase):
             "ConnectionActionFunction",
             "StripeOnboardingFunction",
             "InternalConnectionRegisterFunction",
+            "InternalSmtpConnectionActivateFunction",
             "InternalConnectionResolveFunction",
             "InternalStripeMigrationsPreviewFunction",
             "InternalStripeMigrationsExecuteFunction",
@@ -154,6 +156,46 @@ class SamControlPlaneTests(unittest.TestCase):
                 "TimeToLiveSpecification"
             ],
             {"AttributeName": "expiresAt", "Enabled": True},
+        )
+
+    def test_smtp_activation_has_a_separate_metadata_only_role(self):
+        function = self.resources["InternalSmtpConnectionActivateFunction"]["Properties"]
+        self.assertEqual(
+            function["Handler"],
+            "handlers.internal_smtp_connection_activate.lambda_handler",
+        )
+        self.assertEqual(
+            function["Role"], {"Fn::GetAtt": ["SmtpConnectionActivationRole", "Arn"]}
+        )
+        self.assertEqual(
+            function["Environment"]["Variables"],
+            {
+                "SMTP_TEST_SHARED_ACCOUNT_CLAIM_HASH": {
+                    "Ref": "SmtpTestSharedAccountClaimHash"
+                },
+                "SMTP_ACTIVATION_CALLER_ARNS": {
+                    "Ref": "SmtpActivationCallerArns"
+                },
+            },
+        )
+        self.assertIn("SmtpActivationCallerArns", self.template["Parameters"])
+        self.assertEqual(self.text.count("SMTP_ACTIVATION_CALLER_ARNS"), 1)
+        role = self._role("SmtpConnectionActivationRole")
+        self.assertIn("secretsmanager:DescribeSecret", role)
+        self.assertIn("dynamodb:TransactWriteItems", role)
+        self.assertIn("dynamodb:GetItem", role)
+        for forbidden in (
+            "secretsmanager:GetSecretValue",
+            "dynamodb:PutItem",
+            "dynamodb:UpdateItem",
+            "sns:",
+            "sqs:",
+        ):
+            self.assertNotIn(forbidden, role)
+        self.assertNotIn("Resource: '*'", role)
+        self.assertEqual(
+            self.resources["InternalConnectionResolveFunction"]["Properties"]["Environment"]["Variables"],
+            {"SMTP_TEST_SHARED_ACCOUNT_CLAIM_HASH": {"Ref": "SmtpTestSharedAccountClaimHash"}},
         )
 
     def test_webhook_worker_and_relay_are_separate_least_privilege_functions(self):

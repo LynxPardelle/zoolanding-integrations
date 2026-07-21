@@ -842,6 +842,7 @@ class InternalContractTests(unittest.TestCase):
             "internal_stripe_migrations_control": "/internal/v1/stripe/migrations/control",
             "internal_stripe_migrations_status": "/internal/v1/stripe/migrations/status",
             "internal_connection_register": "/internal/v1/integrations/connection-register",
+            "internal_smtp_connection_activate": "/internal/v1/integrations/smtp-connection-activate",
             "internal_connection_resolve": "/internal/v1/integrations/connection-resolve",
         }
         modules = {name: handler_module(self, name) for name in expected}

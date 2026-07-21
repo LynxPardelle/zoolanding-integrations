@@ -90,6 +90,7 @@ class MemoryBackend:
     def __init__(self):
         self.records = {}
         self.registrations = []
+        self.smtp_activations = []
         self.get_calls = []
 
     def put_registration(self, records, sentinels, idempotency_key):
@@ -135,6 +136,38 @@ class MemoryBackend:
             },
         }
         self.records[(pk, sk)] = updated
+        return updated
+
+    def activate_smtp(
+        self,
+        pk,
+        sk,
+        provider_metadata,
+        expected_revision,
+        registration_hash,
+        activation_hash,
+        sentinels,
+        idempotency_key,
+    ):
+        item = self.records[(pk, sk)]
+        if (
+            item["status"] != "pending"
+            or item["revision"] != expected_revision
+            or item["registrationHash"] != registration_hash
+            or any((sentinel["pk"], sentinel["sk"]) in self.records for sentinel in sentinels)
+        ):
+            raise RuntimeError("conflict")
+        updated = {
+            **item,
+            "status": "active",
+            "revision": expected_revision + 1,
+            "providerMetadata": provider_metadata,
+            "activationHash": activation_hash,
+        }
+        self.records[(pk, sk)] = updated
+        for sentinel in sentinels:
+            self.records[(sentinel["pk"], sentinel["sk"])] = sentinel
+        self.smtp_activations.append((sentinels, idempotency_key))
         return updated
 
     def bind_stripe_account(
@@ -389,8 +422,13 @@ class RegistryTests(unittest.TestCase):
                     "adapterId": "smtp2go-smtp-v1",
                     "host": "mail.smtp2go.com",
                     "port": 465,
+                    "tlsMode": "implicit",
                     "canonicalSendingDomain": sending_domain,
-                    "accountOwnershipState": "audited",
+                    "fromLocalPart": "billing",
+                    "replyToLocalPart": "support",
+                    "accountIsolationHash": hashlib.sha256(b"shared-account").hexdigest(),
+                    "credentialIsolationHash": hashlib.sha256(draft_id.encode("ascii")).hexdigest(),
+                    "ownershipEvidenceHash": hashlib.sha256(b"evidence").hexdigest(),
                 },
             )
             selected_binding = IntegrationBinding(
@@ -415,8 +453,8 @@ class RegistryTests(unittest.TestCase):
             registry.register(*second, "smtp-prod-two")
 
         _, production_claims, _ = backend.registrations[0]
-        self.assertEqual(len(production_claims), 2)
-        isolation = production_claims[1]
+        self.assertEqual(len(production_claims), 4)
+        isolation = production_claims[-1]
         self.assertEqual(isolation["itemType"], "ConnectionIsolationSentinel")
         self.assertNotIn("shared.example.com", repr(isolation))
         self.assertFalse(isolation["authorizes"])
@@ -431,7 +469,7 @@ class RegistryTests(unittest.TestCase):
         )
         self.assertEqual(len(test_backend.registrations), 2)
         self.assertTrue(
-            all(len(sentinels) == 1 for _, sentinels, _ in test_backend.registrations)
+            all(len(sentinels) == 2 for _, sentinels, _ in test_backend.registrations)
         )
 
     def test_exact_replay_is_noop_but_same_id_rebind_is_rejected(self):

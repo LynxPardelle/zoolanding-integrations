@@ -312,6 +312,8 @@ class IntegrationDomainTests(unittest.TestCase):
 
     def test_test_assignments_may_share_the_code_owned_sender_domain(self):
         def smtp_connection(draft_id):
+            import hashlib
+
             return self.domain.IntegrationConnection(
                 scope=self.domain.IntegrationScope(
                     "test", "tenant-example", draft_id, "zoolandingpage.com.mx"
@@ -326,8 +328,13 @@ class IntegrationDomainTests(unittest.TestCase):
                     "adapterId": "smtp2go-smtp-v1",
                     "host": "mail.smtp2go.com",
                     "port": 465,
+                    "tlsMode": "implicit",
                     "canonicalSendingDomain": "zoolandingpage.com.mx",
-                    "accountOwnershipState": "audited",
+                    "fromLocalPart": "billing",
+                    "replyToLocalPart": "support",
+                    "accountIsolationHash": hashlib.sha256(b"shared-account").hexdigest(),
+                    "credentialIsolationHash": hashlib.sha256(draft_id.encode("ascii")).hexdigest(),
+                    "ownershipEvidenceHash": hashlib.sha256(b"evidence").hexdigest(),
                 },
             )
 
@@ -336,6 +343,8 @@ class IntegrationDomainTests(unittest.TestCase):
         self.domain.assert_isolated_connection_assignment(second, (first,))
 
     def test_email_connection_uses_code_owned_smtp2go_metadata(self):
+        import hashlib
+
         scope = self.domain.IntegrationScope(
             "test",
             "tenant-example",
@@ -354,8 +363,13 @@ class IntegrationDomainTests(unittest.TestCase):
                 "adapterId": "smtp2go-smtp-v1",
                 "host": "mail.smtp2go.com",
                 "port": 465,
+                "tlsMode": "implicit",
                 "canonicalSendingDomain": "zoolandingpage.com.mx",
-                "accountOwnershipState": "audited",
+                "fromLocalPart": "billing",
+                "replyToLocalPart": "support",
+                "accountIsolationHash": hashlib.sha256(b"account").hexdigest(),
+                "credentialIsolationHash": hashlib.sha256(b"credential").hexdigest(),
+                "ownershipEvidenceHash": hashlib.sha256(b"evidence").hexdigest(),
             },
         )
         self.assertEqual(
@@ -365,6 +379,8 @@ class IntegrationDomainTests(unittest.TestCase):
         self.assertEqual(connection.provider_metadata["adapterId"], "smtp2go-smtp-v1")
 
     def test_email_metadata_cannot_override_host_domain_or_ownership_policy(self):
+        import hashlib
+
         scope = self.domain.IntegrationScope(
             "production", "tenant-example", "draft-email", "example.com"
         )
@@ -372,13 +388,18 @@ class IntegrationDomainTests(unittest.TestCase):
             "adapterId": "smtp2go-smtp-v1",
             "host": "mail.smtp2go.com",
             "port": 465,
+            "tlsMode": "implicit",
             "canonicalSendingDomain": "example.com",
-            "accountOwnershipState": "audited",
+            "fromLocalPart": "billing",
+            "replyToLocalPart": "support",
+            "accountIsolationHash": hashlib.sha256(b"account").hexdigest(),
+            "credentialIsolationHash": hashlib.sha256(b"credential").hexdigest(),
+            "ownershipEvidenceHash": hashlib.sha256(b"evidence").hexdigest(),
         }
         for change in (
             {"host": "smtp.example.net"},
             {"canonicalSendingDomain": "other.example.com"},
-            {"accountOwnershipState": "unverified"},
+            {"tlsMode": "starttls"},
         ):
             with self.subTest(change=change), self.assertRaises(ValueError):
                 self.domain.IntegrationConnection(

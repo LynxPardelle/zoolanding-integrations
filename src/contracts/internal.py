@@ -27,6 +27,10 @@ _URL_LIKE = re.compile(
     re.IGNORECASE,
 )
 _STRIPE_ACCOUNT = re.compile(r"acct_[A-Za-z0-9]{8,64}", re.ASCII)
+_SMTP_LOCAL_PART = re.compile(
+    r"(?:[a-z0-9]|[a-z0-9](?:[a-z0-9_-]|\.(?!\.)){0,62}[a-z0-9])", re.ASCII
+)
+_OPAQUE_EVIDENCE_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{7,127}", re.ASCII)
 _PROVIDER_CAPABILITIES = {
     "stripe": frozenset(
         {
@@ -139,6 +143,18 @@ class ConnectionRegistration:
     account_reference: str | None
 
 
+@dataclass(frozen=True, slots=True)
+class SmtpConnectionActivation:
+    scope: IntegrationScope
+    connection_id: str
+    command_id: str
+    idempotency_key: str
+    expected_revision: int
+    from_local_part: str
+    reply_to_local_part: str
+    ownership_evidence_id: str
+
+
 def validate_command(kind: str, value: object) -> InternalCommand:
     request = _closed(
         value,
@@ -230,6 +246,49 @@ def validate_connection_registration(value: object) -> ConnectionRegistration:
     )
 
 
+def validate_smtp_connection_activation(value: object) -> SmtpConnectionActivation:
+    request = _closed(
+        value,
+        {
+            "version",
+            "scope",
+            "connectionId",
+            "commandId",
+            "idempotencyKey",
+            "expectedRevision",
+            "fromLocalPart",
+            "replyToLocalPart",
+            "ownershipEvidenceId",
+        },
+    )
+    if request["version"] != 1:
+        raise ContractError("activation version is invalid")
+    local_parts = (request["fromLocalPart"], request["replyToLocalPart"])
+    if any(
+        type(value) is not str
+        or not 1 <= len(value) <= 64
+        or _SMTP_LOCAL_PART.fullmatch(value) is None
+        for value in local_parts
+    ):
+        raise ContractError("SMTP sender policy is invalid")
+    evidence_id = request["ownershipEvidenceId"]
+    if (
+        type(evidence_id) is not str
+        or _OPAQUE_EVIDENCE_ID.fullmatch(evidence_id) is None
+    ):
+        raise ContractError("SMTP ownership evidence is invalid")
+    return SmtpConnectionActivation(
+        scope=_scope(request["scope"]),
+        connection_id=_id(request["connectionId"]),
+        command_id=_id(request["commandId"]),
+        idempotency_key=_idempotency(request["idempotencyKey"]),
+        expected_revision=_positive_int(request["expectedRevision"]),
+        from_local_part=local_parts[0],
+        reply_to_local_part=local_parts[1],
+        ownership_evidence_id=evidence_id,
+    )
+
+
 def validate_service_result(
     value: object, expected: InternalCommand | str
 ) -> dict[str, Any]:
@@ -303,9 +362,30 @@ def validate_connection_registration_result(
     return dict(result)
 
 
+def validate_smtp_connection_activation_result(
+    value: object, expected: SmtpConnectionActivation
+) -> dict[str, Any]:
+    result = _closed(value, {"connectionId", "status", "mode", "revision"})
+    expected_mode = "test" if expected.scope.environment == "test" else "live"
+    if (
+        result["connectionId"] != expected.connection_id
+        or result["status"] != "active"
+        or result["mode"] != expected_mode
+        or result["revision"] != expected.expected_revision + 1
+    ):
+        raise ContractError("activation result is invalid")
+    return dict(result)
+
+
 def validate_connection_resolution_result(
     value: object, expected: InternalCommand
 ) -> dict[str, Any]:
+    provider = value.get("provider") if isinstance(value, dict) else None
+    smtp_fields = (
+        {"adapterId", "endpoint", "senderPolicy", "rateCircuitNamespace"}
+        if provider == "email.smtp"
+        else set()
+    )
     result = _closed(
         value,
         {
@@ -314,8 +394,8 @@ def validate_connection_resolution_result(
             "mode",
             "adapterVersion",
             "credentialReference",
-        },
-        {"endpoint"},
+        }
+        | smtp_fields,
     )
     provider = result["provider"]
     if (
@@ -337,14 +417,32 @@ def validate_connection_resolution_result(
     )
     if reference != expected_reference:
         raise ContractError("resolution result is invalid")
-    if provider == "stripe" and "endpoint" in result:
-        raise ContractError("resolution result is invalid")
     if provider == "email.smtp":
         endpoint = _closed(
             result.get("endpoint"),
-            {"host", "port", "canonicalSendingDomain"},
+            {"host", "port", "tlsMode", "canonicalSendingDomain"},
         )
-        if endpoint["host"] != "mail.smtp2go.com" or endpoint["port"] != 465:
+        sender = _closed(
+            result.get("senderPolicy"), {"fromLocalPart", "replyToLocalPart"}
+        )
+        if (
+            result["adapterId"] != "smtp2go-smtp-v1"
+            or endpoint["host"] != "mail.smtp2go.com"
+            or endpoint["port"] != 465
+            or endpoint["tlsMode"] != "implicit"
+            or any(
+                type(sender[field]) is not str
+                or _SMTP_LOCAL_PART.fullmatch(sender[field]) is None
+                for field in ("fromLocalPart", "replyToLocalPart")
+            )
+            or type(result["rateCircuitNamespace"]) is not str
+            or re.fullmatch(
+                r"smtp-rate-v1:[a-f0-9]{64}",
+                result["rateCircuitNamespace"],
+                re.ASCII,
+            )
+            is None
+        ):
             raise ContractError("resolution result is invalid")
         expected_domain = (
             "zoolandingpage.com.mx"

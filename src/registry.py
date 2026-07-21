@@ -208,6 +208,94 @@ class ConnectionRegistry:
         except Exception:
             raise RegistryConflict("Integration update conflicted") from None
 
+    def activate_smtp(
+        self,
+        candidate: IntegrationConnection,
+        expected_revision: object,
+        idempotency_key: object,
+    ) -> IntegrationConnection:
+        if (
+            type(candidate) is not IntegrationConnection
+            or candidate.provider != "email.smtp"
+            or candidate.status != "active"
+            or type(expected_revision) is not int
+            or expected_revision < 1
+            or candidate.revision != expected_revision + 1
+        ):
+            raise RegistryAccessDenied("SMTP activation is invalid")
+        token = _idempotency_key(idempotency_key)
+        pk = candidate.scope.partition_key
+        sk = f"CONNECTION#{candidate.connection_id}"
+        try:
+            current_record = self._backend.get(pk, sk)
+            current = _connection_from_record(candidate.scope, current_record)
+            activation_hash = _registration_hash((candidate.to_record(),))
+            if current.status == "active":
+                if (
+                    current == candidate
+                    and current_record.get("activationHash") == activation_hash
+                ):
+                    return current
+                raise RegistryConflict("SMTP activation conflicted")
+            base_metadata = {
+                key: candidate.provider_metadata[key]
+                for key in (
+                    "adapterId",
+                    "host",
+                    "port",
+                    "tlsMode",
+                    "canonicalSendingDomain",
+                )
+            }
+            registration_hash = current_record.get("registrationHash")
+            if (
+                current.status != "pending"
+                or current.revision != expected_revision
+                or current.provider != candidate.provider
+                or current.mode != candidate.mode
+                or current.capabilities != candidate.capabilities
+                or dict(current.provider_metadata) != base_metadata
+                or type(registration_hash) is not str
+                or re.fullmatch(r"[a-f0-9]{64}", registration_hash, re.ASCII) is None
+            ):
+                raise RegistryConflict("SMTP activation conflicted")
+            sentinels = tuple(
+                {
+                    **item,
+                    "registrationHash": registration_hash,
+                    "activationHash": activation_hash,
+                }
+                for item in _smtp_isolation_sentinels(candidate)
+            )
+            record = self._backend.activate_smtp(
+                pk,
+                sk,
+                dict(candidate.provider_metadata),
+                expected_revision,
+                registration_hash,
+                activation_hash,
+                sentinels,
+                token,
+            )
+            return _connection_from_record(candidate.scope, record)
+        except RegistryConflict:
+            try:
+                record = self._backend.get(pk, sk)
+                active = _connection_from_record(candidate.scope, record)
+                if (
+                    active == candidate
+                    and record.get("activationHash")
+                    == _registration_hash((candidate.to_record(),))
+                ):
+                    return active
+            except Exception:
+                pass
+            raise
+        except RegistryError:
+            raise
+        except Exception:
+            raise RegistryConflict("SMTP activation conflicted") from None
+
     def bind_stripe_account(
         self,
         scope: IntegrationScope,
@@ -581,6 +669,73 @@ class DynamoRegistryBackend:
             raise RegistryConflict("Integration update conflicted") from None
         return _deserialize(response.get("Attributes"))
 
+    def activate_smtp(
+        self,
+        pk: str,
+        sk: str,
+        provider_metadata: dict[str, Any],
+        expected_revision: int,
+        registration_hash: str,
+        activation_hash: str,
+        sentinels: tuple[dict[str, Any], ...],
+        idempotency_key: str,
+    ) -> dict[str, Any]:
+        values = _serialize_values(
+            {
+                ":active": "active",
+                ":pending": "pending",
+                ":next_revision": expected_revision + 1,
+                ":expected_revision": expected_revision,
+                ":provider": "email.smtp",
+                ":item_type": "IntegrationConnection",
+                ":registration_hash": registration_hash,
+                ":activation_hash": activation_hash,
+                ":metadata": provider_metadata,
+            }
+        )
+        operations = [
+            {
+                "Update": {
+                    "TableName": self._table_name,
+                    "Key": _serialize({"pk": pk, "sk": sk}),
+                    "UpdateExpression": (
+                        "SET #status = :active, revision = :next_revision, "
+                        "providerMetadata = :metadata, activationHash = :activation_hash"
+                    ),
+                    "ConditionExpression": (
+                        "itemType = :item_type AND provider = :provider "
+                        "AND #status = :pending AND revision = :expected_revision "
+                        "AND registrationHash = :registration_hash "
+                        "AND attribute_not_exists(activationHash)"
+                    ),
+                    "ExpressionAttributeNames": {"#status": "status"},
+                    "ExpressionAttributeValues": values,
+                }
+            },
+            *(
+                {
+                    "Put": {
+                        "TableName": self._table_name,
+                        "Item": _serialize(sentinel),
+                        "ConditionExpression": (
+                            "attribute_not_exists(pk) AND attribute_not_exists(sk)"
+                        ),
+                    }
+                }
+                for sentinel in sentinels
+            ),
+        ]
+        try:
+            self._client.transact_write_items(
+                TransactItems=operations,
+                ClientRequestToken=hashlib.sha256(
+                    (idempotency_key + "\0" + activation_hash).encode("utf-8")
+                ).hexdigest()[:36],
+            )
+            return self.get(pk, sk)
+        except Exception:
+            raise RegistryConflict("SMTP activation conflicted") from None
+
     def activate_ready(
         self,
         pk: str,
@@ -839,18 +994,21 @@ def _routing_sentinel(connection: IntegrationConnection) -> dict[str, Any]:
 def _isolation_sentinels(
     connection: IntegrationConnection,
 ) -> tuple[dict[str, Any], ...]:
-    if (
-        connection.scope.environment != "production"
-        or connection.provider != "email.smtp"
-    ):
+    if connection.provider != "email.smtp" or connection.status != "active":
         return ()
-    domain = connection.provider_metadata.get("canonicalSendingDomain")
-    if type(domain) is not str:
-        raise RegistryAccessDenied("Integration registration is invalid")
-    digest = hashlib.sha256(domain.casefold().encode("ascii")).hexdigest()
-    return (
+    return _smtp_isolation_sentinels(connection)
+
+
+def _smtp_isolation_sentinels(
+    connection: IntegrationConnection,
+) -> tuple[dict[str, Any], ...]:
+    metadata = connection.provider_metadata
+    credential_hash = metadata.get("credentialIsolationHash")
+    if type(credential_hash) is not str:
+        raise RegistryAccessDenied("SMTP activation is invalid")
+    claims = [
         {
-            "pk": f"ISOLATION#production#email.smtp#domain#{digest}",
+            "pk": f"ISOLATION#email.smtp#credential#{credential_hash}",
             "sk": "CLAIM",
             "itemType": "ConnectionIsolationSentinel",
             "authorizes": False,
@@ -858,10 +1016,31 @@ def _isolation_sentinels(
             "tenantId": connection.scope.tenant_id,
             "draftId": connection.scope.draft_id,
             "provider": "email.smtp",
-            "claimType": "canonical-sending-domain",
+            "claimType": "credential-isolation",
             "connectionId": connection.connection_id,
         },
-    )
+    ]
+    if connection.scope.environment == "production":
+        account_hash = metadata.get("accountIsolationHash")
+        domain = metadata.get("canonicalSendingDomain")
+        if type(account_hash) is not str or type(domain) is not str:
+            raise RegistryAccessDenied("SMTP activation is invalid")
+        domain_hash = hashlib.sha256(domain.casefold().encode("ascii")).hexdigest()
+        claims.extend(
+            (
+                {
+                    **claims[0],
+                    "pk": f"ISOLATION#production#email.smtp#account#{account_hash}",
+                    "claimType": "account-isolation",
+                },
+                {
+                    **claims[0],
+                    "pk": f"ISOLATION#production#email.smtp#domain#{domain_hash}",
+                    "claimType": "canonical-sending-domain",
+                },
+            )
+        )
+    return tuple(claims)
 
 
 def _registration_hash(records: tuple[dict[str, Any], ...]) -> str:

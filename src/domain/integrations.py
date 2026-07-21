@@ -16,6 +16,10 @@ _DOMAIN = re.compile(
     re.ASCII,
 )
 _STRIPE_ACCOUNT_REFERENCE = re.compile(r"acct_[A-Za-z0-9]{8,64}", re.ASCII)
+_HASH = re.compile(r"[a-f0-9]{64}", re.ASCII)
+_SMTP_LOCAL_PART = re.compile(
+    r"(?:[a-z0-9]|[a-z0-9](?:[a-z0-9_-]|\.(?!\.)){0,62}[a-z0-9])", re.ASCII
+)
 _SAME_ORIGIN_PATH = re.compile(r"/(?!/)(?!.*[\\\s?#:\x00-\x1f\x7f]).{0,255}", re.ASCII)
 _STRIPE_RESOURCE_REFERENCES = {
     "product": re.compile(r"prod_[A-Za-z0-9]{8,64}", re.ASCII),
@@ -389,13 +393,36 @@ class IntegrationConnection:
             if self.scope.environment == "test"
             else self.scope.domain
         )
-        if metadata != {
+        base = {
             "adapterId": "smtp2go-smtp-v1",
             "host": "mail.smtp2go.com",
             "port": 465,
+            "tlsMode": "implicit",
             "canonicalSendingDomain": expected_domain,
-            "accountOwnershipState": "audited",
-        }:
+        }
+        if metadata == base and self.status != "active":
+            return metadata
+        if set(metadata) != set(base) | {
+            "fromLocalPart",
+            "replyToLocalPart",
+            "accountIsolationHash",
+            "credentialIsolationHash",
+            "ownershipEvidenceHash",
+        } or any(metadata.get(key) != value for key, value in base.items()):
+            raise ValueError("SMTP connection metadata is invalid")
+        if any(
+            type(metadata.get(key)) is not str
+            or _SMTP_LOCAL_PART.fullmatch(metadata[key]) is None
+            for key in ("fromLocalPart", "replyToLocalPart")
+        ) or any(
+            type(metadata.get(key)) is not str
+            or _HASH.fullmatch(metadata[key]) is None
+            for key in (
+                "accountIsolationHash",
+                "credentialIsolationHash",
+                "ownershipEvidenceHash",
+            )
+        ):
             raise ValueError("SMTP connection metadata is invalid")
         return metadata
 
@@ -426,20 +453,30 @@ class IntegrationConnection:
         }
 
     def isolation_claims(self) -> frozenset[str]:
-        """Return server-only uniqueness claims for production registration."""
-        if self.scope.environment != "production":
-            return frozenset()
+        """Return server-only uniqueness claims for an activated connection."""
         claims = set()
-        if self.provider == "stripe" and "accountReference" in self.provider_metadata:
+        if (
+            self.scope.environment == "production"
+            and self.provider == "stripe"
+            and "accountReference" in self.provider_metadata
+        ):
             claims.add(
                 f"PROVIDER#stripe#ACCOUNT#{self.provider_metadata['accountReference']}"
             )
-        elif self.provider == "email.smtp":
-            claims.add(f"CREDENTIAL#{self.credential_reference}")
+        elif self.provider == "email.smtp" and "credentialIsolationHash" in self.provider_metadata:
             claims.add(
-                "PROVIDER#email.smtp#DOMAIN#"
-                f"{self.provider_metadata['canonicalSendingDomain']}"
+                "PROVIDER#email.smtp#CREDENTIAL#"
+                f"{self.provider_metadata['credentialIsolationHash']}"
             )
+            if self.scope.environment == "production":
+                claims.add(
+                    "PROVIDER#email.smtp#ACCOUNT#"
+                    f"{self.provider_metadata['accountIsolationHash']}"
+                )
+                claims.add(
+                    "PROVIDER#email.smtp#DOMAIN#"
+                    f"{self.provider_metadata['canonicalSendingDomain']}"
+                )
         return frozenset(claims)
 
 
