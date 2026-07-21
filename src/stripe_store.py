@@ -1990,10 +1990,13 @@ def _receipt_key(connection_id: str, key: str) -> str:
 
 
 def _operation_key(connection_id: str, claim: Mapping[str, Any]) -> str:
-    return (
+    key = (
         f"STRIPEOP#{connection_id}#{claim['resourceType']}#"
         f"{claim['resourceId']}#{claim['dimension']}"
     )
+    if claim["resourceType"] == "subscription" and claim["dimension"] == "mutation":
+        key += f"#REVISION#{claim['revision']}"
+    return key
 
 
 def _operation_claim(value: object) -> dict[str, Any]:
@@ -2007,7 +2010,7 @@ def _operation_claim(value: object) -> dict[str, Any]:
         "offer": {"immutable", "presentation", "lifecycle"},
         "discount": {"immutable", "presentation", "lifecycle"},
         "checkout": {"immutable"},
-        "subscription": {"change", "discount", "pause"},
+        "subscription": {"mutation"},
         "customer-portal": {"immutable"},
     }
     if claim["dimension"] not in allowed.get(claim["resourceType"], set()):

@@ -117,15 +117,13 @@ class IntegrationDomainTests(unittest.TestCase):
             ):
                 self.domain.IntegrationBinding.from_mapping(self.scope, candidate)
 
-    def test_stripe_optional_routes_follow_capabilities_and_oauth_is_the_default(self):
+    def test_stripe_optional_routes_follow_capabilities_and_strategy_is_explicit(self):
         checkout_only = self.stripe_binding(capabilities=["checkout"])
         checkout_only["stripe"].pop("accountStrategy")
         checkout_only["stripe"].pop("onboardingRoutes")
         checkout_only["stripe"].pop("customerPortalReturnPath")
-        parsed = self.domain.IntegrationBinding.from_mapping(self.scope, checkout_only)
-        self.assertEqual(
-            parsed.provider_metadata["accountStrategy"], "oauth-standard-v1"
-        )
+        with self.assertRaises(ValueError):
+            self.domain.IntegrationBinding.from_mapping(self.scope, checkout_only)
 
         portal = self.stripe_binding(capabilities=["customer-portal"])
         portal["stripe"].pop("onboardingRoutes")

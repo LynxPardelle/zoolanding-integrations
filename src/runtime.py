@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
 import os
 import time
 from collections.abc import Mapping
@@ -76,27 +78,42 @@ class PublishedTaxPolicyVerifier:
         self._table_name = table_name
         self._client = client
 
-    def __call__(self, resolved: Any, state: Any, target: Any) -> bool:
-        del target
+    def authorize(
+        self, resolved: Any, expected_revision: Any
+    ) -> tuple[str, str | None] | None:
         scope = getattr(getattr(resolved, "connection", None), "scope", None)
-        if getattr(scope, "environment", None) == "test":
-            return True
-        connection_id = getattr(
-            getattr(resolved, "connection", None), "connection_id", None
-        )
+        connection = getattr(resolved, "connection", None)
+        binding = getattr(resolved, "binding", None)
+        connection_id = getattr(connection, "connection_id", None)
         metadata = getattr(getattr(resolved, "binding", None), "provider_metadata", {})
         tax_mode = metadata.get("taxMode") if isinstance(metadata, Mapping) else None
         approval_id = (
             metadata.get("taxApprovalId") if isinstance(metadata, Mapping) else None
         )
+        if type(expected_revision) is not int or expected_revision < 1:
+            return None
+        if getattr(scope, "environment", None) == "test":
+            if tax_mode not in {"manual-rate", "stripe-tax"}:
+                return None
+            return tax_mode, None
+        connection_metadata = getattr(connection, "provider_metadata", {})
+        account_reference = (
+            connection_metadata.get("accountReference")
+            if isinstance(connection_metadata, Mapping)
+            else None
+        )
+        mode = getattr(connection, "mode", None)
         if (
             getattr(scope, "environment", None) != "production"
             or type(connection_id) is not str
             or type(approval_id) is not str
             or tax_mode not in {"manual-rate", "stripe-tax"}
-            or not isinstance(state, dict)
+            or type(account_reference) is not str
+            or not account_reference
+            or mode != "live"
+            or getattr(binding, "mode", None) != mode
         ):
-            return False
+            return None
         sk = f"TAX_APPROVAL#{connection_id}#{approval_id}"
         try:
             response = self._client.get_item(
@@ -107,7 +124,7 @@ class PublishedTaxPolicyVerifier:
             raw = response.get("Item") if isinstance(response, dict) else None
             record = _deserialize(raw) if raw is not None else None
         except Exception:
-            return False
+            return None
         expected_keys = {
             "pk",
             "sk",
@@ -117,9 +134,14 @@ class PublishedTaxPolicyVerifier:
             "approvalId",
             "provider",
             "taxMode",
+            "accountHash",
+            "mode",
+            "expectedRevision",
             "status",
             "revision",
+            "approvalHash",
         }
+        account_hash = hashlib.sha256(account_reference.encode("utf-8")).hexdigest()
         if (
             not isinstance(record, dict)
             or set(record) != expected_keys
@@ -133,11 +155,33 @@ class PublishedTaxPolicyVerifier:
             or record.get("approvalId") != approval_id
             or record.get("provider") != "stripe"
             or record.get("taxMode") != tax_mode
+            or record.get("accountHash") != account_hash
+            or record.get("mode") != mode
+            or record.get("expectedRevision") != expected_revision
             or record.get("status") != "approved"
             or type(record.get("revision")) is not int
             or record["revision"] < 1
+            or record.get("approvalHash") != _tax_approval_hash(record)
+        ):
+            return None
+        return tax_mode, record["approvalHash"]
+
+    def validate_state(self, authorization: Any, state: Any) -> bool:
+        if (
+            not isinstance(authorization, tuple)
+            or len(authorization) != 2
+            or authorization[0] not in {"manual-rate", "stripe-tax"}
+            or (
+                authorization[1] is not None
+                and (
+                    type(authorization[1]) is not str
+                    or len(authorization[1]) != 64
+                )
+            )
+            or not isinstance(state, dict)
         ):
             return False
+        tax_mode = authorization[0]
         automatic_tax = state.get("automaticTax")
         if (
             not isinstance(automatic_tax, dict)
@@ -151,16 +195,48 @@ class PublishedTaxPolicyVerifier:
             return False
         default_rates = state.get("defaultTaxRateIds")
         items = state.get("items")
-        return bool(
-            isinstance(default_rates, list)
-            and isinstance(items, list)
-            and (
-                default_rates
-                or any(
-                    isinstance(item, dict) and item.get("taxRateIds") for item in items
-                )
+        if (
+            not isinstance(default_rates, list)
+            or any(type(rate) is not str for rate in default_rates)
+            or not isinstance(items, list)
+            or any(
+                not isinstance(item, dict)
+                or not isinstance(item.get("taxRateIds"), list)
+                or any(type(rate) is not str for rate in item["taxRateIds"])
+                for item in items
             )
-        )
+        ):
+            return False
+        return bool(default_rates or any(item["taxRateIds"] for item in items))
+
+
+def _tax_approval_hash(record: Mapping[str, Any]) -> str:
+    fields = (
+        "environment",
+        "tenantId",
+        "draftId",
+        "domain",
+        "connectionId",
+        "approvalId",
+        "provider",
+        "taxMode",
+        "accountHash",
+        "mode",
+        "expectedRevision",
+        "status",
+        "revision",
+    )
+    try:
+        payload = {field: record[field] for field in fields}
+        encoded = json.dumps(
+            payload,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=True,
+        ).encode("ascii")
+    except (KeyError, TypeError, UnicodeError, ValueError):
+        return ""
+    return hashlib.sha256(encoded).hexdigest()
 
 
 def browser_runtime() -> dict[str, Any]:

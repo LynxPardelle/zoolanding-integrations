@@ -94,6 +94,36 @@ class SamControlPlaneTests(unittest.TestCase):
         ):
             self.assertNotIn("secretsmanager:", self._role(name))
 
+    def test_browser_action_transaction_is_limited_to_the_registry_table(self):
+        statements = self.resources["BrowserActionRole"]["Properties"]["Policies"][
+            0
+        ]["PolicyDocument"]["Statement"]
+        transaction = [
+            statement
+            for statement in statements
+            if "dynamodb:TransactWriteItems"
+            in (
+                statement["Action"]
+                if isinstance(statement["Action"], list)
+                else [statement["Action"]]
+            )
+        ]
+        self.assertEqual(
+            transaction,
+            [
+                {
+                    "Effect": "Allow",
+                    "Action": [
+                        "dynamodb:UpdateItem",
+                        "dynamodb:TransactWriteItems",
+                    ],
+                    "Resource": {
+                        "Fn::GetAtt": ["IntegrationRegistryTable", "Arn"]
+                    },
+                }
+            ],
+        )
+
     def test_runtime_inputs_are_explicit_and_no_dev_or_cache_surface_exists(self):
         parameters = self.template["Parameters"]
         for name in (

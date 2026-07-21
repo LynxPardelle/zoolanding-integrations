@@ -272,12 +272,8 @@ class Store:
 
                 raise StripeCommandConflict("conflict")
             return dict(existing)
-        claim_identity = (
-            scope.partition_key,
-            connection_id,
-            operation_claim["resourceType"],
-            operation_claim["resourceId"],
-            operation_claim["dimension"],
+        claim_identity = self._operation_identity(
+            scope, connection_id, operation_claim
         )
         prior_claim = self.operation_claims.get(claim_identity)
         if prior_claim is not None:
@@ -370,12 +366,8 @@ class Store:
             raise AssertionError("hash mismatch")
         receipt.update(result)
         operation = receipt["operationClaim"]
-        operation_identity = (
-            scope.partition_key,
-            connection_id,
-            operation["resourceType"],
-            operation["resourceId"],
-            operation["dimension"],
+        operation_identity = self._operation_identity(
+            scope, connection_id, operation
         )
         self.operation_claims[operation_identity]["status"] = "accepted"
         for mapping in mappings:
@@ -405,12 +397,8 @@ class Store:
         receipt = self.receipts[(scope.partition_key, connection_id, key)]
         receipt["status"] = "unknown"
         operation = receipt["operationClaim"]
-        operation_identity = (
-            scope.partition_key,
-            connection_id,
-            operation["resourceType"],
-            operation["resourceId"],
-            operation["dimension"],
+        operation_identity = self._operation_identity(
+            scope, connection_id, operation
         )
         self.operation_claims[operation_identity]["status"] = "unknown"
 
@@ -418,12 +406,8 @@ class Store:
         receipt = self.receipts[(scope.partition_key, connection_id, key)]
         receipt["status"] = "needs_review"
         operation = receipt["operationClaim"]
-        operation_identity = (
-            scope.partition_key,
-            connection_id,
-            operation["resourceType"],
-            operation["resourceId"],
-            operation["dimension"],
+        operation_identity = self._operation_identity(
+            scope, connection_id, operation
         )
         self.operation_claims[operation_identity]["status"] = "needs_review"
 
@@ -431,14 +415,26 @@ class Store:
         receipt = self.receipts[(scope.partition_key, connection_id, key)]
         receipt["status"] = "rejected"
         operation = receipt["operationClaim"]
-        operation_identity = (
+        operation_identity = self._operation_identity(
+            scope, connection_id, operation
+        )
+        self.operation_claims[operation_identity]["status"] = "rejected"
+
+    @staticmethod
+    def _operation_identity(scope, connection_id, operation):
+        identity = (
             scope.partition_key,
             connection_id,
             operation["resourceType"],
             operation["resourceId"],
             operation["dimension"],
         )
-        self.operation_claims[operation_identity]["status"] = "rejected"
+        if (
+            operation["resourceType"] == "subscription"
+            and operation["dimension"] == "mutation"
+        ):
+            identity += (operation["revision"],)
+        return identity
 
 
 class Provider:
@@ -590,6 +586,20 @@ class Routes:
         }
 
 
+class TaxVerifier:
+    def __init__(self):
+        self.allow = True
+        self.calls = []
+
+    def authorize(self, resolved_binding, expected_revision):
+        self.calls.append(("authorize", resolved_binding, expected_revision))
+        return ("stripe-tax", "test") if self.allow else None
+
+    def validate_state(self, authorization, state):
+        self.calls.append(("validate", authorization, state))
+        return self.allow
+
+
 class StripeCommandTests(unittest.TestCase):
     def setUp(self):
         from src.stripe_commands import StripeCommandService
@@ -599,13 +609,14 @@ class StripeCommandTests(unittest.TestCase):
         self.store = Store()
         self.resolver = Resolver()
         self.routes = Routes()
+        self.tax_verifier = TaxVerifier()
         self.service = StripeCommandService(
             self.resolver,
             self.store,
             self.provider,
             self.routes,
             now_epoch=lambda: self.now,
-            tax_verifier=lambda resolved_binding, state, target: True,
+            tax_verifier=self.tax_verifier,
         )
 
     def seed_subscription(self):
@@ -649,6 +660,135 @@ class StripeCommandTests(unittest.TestCase):
             "status": "active",
             "sourceRevision": 2,
         }
+
+    def test_every_subscription_mutation_authorizes_tax_before_provider_access(self):
+        cases = (
+            (
+                "subscription-change",
+                "subscription-change",
+                {
+                    "subscriptionId": "subscription-1",
+                    "expectedRevision": 2,
+                    "targetOfferVersionId": "offer-v2",
+                    "planChangePolicy": {"mode": "immediate-prorated"},
+                    "previewTimestamp": 1_800_000_100,
+                },
+            ),
+            (
+                "subscription-change",
+                "subscription-change",
+                {
+                    "subscriptionId": "subscription-1",
+                    "expectedRevision": 2,
+                    "targetOfferVersionId": "offer-v2",
+                    "planChangePolicy": {"mode": "next-renewal"},
+                },
+            ),
+            (
+                "subscription-discount",
+                "apply",
+                {
+                    "subscriptionId": "subscription-1",
+                    "expectedRevision": 2,
+                    "action": "apply",
+                    "discountVersionId": "discount-v1",
+                },
+            ),
+            (
+                "subscription-discount",
+                "remove",
+                {
+                    "subscriptionId": "subscription-1",
+                    "expectedRevision": 2,
+                    "action": "remove",
+                },
+            ),
+            (
+                "subscription-pause",
+                "pause",
+                {
+                    "subscriptionId": "subscription-1",
+                    "expectedRevision": 2,
+                    "action": "pause",
+                    "pausePolicy": {
+                        "enabled": True,
+                        "newInvoiceBehavior": "keep-as-draft",
+                        "existingInvoiceBehavior": "unchanged",
+                        "accessBehavior": "suspend",
+                        "resume": {"mode": "manual"},
+                        "onResume": {
+                            "collection": "restore",
+                            "access": "restore-if-suspended",
+                        },
+                    },
+                },
+            ),
+            (
+                "subscription-pause",
+                "resume",
+                {
+                    "subscriptionId": "subscription-1",
+                    "expectedRevision": 2,
+                    "action": "resume",
+                    "pausePolicy": {"enabled": False},
+                },
+            ),
+        )
+        for kind, operation, input_value in cases:
+            with self.subTest(kind=kind, action=input_value.get("action")):
+                self.setUp()
+                self.seed_subscription()
+                self.tax_verifier.allow = False
+                selected = subscription_command(
+                    kind, input_value, operation=operation
+                )
+
+                self.assertEqual(
+                    self.service.execute(kind, selected)["status"], "needs_review"
+                )
+                self.assertEqual(self.provider.calls, [])
+                self.assertEqual(
+                    [(call[0], call[2]) for call in self.tax_verifier.calls],
+                    [("authorize", 2)],
+                )
+
+    def test_subscription_mutations_share_one_revision_claim_across_operations(self):
+        self.seed_subscription()
+        discount = subscription_command(
+            "subscription-discount",
+            {
+                "subscriptionId": "subscription-1",
+                "expectedRevision": 2,
+                "action": "remove",
+            },
+            operation="remove",
+        )
+        pause = subscription_command(
+            "subscription-pause",
+            {
+                "subscriptionId": "subscription-1",
+                "expectedRevision": 2,
+                "action": "resume",
+                "pausePolicy": {"enabled": False},
+            },
+            operation="resume",
+        )
+
+        self.assertEqual(
+            self.service.execute("subscription-discount", discount)["status"],
+            "accepted",
+        )
+        provider_calls = list(self.provider.calls)
+        self.assertEqual(
+            self.service.execute("subscription-discount", discount)["status"],
+            "accepted",
+        )
+        self.assertEqual(self.provider.calls, provider_calls)
+        with self.assertRaisesRegex(Exception, "conflict"):
+            self.service.execute("subscription-pause", pause)
+        self.assertEqual(self.provider.calls, provider_calls)
+        claim = next(iter(self.store.operation_claims.values()))
+        self.assertEqual(claim["dimension"], "mutation")
 
     def test_subscription_revision_is_checked_from_projection_before_provider_network(
         self,
@@ -974,6 +1114,14 @@ class StripeCommandTests(unittest.TestCase):
             self.service.execute("subscription-discount", discount)["status"],
             "accepted",
         )
+        projection_key = next(iter(self.store.subscription_projections))
+        self.store.subscription_projections[projection_key]["sourceRevision"] = 3
+        pause = subscription_command(
+            "subscription-pause",
+            {**pause.input, "expectedRevision": 3},
+            revision=3,
+            operation="pause",
+        )
         self.assertEqual(
             self.service.execute("subscription-pause", pause)["status"], "accepted"
         )
@@ -1026,6 +1174,19 @@ class StripeCommandTests(unittest.TestCase):
         self.assertEqual(
             [call[0] for call in self.provider.calls].count("portal-session"), 2
         )
+        configuration = self.store.get_mapping(
+            selected_scope,
+            "stripe-primary",
+            "portal-configuration",
+            "restricted-default",
+        )
+        self.assertEqual(configuration["configurationRevision"], 1)
+        self.assertEqual(
+            configuration["configurationHash"],
+            hashlib.sha256(
+                b'{"invoice_history":true,"payment_method_update":true}'
+            ).hexdigest(),
+        )
         self.assertNotIn("billing.stripe.com", repr(self.store.persisted_values))
         self.assertTrue(
             any(
@@ -1071,6 +1232,58 @@ class StripeCommandTests(unittest.TestCase):
             "customer-portal", command("customer-portal", next_payload)
         )
         self.assertEqual(next_attempt["status"], "accepted")
+
+    def test_corrupt_portal_configuration_is_never_passed_to_stripe(self):
+        self.seed_subscription()
+        selected_scope = resolved().connection.scope
+
+        def portal(attempt):
+            payload = offer_command()
+            payload["input"] = {
+                "subscriptionId": "subscription-1",
+                "portalAttemptId": attempt,
+            }
+            content_hash = hashlib.sha256(
+                json.dumps(
+                    payload["input"], sort_keys=True, separators=(",", ":")
+                ).encode("utf-8")
+            ).hexdigest()
+            payload["idempotencyKey"] = integration_key(
+                payload["scope"],
+                payload["connectionId"],
+                "customer-portal",
+                "subscription-1",
+                1,
+                content_hash,
+            )
+            return command("customer-portal", payload)
+
+        self.assertEqual(
+            self.service.execute("customer-portal", portal("portal-attempt-1"))[
+                "status"
+            ],
+            "accepted",
+        )
+        key = (
+            selected_scope.partition_key,
+            "stripe-primary",
+            "portal-configuration",
+            "restricted-default",
+        )
+        self.store.mappings[key]["configurationHash"] = "0" * 64
+        before = len(
+            [call for call in self.provider.calls if call[0] == "portal-session"]
+        )
+
+        result = self.service.execute(
+            "customer-portal", portal("portal-attempt-2")
+        )
+
+        self.assertEqual(result["status"], "needs_review")
+        self.assertEqual(
+            len([call for call in self.provider.calls if call[0] == "portal-session"]),
+            before,
+        )
 
     def test_all_supported_pause_invoice_behaviors_are_forwarded_exactly(self):
         for configured, expected in (

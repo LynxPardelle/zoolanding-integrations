@@ -69,7 +69,6 @@ _STRIPE_KEYS = frozenset(
     }
 )
 _STRIPE_REQUIRED = _STRIPE_KEYS - {
-    "accountStrategy",
     "taxApprovalId",
     "onboardingRoutes",
     "customerPortalReturnPath",
@@ -136,7 +135,6 @@ def _stripe_binding_metadata(
     ):
         raise ValueError("Stripe binding metadata is invalid")
     selected = dict(value)
-    selected.setdefault("accountStrategy", "oauth-standard-v1")
     expected = {
         "accountModel": "merchant",
         "chargeType": "direct",

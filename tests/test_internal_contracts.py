@@ -359,6 +359,50 @@ class InternalContractTests(unittest.TestCase):
                     command,
                 )
 
+        for redirect_kind in ("checkout", "customer-portal"):
+            redirect_command = command
+            if redirect_kind == "customer-portal":
+                payload = offer_command()
+                payload["input"] = {
+                    "subscriptionId": "subscription-1",
+                    "portalAttemptId": "portal-attempt-1",
+                }
+                content_hash = hashlib.sha256(
+                    json.dumps(
+                        payload["input"], sort_keys=True, separators=(",", ":")
+                    ).encode("utf-8")
+                ).hexdigest()
+                payload["idempotencyKey"] = integration_key(
+                    payload["scope"],
+                    payload["connectionId"],
+                    "customer-portal",
+                    "subscription-1",
+                    1,
+                    content_hash,
+                )
+                redirect_command = contracts.validate_command(redirect_kind, payload)
+            with self.subTest(kind=redirect_kind), self.assertRaises(
+                contracts.ContractError
+            ):
+                contracts.validate_service_result(
+                    {
+                        "commandId": redirect_command.command_id,
+                        "status": "accepted",
+                    },
+                    redirect_command,
+                )
+            for status in ("pending", "needs_review"):
+                self.assertEqual(
+                    contracts.validate_service_result(
+                        {
+                            "commandId": redirect_command.command_id,
+                            "status": status,
+                        },
+                        redirect_command,
+                    )["status"],
+                    status,
+                )
+
         status_payload = offer_command()
         status_payload["input"] = {
             "orderId": "order-1",

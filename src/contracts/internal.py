@@ -208,11 +208,13 @@ def validate_service_result(
             return dict(result)
 
     result = _closed(value, {"commandId", "status"})
-    if result["commandId"] != expected_command_id or result["status"] not in {
-        "accepted",
-        "pending",
-        "needs_review",
-    }:
+    allowed_statuses = {"accepted", "pending", "needs_review"}
+    if command is not None and command.kind in {"checkout", "customer-portal"}:
+        allowed_statuses = {"pending", "needs_review"}
+    if (
+        result["commandId"] != expected_command_id
+        or result["status"] not in allowed_statuses
+    ):
         raise ContractError("command result is invalid")
     return {"commandId": expected_command_id, "status": result["status"]}
 

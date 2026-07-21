@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 from typing import Any
 from urllib.parse import urlencode, urlsplit, urlunsplit
 
@@ -46,6 +47,11 @@ _CAPABILITIES = {
 _CHECKOUT_MIN_TTL_SECONDS = 30 * 60
 _CHECKOUT_MAX_TTL_SECONDS = 24 * 60 * 60
 _PROVIDER_IDEMPOTENCY_RETRY_SECONDS = 24 * 60 * 60
+_PORTAL_CONFIGURATION_REVISION = 1
+_PORTAL_CONFIGURATION_HASH = hashlib.sha256(
+    b'{"invoice_history":true,"payment_method_update":true}'
+).hexdigest()
+_PORTAL_CONFIGURATION_ID = re.compile(r"bpc_[A-Za-z0-9]{8,64}", re.ASCII)
 
 
 class StripeCommandService:
@@ -680,7 +686,9 @@ class StripeCommandService:
         return mapping, state
 
     def _subscription_change(self, command, resolved):
+        tax_authorization = self._authorize_subscription_mutation(command, resolved)
         _, state = self._subscription_context(command, resolved)
+        self._validate_subscription_tax(tax_authorization, state)
         value = command.input
         target = self._mapping(command, "offer", value["targetOfferVersionId"])
         if (
@@ -725,11 +733,6 @@ class StripeCommandService:
                 idempotency_key=command.idempotency_key,
             )
             return None, [], None
-        if (
-            self._tax_verifier is None
-            or self._tax_verifier(resolved, state, target) is not True
-        ):
-            raise StripeNeedsReview("Stripe subscription needs review")
         arguments = {
             "subscription_id": state["subscriptionId"],
             "item_id": item["itemId"],
@@ -745,7 +748,9 @@ class StripeCommandService:
         return None, [], None
 
     def _subscription_discount(self, command, resolved):
+        tax_authorization = self._authorize_subscription_mutation(command, resolved)
         _, state = self._subscription_context(command, resolved)
+        self._validate_subscription_tax(tax_authorization, state)
         value = command.input
         discounts = state["discounts"]
         if any(type(item) is not str for item in discounts) or len(discounts) > 1:
@@ -789,7 +794,9 @@ class StripeCommandService:
         return None, [], None
 
     def _subscription_pause(self, command, resolved):
+        tax_authorization = self._authorize_subscription_mutation(command, resolved)
         _, state = self._subscription_context(command, resolved)
+        self._validate_subscription_tax(tax_authorization, state)
         value = command.input
         if value["action"] == "pause":
             if (
@@ -828,18 +835,15 @@ class StripeCommandService:
             configuration = {
                 "resourceType": "portal-configuration",
                 "resourceId": "restricted-default",
-                "revision": 1,
-                "contentHash": hashlib.sha256(
-                    b"payment-method-and-invoice-history-only-v1"
-                ).hexdigest(),
+                "revision": _PORTAL_CONFIGURATION_REVISION,
+                "contentHash": _PORTAL_CONFIGURATION_HASH,
+                "configurationRevision": _PORTAL_CONFIGURATION_REVISION,
+                "configurationHash": _PORTAL_CONFIGURATION_HASH,
                 "configurationId": configuration_id,
                 "status": "active",
             }
             mappings.append(configuration)
-        if (
-            configuration.get("status") != "active"
-            or type(configuration.get("configurationId")) is not str
-        ):
+        if not _valid_portal_configuration(configuration):
             raise StripeNeedsReview("Stripe subscription needs review")
         result = self._provider.create_portal_session(
             resolved,
@@ -880,11 +884,7 @@ class StripeCommandService:
         configuration = self._mapping(
             command, "portal-configuration", "restricted-default"
         )
-        if (
-            not isinstance(configuration, dict)
-            or configuration.get("status") != "active"
-            or type(configuration.get("configurationId")) is not str
-        ):
+        if not _valid_portal_configuration(configuration):
             return {"commandId": command.command_id, "status": "needs_review"}
         try:
             projection, state = self._subscription_context(
@@ -914,6 +914,29 @@ class StripeCommandService:
         return self._store.get_mapping(
             command.scope, command.connection_id, resource_type, resource_id
         )
+
+    def _authorize_subscription_mutation(self, command, resolved):
+        authorize = getattr(self._tax_verifier, "authorize", None)
+        if not callable(authorize):
+            raise StripeNeedsReview("Stripe subscription needs review")
+        try:
+            authorization = authorize(resolved, command.input["expectedRevision"])
+        except Exception:
+            raise StripeNeedsReview("Stripe subscription needs review") from None
+        if authorization is None:
+            raise StripeNeedsReview("Stripe subscription needs review")
+        return authorization
+
+    def _validate_subscription_tax(self, authorization, state):
+        validate = getattr(self._tax_verifier, "validate_state", None)
+        if not callable(validate):
+            raise StripeNeedsReview("Stripe subscription needs review")
+        try:
+            valid = validate(authorization, state)
+        except Exception:
+            valid = False
+        if valid is not True:
+            raise StripeNeedsReview("Stripe subscription needs review")
 
 
 def _request_hash(command: InternalCommand) -> str:
@@ -980,7 +1003,7 @@ def _operation_claim(command: InternalCommand) -> dict[str, Any]:
         else:
             resource_type = "subscription"
             resource_id = value["subscriptionId"]
-            dimension = command.kind.removeprefix("subscription-")
+            dimension = "mutation"
             revision = value["expectedRevision"]
     else:
         raise StripeCommandError("Stripe command is unavailable")
@@ -993,6 +1016,32 @@ def _operation_claim(command: InternalCommand) -> dict[str, Any]:
         "revision": revision,
         "contentHash": command.content_hash,
     }
+
+
+def _valid_portal_configuration(value: object) -> bool:
+    expected_keys = {
+        "resourceType",
+        "resourceId",
+        "revision",
+        "contentHash",
+        "configurationRevision",
+        "configurationHash",
+        "configurationId",
+        "status",
+    }
+    return bool(
+        isinstance(value, dict)
+        and set(value) == expected_keys
+        and value["resourceType"] == "portal-configuration"
+        and value["resourceId"] == "restricted-default"
+        and value["revision"] == _PORTAL_CONFIGURATION_REVISION
+        and value["contentHash"] == _PORTAL_CONFIGURATION_HASH
+        and value["configurationRevision"] == _PORTAL_CONFIGURATION_REVISION
+        and value["configurationHash"] == _PORTAL_CONFIGURATION_HASH
+        and type(value["configurationId"]) is str
+        and _PORTAL_CONFIGURATION_ID.fullmatch(value["configurationId"]) is not None
+        and value["status"] == "active"
+    )
 
 
 def _same_immutable_version(mapping, revision, content_hash):

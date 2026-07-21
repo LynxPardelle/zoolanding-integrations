@@ -115,6 +115,23 @@ class StripeStoreTests(unittest.TestCase):
                 content_hash="d" * 64,
             )
 
+    def test_subscription_mutation_claim_key_includes_expected_revision(self):
+        self.claim(
+            resource_type="subscription",
+            resource_id="subscription-1",
+            dimension="mutation",
+            revision=2,
+        )
+
+        self.assertIn(
+            (
+                SCOPE.partition_key,
+                "STRIPEOP#stripe-primary#subscription#subscription-1#"
+                "mutation#REVISION#2",
+            ),
+            self.client.items,
+        )
+
     def test_operation_claim_accepts_only_code_owned_resource_dimensions(self):
         accepted = (
             ("offer", "immutable"),
@@ -124,9 +141,7 @@ class StripeStoreTests(unittest.TestCase):
             ("discount", "presentation"),
             ("discount", "lifecycle"),
             ("checkout", "immutable"),
-            ("subscription", "change"),
-            ("subscription", "discount"),
-            ("subscription", "pause"),
+            ("subscription", "mutation"),
             ("customer-portal", "immutable"),
         )
         for index, (resource_type, dimension) in enumerate(accepted, start=1):
@@ -145,6 +160,9 @@ class StripeStoreTests(unittest.TestCase):
         for resource_type, dimension in (
             ("offer", "pause"),
             ("subscription", "immutable"),
+            ("subscription", "change"),
+            ("subscription", "discount"),
+            ("subscription", "pause"),
             ("customer-portal", "portal"),
             ("unknown", "immutable"),
         ):
