@@ -1,0 +1,104 @@
+"""Authenticated and CSRF-checked generic connection status actions."""
+
+from __future__ import annotations
+
+from typing import Any
+
+try:
+    from common.auth_admin import authorize_request
+    from common.http import (
+        closed_object,
+        dispatch,
+        domain_header,
+        positive_int,
+        safe_id,
+        unavailable_response,
+        validation_error,
+    )
+except ModuleNotFoundError:
+    from src.common.auth_admin import authorize_request
+    from src.common.http import (
+        closed_object,
+        dispatch,
+        domain_header,
+        positive_int,
+        safe_id,
+        unavailable_response,
+        validation_error,
+    )
+
+
+PATH = "/features/integrations/action"
+
+
+def handle_request(
+    event: dict[str, Any],
+    *,
+    policy_resolver: Any,
+    auth_store: Any,
+    registry: Any,
+    environment: str,
+    now_epoch: int,
+) -> dict[str, Any]:
+    def handle(payload: dict[str, Any]) -> dict[str, Any]:
+        request = closed_object(payload, {"operation", "input"})
+        if request["operation"] != "setStatus":
+            raise validation_error()
+        input_value = closed_object(
+            request["input"],
+            {"connectionId", "status", "expectedRevision"},
+        )
+        connection_id = safe_id(input_value["connectionId"])
+        if type(input_value["status"]) is not str or input_value["status"] not in {
+            "active",
+            "disabled",
+        }:
+            raise validation_error()
+        revision = positive_int(input_value["expectedRevision"])
+        policies = policy_resolver.resolve(
+            environment=environment,
+            domain=domain_header(event),
+        )
+        authorize_request(
+            event=event,
+            policies=policies,
+            capability="integration:manage",
+            mutation=True,
+            store=auth_store,
+            now_epoch=now_epoch,
+        )
+        connection = registry.update_status(
+            policies.scope,
+            connection_id,
+            input_value["status"],
+            revision,
+        )
+        return {
+            "connection": {
+                "connectionId": connection.connection_id,
+                "provider": connection.provider,
+                "status": connection.status,
+                "mode": connection.mode,
+                "capabilities": sorted(connection.capabilities),
+                "revision": connection.revision,
+            }
+        }
+
+    return dispatch(event, PATH, handle)
+
+
+def lambda_handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
+    del context
+    try:
+        dependencies = _runtime_dependencies()
+    except Exception:
+        return unavailable_response(event)
+    return handle_request(event, **dependencies)
+
+
+def _runtime_dependencies() -> dict[str, Any]:
+    try:
+        from runtime import browser_runtime
+    except ModuleNotFoundError:
+        from src.runtime import browser_runtime
+    return browser_runtime()

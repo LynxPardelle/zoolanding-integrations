@@ -7,11 +7,32 @@ Parameters:
     Type: String
     AllowedValues:
       - test
-      - prod
+      - production
+  ConfigRegistryTableName:
+    Type: String
+    MinLength: 3
+  ConfigPayloadsBucketName:
+    Type: String
+    MinLength: 3
+  AuthSessionTableName:
+    Type: String
+    MinLength: 3
+  AuthUserStateTableName:
+    Type: String
+    MinLength: 3
+  InternalCallerArns:
+    Type: String
+    MinLength: 20
+  StripeSecretsPrefixArn:
+    Type: String
+    MinLength: 20
+  IntegrationSecretsPrefixArn:
+    Type: String
+    MinLength: 20
 
 Globals:
   Function:
-    Runtime: python3.12
+    Runtime: python3.13
     Architectures:
       - arm64
     MemorySize: 256
@@ -20,6 +41,18 @@ Globals:
       Variables:
         ENVIRONMENT_NAME:
           Ref: EnvironmentName
+        INTERNAL_CALLER_ARNS:
+          Ref: InternalCallerArns
+        CONFIG_REGISTRY_TABLE_NAME:
+          Ref: ConfigRegistryTableName
+        CONFIG_PAYLOADS_BUCKET_NAME:
+          Ref: ConfigPayloadsBucketName
+        AUTH_SESSION_TABLE_NAME:
+          Ref: AuthSessionTableName
+        AUTH_USER_STATE_TABLE_NAME:
+          Ref: AuthUserStateTableName
+        INTEGRATION_REGISTRY_TABLE_NAME:
+          Ref: IntegrationRegistryTable
 
 Resources:
   IntegrationRegistryTable:
@@ -42,6 +75,9 @@ Resources:
         PointInTimeRecoveryEnabled: true
       SSESpecification:
         SSEEnabled: true
+      TimeToLiveSpecification:
+        AttributeName: expiresAt
+        Enabled: true
       Tags:
         - Key: Project
           Value: Zoolandingpage
@@ -109,6 +145,224 @@ Resources:
           Value:
             Ref: EnvironmentName
 
+  IntegrationApi:
+    Type: AWS::Serverless::Api
+    Properties:
+      StageName:
+        Ref: EnvironmentName
+      EndpointConfiguration: REGIONAL
+
+  ControlPlaneLogGroup:
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      LogGroupName:
+        Fn::Sub: /aws/lambda/${AWS::StackName}-control-plane
+      RetentionInDays: 30
+
+  ControlPlaneLoggingPolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Action:
+              - logs:CreateLogStream
+              - logs:PutLogEvents
+            Resource:
+              Fn::Sub: ${ControlPlaneLogGroup.Arn}:*
+
+  PublishedPolicyReadPolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Action: dynamodb:GetItem
+            Resource:
+              Fn::Sub: arn:${AWS::Partition}:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${ConfigRegistryTableName}
+          - Effect: Allow
+            Action: s3:GetObject
+            Resource:
+              Fn::Sub: arn:${AWS::Partition}:s3:::${ConfigPayloadsBucketName}/sites/*
+
+  AuthAdminReadPolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Action: dynamodb:GetItem
+            Resource:
+              - Fn::Sub: arn:${AWS::Partition}:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${AuthSessionTableName}
+              - Fn::Sub: arn:${AWS::Partition}:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${AuthUserStateTableName}
+
+  IntegrationRegistryReadPolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Action:
+              - dynamodb:GetItem
+              - dynamodb:Query
+            Resource:
+              Fn::GetAtt:
+                - IntegrationRegistryTable
+                - Arn
+
+  BrowserReadRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - Ref: ControlPlaneLoggingPolicy
+        - Ref: PublishedPolicyReadPolicy
+        - Ref: AuthAdminReadPolicy
+        - Ref: IntegrationRegistryReadPolicy
+
+  BrowserActionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - Ref: ControlPlaneLoggingPolicy
+        - Ref: PublishedPolicyReadPolicy
+        - Ref: AuthAdminReadPolicy
+        - Ref: IntegrationRegistryReadPolicy
+      Policies:
+        - PolicyName: UpdateConnectionState
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: dynamodb:UpdateItem
+                Resource:
+                  Fn::GetAtt:
+                    - IntegrationRegistryTable
+                    - Arn
+
+  StripeOnboardingRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - Ref: ControlPlaneLoggingPolicy
+        - Ref: PublishedPolicyReadPolicy
+        - Ref: AuthAdminReadPolicy
+        - Ref: IntegrationRegistryReadPolicy
+      Policies:
+        - PolicyName: StripeOnboardingStateAndCredential
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:PutItem
+                  - dynamodb:UpdateItem
+                Resource:
+                  Fn::GetAtt:
+                    - IntegrationRegistryTable
+                    - Arn
+              - Effect: Allow
+                Action: secretsmanager:GetSecretValue
+                Resource:
+                  Fn::Sub: ${StripeSecretsPrefixArn}*
+
+  ConnectionAdminRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - Ref: ControlPlaneLoggingPolicy
+        - Ref: PublishedPolicyReadPolicy
+        - Ref: IntegrationRegistryReadPolicy
+      Policies:
+        - PolicyName: RegisterConnectionMetadata
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: dynamodb:TransactWriteItems
+                Resource:
+                  Fn::GetAtt:
+                    - IntegrationRegistryTable
+                    - Arn
+              - Effect: Allow
+                Action: secretsmanager:DescribeSecret
+                Resource:
+                  Fn::Sub: ${IntegrationSecretsPrefixArn}*
+
+  InternalConnectionResolveRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - Ref: ControlPlaneLoggingPolicy
+        - Ref: IntegrationRegistryReadPolicy
+
+  InternalProviderCommandRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - Ref: ControlPlaneLoggingPolicy
+        - Ref: IntegrationRegistryReadPolicy
+
+  InternalMigrationBoundaryRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - Ref: ControlPlaneLoggingPolicy
+
   WebhookIngressLogGroup:
     Type: AWS::Logs::LogGroup
     DeletionPolicy: Retain
@@ -127,7 +381,7 @@ Resources:
         Fn::Sub: /aws/lambda/${AWS::StackName}-integration-outgoing-stream
       RetentionInDays: 30
 
-  StreamBoundaryRole:
+  WebhookIngressStreamRole:
     Type: AWS::IAM::Role
     Properties:
       AssumeRolePolicyDocument:
@@ -138,7 +392,7 @@ Resources:
               Service: lambda.amazonaws.com
             Action: sts:AssumeRole
       Policies:
-        - PolicyName: IntegrationsPendingStreamBoundary
+        - PolicyName: IntegrationsWebhookIngressStream
           PolicyDocument:
             Version: '2012-10-17'
             Statement:
@@ -153,22 +407,428 @@ Resources:
                     - WebhookReceiptTable
                     - StreamArn
               - Effect: Allow
-                Action:
-                  - sqs:SendMessage
+                Action: sqs:SendMessage
                 Resource:
-                  - Fn::GetAtt:
-                      - WebhookIngressFailureQueue
-                      - Arn
-                  - Fn::GetAtt:
-                      - IntegrationOutgoingFailureQueue
-                      - Arn
+                  Fn::GetAtt:
+                    - WebhookIngressFailureQueue
+                    - Arn
               - Effect: Allow
                 Action:
                   - logs:CreateLogStream
                   - logs:PutLogEvents
                 Resource:
-                  - Fn::Sub: arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/${AWS::StackName}-webhook-ingress-stream:*
-                  - Fn::Sub: arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/${AWS::StackName}-integration-outgoing-stream:*
+                  Fn::Sub: arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/${AWS::StackName}-webhook-ingress-stream:*
+
+  IntegrationOutgoingStreamRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: IntegrationsOutgoingStream
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:DescribeStream
+                  - dynamodb:GetRecords
+                  - dynamodb:GetShardIterator
+                  - dynamodb:ListStreams
+                Resource:
+                  Fn::GetAtt:
+                    - WebhookReceiptTable
+                    - StreamArn
+              - Effect: Allow
+                Action: sqs:SendMessage
+                Resource:
+                  Fn::GetAtt:
+                    - IntegrationOutgoingFailureQueue
+                    - Arn
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource:
+                  Fn::Sub: arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/${AWS::StackName}-integration-outgoing-stream:*
+
+  ConnectionReadFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src/
+      Handler: handlers.connection_read.lambda_handler
+      Role:
+        Fn::GetAtt:
+          - BrowserReadRole
+          - Arn
+      LoggingConfig:
+        LogFormat: JSON
+        LogGroup:
+          Ref: ControlPlaneLogGroup
+      Events:
+        BrowserRead:
+          Type: Api
+          Properties:
+            RestApiId:
+              Ref: IntegrationApi
+            Path: /features/integrations/read
+            Method: post
+
+  ConnectionActionFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src/
+      Handler: handlers.connection_action.lambda_handler
+      Role:
+        Fn::GetAtt:
+          - BrowserActionRole
+          - Arn
+      LoggingConfig:
+        LogFormat: JSON
+        LogGroup:
+          Ref: ControlPlaneLogGroup
+      Events:
+        BrowserAction:
+          Type: Api
+          Properties:
+            RestApiId:
+              Ref: IntegrationApi
+            Path: /features/integrations/action
+            Method: post
+
+  StripeOnboardingFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src/
+      Handler: handlers.stripe_onboarding.lambda_handler
+      Role:
+        Fn::GetAtt:
+          - StripeOnboardingRole
+          - Arn
+      LoggingConfig:
+        LogFormat: JSON
+        LogGroup:
+          Ref: ControlPlaneLogGroup
+      Events:
+        StripeOnboarding:
+          Type: Api
+          Properties:
+            RestApiId:
+              Ref: IntegrationApi
+            Path: /features/integrations/stripe/onboarding
+            Method: post
+
+  InternalStripeOfferFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src/
+      Handler: handlers.internal_stripe_offer.lambda_handler
+      Role:
+        Fn::GetAtt: [InternalProviderCommandRole, Arn]
+      LoggingConfig: &ControlPlaneLogging
+        LogFormat: JSON
+        LogGroup:
+          Ref: ControlPlaneLogGroup
+      Events:
+        InternalCommand:
+          Type: Api
+          Properties: &InternalStripeOfferEvent
+            RestApiId:
+              Ref: IntegrationApi
+            Path: /internal/v1/stripe/offer
+            Method: post
+            Auth:
+              Authorizer: AWS_IAM
+
+  InternalStripeProductPresentationFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src/
+      Handler: handlers.internal_stripe_product_presentation.lambda_handler
+      Role:
+        Fn::GetAtt: [InternalProviderCommandRole, Arn]
+      LoggingConfig: *ControlPlaneLogging
+      Events:
+        InternalCommand:
+          Type: Api
+          Properties:
+            RestApiId:
+              Ref: IntegrationApi
+            Path: /internal/v1/stripe/product-presentation
+            Method: post
+            Auth:
+              Authorizer: AWS_IAM
+
+  InternalStripeDiscountFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src/
+      Handler: handlers.internal_stripe_discount.lambda_handler
+      Role:
+        Fn::GetAtt: [InternalProviderCommandRole, Arn]
+      LoggingConfig: *ControlPlaneLogging
+      Events:
+        InternalCommand:
+          Type: Api
+          Properties:
+            RestApiId:
+              Ref: IntegrationApi
+            Path: /internal/v1/stripe/discount
+            Method: post
+            Auth:
+              Authorizer: AWS_IAM
+
+  InternalStripeDiscountLifecycleFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src/
+      Handler: handlers.internal_stripe_discount_lifecycle.lambda_handler
+      Role:
+        Fn::GetAtt: [InternalProviderCommandRole, Arn]
+      LoggingConfig: *ControlPlaneLogging
+      Events:
+        InternalCommand:
+          Type: Api
+          Properties:
+            RestApiId:
+              Ref: IntegrationApi
+            Path: /internal/v1/stripe/discount-lifecycle
+            Method: post
+            Auth:
+              Authorizer: AWS_IAM
+
+  InternalStripeCheckoutFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src/
+      Handler: handlers.internal_stripe_checkout.lambda_handler
+      Role:
+        Fn::GetAtt: [InternalProviderCommandRole, Arn]
+      LoggingConfig: *ControlPlaneLogging
+      Events:
+        InternalCommand:
+          Type: Api
+          Properties:
+            RestApiId:
+              Ref: IntegrationApi
+            Path: /internal/v1/stripe/checkout
+            Method: post
+            Auth:
+              Authorizer: AWS_IAM
+
+  InternalStripeCheckoutStatusFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src/
+      Handler: handlers.internal_stripe_checkout_status.lambda_handler
+      Role:
+        Fn::GetAtt: [InternalProviderCommandRole, Arn]
+      LoggingConfig: *ControlPlaneLogging
+      Events:
+        InternalCommand:
+          Type: Api
+          Properties:
+            RestApiId:
+              Ref: IntegrationApi
+            Path: /internal/v1/stripe/checkout-status
+            Method: get
+            Auth:
+              Authorizer: AWS_IAM
+
+  InternalStripeSubscriptionChangeFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src/
+      Handler: handlers.internal_stripe_subscription_change.lambda_handler
+      Role:
+        Fn::GetAtt: [InternalProviderCommandRole, Arn]
+      LoggingConfig: *ControlPlaneLogging
+      Events:
+        InternalCommand:
+          Type: Api
+          Properties:
+            RestApiId:
+              Ref: IntegrationApi
+            Path: /internal/v1/stripe/subscription/change
+            Method: post
+            Auth:
+              Authorizer: AWS_IAM
+
+  InternalStripeSubscriptionDiscountFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src/
+      Handler: handlers.internal_stripe_subscription_discount.lambda_handler
+      Role:
+        Fn::GetAtt: [InternalProviderCommandRole, Arn]
+      LoggingConfig: *ControlPlaneLogging
+      Events:
+        InternalCommand:
+          Type: Api
+          Properties:
+            RestApiId:
+              Ref: IntegrationApi
+            Path: /internal/v1/stripe/subscription/discount
+            Method: post
+            Auth:
+              Authorizer: AWS_IAM
+
+  InternalStripeSubscriptionPauseFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src/
+      Handler: handlers.internal_stripe_subscription_pause.lambda_handler
+      Role:
+        Fn::GetAtt: [InternalProviderCommandRole, Arn]
+      LoggingConfig: *ControlPlaneLogging
+      Events:
+        InternalCommand:
+          Type: Api
+          Properties:
+            RestApiId:
+              Ref: IntegrationApi
+            Path: /internal/v1/stripe/subscription/pause
+            Method: post
+            Auth:
+              Authorizer: AWS_IAM
+
+  InternalStripeCustomerPortalFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src/
+      Handler: handlers.internal_stripe_customer_portal.lambda_handler
+      Role:
+        Fn::GetAtt: [InternalProviderCommandRole, Arn]
+      LoggingConfig: *ControlPlaneLogging
+      Events:
+        InternalCommand:
+          Type: Api
+          Properties:
+            RestApiId:
+              Ref: IntegrationApi
+            Path: /internal/v1/stripe/customer-portal
+            Method: post
+            Auth:
+              Authorizer: AWS_IAM
+
+  InternalStripeMigrationsPreviewFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src/
+      Handler: handlers.internal_stripe_migrations_preview.lambda_handler
+      Role:
+        Fn::GetAtt: [InternalMigrationBoundaryRole, Arn]
+      LoggingConfig: *ControlPlaneLogging
+      Events:
+        InternalCommand:
+          Type: Api
+          Properties:
+            RestApiId:
+              Ref: IntegrationApi
+            Path: /internal/v1/stripe/migrations/preview
+            Method: post
+            Auth:
+              Authorizer: AWS_IAM
+
+  InternalStripeMigrationsExecuteFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src/
+      Handler: handlers.internal_stripe_migrations_execute.lambda_handler
+      Role:
+        Fn::GetAtt: [InternalMigrationBoundaryRole, Arn]
+      LoggingConfig: *ControlPlaneLogging
+      Events:
+        InternalCommand:
+          Type: Api
+          Properties:
+            RestApiId:
+              Ref: IntegrationApi
+            Path: /internal/v1/stripe/migrations/execute
+            Method: post
+            Auth:
+              Authorizer: AWS_IAM
+
+  InternalStripeMigrationsControlFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src/
+      Handler: handlers.internal_stripe_migrations_control.lambda_handler
+      Role:
+        Fn::GetAtt: [InternalMigrationBoundaryRole, Arn]
+      LoggingConfig: *ControlPlaneLogging
+      Events:
+        InternalCommand:
+          Type: Api
+          Properties:
+            RestApiId:
+              Ref: IntegrationApi
+            Path: /internal/v1/stripe/migrations/control
+            Method: post
+            Auth:
+              Authorizer: AWS_IAM
+
+  InternalStripeMigrationsStatusFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src/
+      Handler: handlers.internal_stripe_migrations_status.lambda_handler
+      Role:
+        Fn::GetAtt: [InternalMigrationBoundaryRole, Arn]
+      LoggingConfig: *ControlPlaneLogging
+      Events:
+        InternalCommand:
+          Type: Api
+          Properties:
+            RestApiId:
+              Ref: IntegrationApi
+            Path: /internal/v1/stripe/migrations/status
+            Method: get
+            Auth:
+              Authorizer: AWS_IAM
+
+  InternalConnectionRegisterFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src/
+      Handler: handlers.internal_connection_register.lambda_handler
+      Role:
+        Fn::GetAtt: [ConnectionAdminRole, Arn]
+      LoggingConfig: *ControlPlaneLogging
+      Events:
+        InternalCommand:
+          Type: Api
+          Properties:
+            RestApiId:
+              Ref: IntegrationApi
+            Path: /internal/v1/integrations/connection-register
+            Method: post
+            Auth:
+              Authorizer: AWS_IAM
+
+  InternalConnectionResolveFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src/
+      Handler: handlers.internal_connection_resolve.lambda_handler
+      Role:
+        Fn::GetAtt: [InternalConnectionResolveRole, Arn]
+      LoggingConfig: *ControlPlaneLogging
+      Events:
+        InternalCommand:
+          Type: Api
+          Properties:
+            RestApiId:
+              Ref: IntegrationApi
+            Path: /internal/v1/integrations/connection-resolve
+            Method: post
+            Auth:
+              Authorizer: AWS_IAM
 
   WebhookIngressStreamFunction:
     Type: AWS::Serverless::Function
@@ -182,7 +842,7 @@ Resources:
       Description: Fails closed until verified webhook event processing is implemented.
       Role:
         Fn::GetAtt:
-          - StreamBoundaryRole
+          - WebhookIngressStreamRole
           - Arn
       Environment:
         Variables:
@@ -225,7 +885,7 @@ Resources:
       Description: Fails closed until verified Integration Events relay is implemented.
       Role:
         Fn::GetAtt:
-          - StreamBoundaryRole
+          - IntegrationOutgoingStreamRole
           - Arn
       Environment:
         Variables:

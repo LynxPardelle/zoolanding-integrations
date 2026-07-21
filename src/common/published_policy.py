@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 import json
 import re
+from types import MappingProxyType
 from typing import Any
 
 try:
@@ -16,6 +17,7 @@ except ModuleNotFoundError:
 MAX_DESCRIPTOR_BYTES = 256 * 1024
 MAX_JSON_DEPTH = 32
 _VERSION_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}", re.ASCII)
+_AUTH_PROFILE_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}", re.ASCII)
 
 
 class PolicyResolutionError(RuntimeError):
@@ -28,6 +30,8 @@ class ResolvedIntegrationPolicy:
     version_id: str
     prefix: str
     bindings: tuple[IntegrationBinding, ...]
+    admin_access: Any
+    auth_registry: Any
 
 
 class PublishedPolicyResolver:
@@ -88,7 +92,13 @@ class PublishedPolicyResolver:
         value = self._load_json(key)
         try:
             if (
-                set(value) != {"version", "scope", "bindings"}
+                set(value)
+                != {
+                    "version",
+                    "scope",
+                    "adminAccess",
+                    "bindings",
+                }
                 or value.get("version") != 1
             ):
                 raise ValueError
@@ -102,11 +112,24 @@ class PublishedPolicyResolver:
             )
             if len({item.binding_id for item in bindings}) != len(bindings):
                 raise ValueError
+            admin_access = _admin_access(value.get("adminAccess"))
         except (TypeError, ValueError):
             raise PolicyResolutionError(
                 "Published Integration policy is invalid"
             ) from None
-        resolved = ResolvedIntegrationPolicy(scope, version_id, prefix, bindings)
+        auth_registry: Any = MappingProxyType({})
+        if admin_access["mode"] == "auth-profile":
+            auth_registry = _auth_registry(
+                self._load_json(f"{prefix}{domain}/server/auth-profile-registry.json")
+            )
+        resolved = ResolvedIntegrationPolicy(
+            scope,
+            version_id,
+            prefix,
+            bindings,
+            admin_access,
+            auth_registry,
+        )
         self._cache[cache_key] = resolved
         return resolved
 
@@ -150,7 +173,7 @@ class PublishedPolicyResolver:
                 object_pairs_hook=_unique_object,
                 parse_constant=lambda _value: (_ for _ in ()).throw(ValueError()),
             )
-        except (UnicodeDecodeError, TypeError, ValueError):
+        except (UnicodeDecodeError, TypeError, ValueError, RecursionError):
             raise PolicyResolutionError(
                 "Published Integration policy is invalid"
             ) from None
@@ -197,4 +220,65 @@ def _published_pointer(
 def _version_id(value: object) -> str:
     if type(value) is not str or _VERSION_ID.fullmatch(value) is None:
         raise ValueError
+    return value
+
+
+def _admin_access(value: object) -> Any:
+    if not isinstance(value, dict):
+        raise ValueError
+    if value.get("mode") == "none" and set(value) == {"mode"}:
+        return MappingProxyType({"mode": "none"})
+    if set(value) != {"mode", "authProfileId", "capabilities"}:
+        raise ValueError
+    if value.get("mode") != "auth-profile":
+        raise ValueError
+    auth_profile_id = value.get("authProfileId")
+    if (
+        type(auth_profile_id) is not str
+        or _AUTH_PROFILE_ID.fullmatch(auth_profile_id) is None
+    ):
+        raise ValueError
+    capabilities = value.get("capabilities")
+    if (
+        not isinstance(capabilities, list)
+        or not 1 <= len(capabilities) <= 2
+        or len(set(capabilities)) != len(capabilities)
+        or not set(capabilities).issubset({"integration:read", "integration:manage"})
+    ):
+        raise ValueError
+    return MappingProxyType(
+        {
+            "mode": "auth-profile",
+            "authProfileId": auth_profile_id,
+            "capabilities": tuple(capabilities),
+        }
+    )
+
+
+def _auth_registry(value: object) -> Any:
+    if (
+        not isinstance(value, dict)
+        or set(value) != {"version", "profiles"}
+        or value.get("version") != 1
+        or not isinstance(value.get("profiles"), list)
+        or not 1 <= len(value["profiles"]) <= 100
+    ):
+        raise PolicyResolutionError("Published Integration policy is invalid")
+    profile_ids = [
+        item.get("authProfileId") if isinstance(item, dict) else None
+        for item in value["profiles"]
+    ]
+    if any(
+        type(item) is not str or _AUTH_PROFILE_ID.fullmatch(item) is None
+        for item in profile_ids
+    ) or len(set(profile_ids)) != len(profile_ids):
+        raise PolicyResolutionError("Published Integration policy is invalid")
+    return _freeze(value)
+
+
+def _freeze(value: Any) -> Any:
+    if isinstance(value, dict):
+        return MappingProxyType({key: _freeze(item) for key, item in value.items()})
+    if isinstance(value, list):
+        return tuple(_freeze(item) for item in value)
     return value

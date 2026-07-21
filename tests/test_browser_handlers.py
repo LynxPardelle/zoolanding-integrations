@@ -1,0 +1,263 @@
+import importlib
+import importlib.util
+import json
+import unittest
+
+from tests.test_authorization import auth_store, event as auth_event, policies
+from tests.test_registry import connection
+
+
+def handler_module(testcase, name):
+    module_name = f"src.handlers.{name}"
+    testcase.assertIsNotNone(
+        importlib.util.find_spec(module_name),
+        f"{name} handler is not implemented",
+    )
+    return importlib.import_module(module_name)
+
+
+class Resolver:
+    def __init__(self, resolved=None):
+        self.resolved = resolved or policies()
+        self.calls = []
+
+    def resolve(self, **kwargs):
+        self.calls.append(kwargs)
+        return self.resolved
+
+
+class Registry:
+    def __init__(self):
+        self.updated = []
+
+    def list_connections(self, resolved_scope):
+        self.scope = resolved_scope
+        return (connection(),)
+
+    def update_status(self, resolved_scope, connection_id, status, expected_revision):
+        self.updated.append((resolved_scope, connection_id, status, expected_revision))
+        return connection(status=status)
+
+
+class BindingResolver:
+    def __init__(self):
+        self.calls = []
+
+    def resolve(self, *args, **kwargs):
+        from src.registry import ResolvedBinding
+        from tests.test_registry import binding
+
+        self.calls.append((args, kwargs))
+        return ResolvedBinding(binding(), connection())
+
+
+class OnboardingService:
+    def __init__(self):
+        self.calls = []
+
+    def start(self, resolved, context, now_epoch):
+        self.calls.append(("start", resolved, context, now_epoch))
+        return {"handoffUrl": "https://connect.stripe.com/setup/synthetic"}
+
+    def complete_return(self, resolved, context, state, now_epoch):
+        self.calls.append(("return", resolved, context, state, now_epoch))
+        return {
+            "status": "ready",
+            "chargesEnabled": True,
+            "detailsSubmitted": True,
+            "requirementsDueCount": 0,
+        }
+
+
+def request(path, body, *, csrf=True):
+    value = auth_event(csrf=csrf)
+    value.update(
+        {
+            "rawPath": path,
+            "requestContext": {
+                "http": {"method": "POST"},
+                "requestId": "request-1",
+            },
+            "body": json.dumps(body),
+            "isBase64Encoded": False,
+        }
+    )
+    return value
+
+
+def body(response):
+    return json.loads(response["body"])
+
+
+class BrowserHandlerTests(unittest.TestCase):
+    def test_read_and_action_lambda_entrypoints_use_server_runtime_dependencies(self):
+        read_handler = handler_module(self, "connection_read")
+        action_handler = handler_module(self, "connection_action")
+        registry = Registry()
+        dependencies = {
+            "policy_resolver": Resolver(),
+            "auth_store": auth_store(),
+            "registry": registry,
+            "environment": "test",
+            "now_epoch": 1_000,
+        }
+        read_handler._runtime_dependencies = lambda: dependencies
+        action_handler._runtime_dependencies = lambda: dependencies
+
+        read = read_handler.lambda_handler(
+            request("/features/integrations/read", {"operation": "list"}), None
+        )
+        action = action_handler.lambda_handler(
+            request(
+                "/features/integrations/action",
+                {
+                    "operation": "setStatus",
+                    "input": {
+                        "connectionId": "stripe-primary",
+                        "status": "disabled",
+                        "expectedRevision": 1,
+                    },
+                },
+            ),
+            None,
+        )
+
+        self.assertEqual(read["statusCode"], 200)
+        self.assertEqual(action["statusCode"], 200)
+
+    def test_connection_read_is_sanitized_no_store_and_scope_derived(self):
+        handler = handler_module(self, "connection_read")
+        registry = Registry()
+        resolver = Resolver()
+
+        response = handler.handle_request(
+            request("/features/integrations/read", {"operation": "list"}),
+            policy_resolver=resolver,
+            auth_store=auth_store(),
+            registry=registry,
+            environment="test",
+            now_epoch=1_000,
+        )
+
+        self.assertEqual(response["statusCode"], 200)
+        self.assertEqual(response["headers"]["Cache-Control"], "no-store")
+        result = body(response)
+        self.assertEqual(
+            result["data"]["connections"][0]["connectionId"], "stripe-primary"
+        )
+        self.assertNotIn("acct_synthetic", response["body"])
+        self.assertNotIn("credentialReference", response["body"])
+        self.assertEqual(registry.scope.draft_id, "draft-example")
+        self.assertEqual(
+            resolver.calls, [{"environment": "test", "domain": "example.com"}]
+        )
+        malformed = handler.handle_request(
+            request("/features/integrations/read", {"operation": {"invalid": True}}),
+            policy_resolver=resolver,
+            auth_store=auth_store(),
+            registry=registry,
+            environment="test",
+            now_epoch=1_000,
+        )
+        self.assertEqual(malformed["statusCode"], 422)
+
+    def test_connection_action_requires_manage_and_csrf_then_updates_exact_scope(self):
+        handler = handler_module(self, "connection_action")
+        registry = Registry()
+        payload = {
+            "operation": "setStatus",
+            "input": {
+                "connectionId": "stripe-primary",
+                "status": "disabled",
+                "expectedRevision": 1,
+            },
+        }
+        denied = handler.handle_request(
+            request("/features/integrations/action", payload, csrf=False),
+            policy_resolver=Resolver(),
+            auth_store=auth_store(),
+            registry=registry,
+            environment="test",
+            now_epoch=1_000,
+        )
+        self.assertEqual(denied["statusCode"], 403)
+
+        response = handler.handle_request(
+            request("/features/integrations/action", payload),
+            policy_resolver=Resolver(),
+            auth_store=auth_store(),
+            registry=registry,
+            environment="test",
+            now_epoch=1_000,
+        )
+        self.assertEqual(response["statusCode"], 200)
+        self.assertEqual(registry.updated[0][0].draft_id, "draft-example")
+        self.assertEqual(registry.updated[0][1:], ("stripe-primary", "disabled", 1))
+
+    def test_onboarding_accepts_no_account_or_callback_urls_and_return_rechecks_status(
+        self,
+    ):
+        handler = handler_module(self, "stripe_onboarding")
+        service = OnboardingService()
+        dependencies = {
+            "policy_resolver": Resolver(),
+            "auth_store": auth_store(),
+            "binding_resolver": BindingResolver(),
+            "onboarding_service": service,
+            "environment": "test",
+            "now_epoch": 1_000,
+        }
+        unsafe = handler.handle_request(
+            request(
+                "/features/integrations/stripe/onboarding",
+                {
+                    "operation": "start",
+                    "input": {
+                        "bindingId": "stripe-primary",
+                        "accountId": "acct_browser",
+                        "returnUrl": "https://evil.example",
+                    },
+                },
+            ),
+            **dependencies,
+        )
+        self.assertEqual(unsafe["statusCode"], 422)
+        self.assertEqual(service.calls, [])
+
+        started = handler.handle_request(
+            request(
+                "/features/integrations/stripe/onboarding",
+                {"operation": "start", "input": {"bindingId": "stripe-primary"}},
+            ),
+            **dependencies,
+        )
+        self.assertEqual(started["statusCode"], 200)
+        self.assertIn(
+            "https://connect.stripe.com/", body(started)["data"]["handoffUrl"]
+        )
+
+        returned = handler.handle_request(
+            request(
+                "/features/integrations/stripe/onboarding",
+                {
+                    "operation": "return",
+                    "input": {"bindingId": "stripe-primary", "state": "a" * 43},
+                },
+            ),
+            **dependencies,
+        )
+        self.assertEqual(returned["statusCode"], 200)
+        self.assertEqual(body(returned)["data"]["status"], "ready")
+        self.assertEqual([call[0] for call in service.calls], ["start", "return"])
+        malformed = handler.handle_request(
+            request(
+                "/features/integrations/stripe/onboarding",
+                {"operation": {"invalid": True}, "input": {}},
+            ),
+            **dependencies,
+        )
+        self.assertEqual(malformed["statusCode"], 422)
+
+
+if __name__ == "__main__":
+    unittest.main()

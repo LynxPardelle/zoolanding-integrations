@@ -1,5 +1,8 @@
 from pathlib import Path
 import importlib
+import os
+import subprocess
+import sys
 import unittest
 
 
@@ -34,7 +37,7 @@ class RepositoryContractTests(unittest.TestCase):
             "IntegrationEventsTopic",
         ):
             self.assertIn(f"  {resource}:", template)
-        self.assertIn("Runtime: python3.12", template)
+        self.assertIn("Runtime: python3.13", template)
         self.assertEqual(template.count("BillingMode: PAY_PER_REQUEST"), 2)
         self.assertEqual(template.count("PointInTimeRecoveryEnabled: true"), 2)
         self.assertEqual(template.count("SSEEnabled: true"), 2)
@@ -44,9 +47,22 @@ class RepositoryContractTests(unittest.TestCase):
         self.assertIn("dynamodb:ListStreams", template)
         self.assertIn('itemType":{"S":["WebhookIngressOutbox"]}', template)
         self.assertIn('itemType":{"S":["IntegrationEventOutbox"]}', template)
-        self.assertNotIn("AWS::Serverless::Api", template)
-        self.assertNotIn("Type: Api", template)
+        self.assertIn("AWS::Serverless::Api", template)
+        self.assertIn("Type: Api", template)
         self.assertNotIn("Tracing: Active", template)
+        self.assertIn("WebhookIngressStreamRole:", template)
+        self.assertIn("IntegrationOutgoingStreamRole:", template)
+        self.assertNotIn("StreamBoundaryRole:", template)
+        ingress_role = template.split("  WebhookIngressStreamRole:", 1)[1].split(
+            "  IntegrationOutgoingStreamRole:", 1
+        )[0]
+        outgoing_role = template.split("  IntegrationOutgoingStreamRole:", 1)[1].split(
+            "  WebhookIngressStreamFunction:", 1
+        )[0]
+        self.assertIn("WebhookIngressFailureQueue", ingress_role)
+        self.assertNotIn("IntegrationOutgoingFailureQueue", ingress_role)
+        self.assertIn("IntegrationOutgoingFailureQueue", outgoing_role)
+        self.assertNotIn("WebhookIngressFailureQueue", outgoing_role)
 
     def test_pending_stream_boundary_fails_closed_without_payload_logging(self):
         try:
@@ -65,6 +81,29 @@ class RepositoryContractTests(unittest.TestCase):
                 ]
             },
         )
+
+    def test_every_sam_handler_imports_from_the_lambda_code_root(self):
+        handlers = (
+            "handlers.connection_read",
+            "handlers.connection_action",
+            "handlers.stripe_onboarding",
+            "handlers.internal_connection_register",
+            "handlers.internal_connection_resolve",
+        )
+        environment = dict(os.environ)
+        environment["PYTHONPATH"] = str(ROOT / "src")
+        for name in handlers:
+            with self.subTest(handler=name):
+                result = subprocess.run(
+                    [sys.executable, "-c", f"import {name}"],
+                    cwd=ROOT,
+                    env=environment,
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                    timeout=10,
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
 
     def test_repository_has_no_dev_or_deployment_surface(self):
         self.assertFalse((ROOT / "samconfig.toml").exists())

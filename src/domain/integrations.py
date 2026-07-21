@@ -10,20 +10,23 @@ from typing import Any, Mapping
 
 TECHNICAL_TTL_SECONDS = 90 * 24 * 60 * 60
 _SAFE_ID = re.compile(r"[a-z0-9][a-z0-9._-]{0,63}", re.ASCII)
-_PROVIDER_REFERENCE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}", re.ASCII)
 _DOMAIN = re.compile(
     r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?"
     r"(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)+",
     re.ASCII,
 )
-_SECRET_KEY = re.compile(
-    r"(?:secret|token|password|credential|authorization|private.?key|api.?key)",
-    re.IGNORECASE,
-)
-_SECRET_VALUE = re.compile(
-    r"(?:(?:sk|rk)_(?:live|test)_|whsec_|eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.|BEGIN [A-Z ]*PRIVATE KEY)",
-    re.ASCII,
-)
+_STRIPE_ACCOUNT_REFERENCE = re.compile(r"acct_[A-Za-z0-9]{8,64}", re.ASCII)
+_STRIPE_RESOURCE_REFERENCES = {
+    "product": re.compile(r"prod_[A-Za-z0-9]{8,64}", re.ASCII),
+    "price": re.compile(r"price_[A-Za-z0-9]{8,64}", re.ASCII),
+    "promotion-code": re.compile(r"promo_[A-Za-z0-9]{8,64}", re.ASCII),
+    "checkout-session": re.compile(r"cs_(?:test|live)_[A-Za-z0-9]{8,64}", re.ASCII),
+    "subscription": re.compile(r"sub_[A-Za-z0-9]{8,64}", re.ASCII),
+    "customer": re.compile(r"cus_[A-Za-z0-9]{8,64}", re.ASCII),
+    "payment-intent": re.compile(r"pi_[A-Za-z0-9]{8,64}", re.ASCII),
+    "refund": re.compile(r"re_[A-Za-z0-9]{8,64}", re.ASCII),
+    "coupon": re.compile(r"[A-Za-z0-9]{8,64}", re.ASCII),
+}
 _PROVIDER_CAPABILITIES = {
     "stripe": frozenset(
         {
@@ -68,29 +71,6 @@ def _safe_id(value: object, name: str) -> str:
     if type(value) is not str or _SAFE_ID.fullmatch(value) is None:
         raise ValueError(f"{name} is invalid")
     return value
-
-
-def _provider_reference(value: object, name: str) -> str:
-    if type(value) is not str or _PROVIDER_REFERENCE.fullmatch(value) is None:
-        raise ValueError(f"{name} is invalid")
-    if _SECRET_VALUE.search(value):
-        raise ValueError(f"{name} is invalid")
-    return value
-
-
-def _reject_secret_material(value: object) -> None:
-    stack = [value]
-    while stack:
-        current = stack.pop()
-        if isinstance(current, Mapping):
-            for key, item in current.items():
-                if type(key) is not str or _SECRET_KEY.search(key):
-                    raise ValueError("secret material is forbidden")
-                stack.append(item)
-        elif isinstance(current, (list, tuple, set, frozenset)):
-            stack.extend(current)
-        elif isinstance(current, str) and _SECRET_VALUE.search(current):
-            raise ValueError("secret material is forbidden")
 
 
 def _freeze(value: Any) -> Any:
@@ -219,7 +199,6 @@ class IntegrationBinding:
         object.__setattr__(
             self, "capabilities", _capabilities(self.provider, self.capabilities)
         )
-        _reject_secret_material(self.provider_metadata)
         if self.provider == "stripe":
             metadata = _stripe_binding_metadata(self.provider_metadata)
         elif self.provider_metadata:
@@ -234,7 +213,6 @@ class IntegrationBinding:
     ) -> "IntegrationBinding":
         if not isinstance(value, Mapping):
             raise ValueError("binding is invalid")
-        _reject_secret_material(value)
         provider = value.get("provider")
         keys = _BINDING_KEYS | ({"stripe"} if provider == "stripe" else set())
         if set(value) != keys:
@@ -282,12 +260,15 @@ class IntegrationConnection:
     mode: str
     capabilities: frozenset[str]
     provider_metadata: Mapping[str, Any]
+    revision: int = 1
 
     def __post_init__(self) -> None:
         if type(self.scope) is not IntegrationScope:
             raise ValueError("scope is invalid")
         _safe_id(self.connection_id, "connection ID")
         _provider(self.provider, self.adapter_version)
+        if type(self.revision) is not int or self.revision < 1:
+            raise ValueError("connection revision is invalid")
         if self.status not in {
             "pending",
             "active",
@@ -297,7 +278,6 @@ class IntegrationConnection:
         object.__setattr__(
             self, "capabilities", _capabilities(self.provider, self.capabilities)
         )
-        _reject_secret_material(self.provider_metadata)
         metadata = self._validated_metadata(dict(self.provider_metadata))
         object.__setattr__(self, "provider_metadata", _freeze(metadata))
 
@@ -306,15 +286,25 @@ class IntegrationConnection:
             if not set(metadata).issubset({"accountReference", "resourceMappings"}):
                 raise ValueError("Stripe connection metadata is invalid")
             if "accountReference" in metadata:
-                _provider_reference(metadata["accountReference"], "account reference")
+                account_reference = metadata["accountReference"]
+                if (
+                    type(account_reference) is not str
+                    or _STRIPE_ACCOUNT_REFERENCE.fullmatch(account_reference) is None
+                ):
+                    raise ValueError("Stripe connection metadata is invalid")
             elif self.scope.environment == "production" and self.status == "active":
                 raise ValueError("Stripe connection metadata is invalid")
             mappings = metadata.get("resourceMappings", {})
             if not isinstance(mappings, Mapping) or len(mappings) > 64:
                 raise ValueError("provider resource mappings are invalid")
             for kind, reference in mappings.items():
-                _safe_id(kind, "resource kind")
-                _provider_reference(reference, "resource reference")
+                pattern = _STRIPE_RESOURCE_REFERENCES.get(kind)
+                if (
+                    pattern is None
+                    or type(reference) is not str
+                    or pattern.fullmatch(reference) is None
+                ):
+                    raise ValueError("provider resource mappings are invalid")
             return metadata
         expected_domain = (
             "zoolandingpage.com.mx"
@@ -353,6 +343,7 @@ class IntegrationConnection:
             "provider": self.provider,
             "adapterVersion": self.adapter_version,
             "status": self.status,
+            "revision": self.revision,
             "mode": self.mode,
             "capabilities": sorted(self.capabilities),
             "credentialReference": self.credential_reference,

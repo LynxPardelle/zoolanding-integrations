@@ -83,27 +83,65 @@ class IntegrationDomainTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "provider is invalid"):
             self.domain.IntegrationBinding.from_mapping(self.scope, unknown)
 
-    def test_secret_looking_keys_and_values_are_rejected_recursively(self):
+    def test_closed_contracts_and_typed_stripe_references_reject_secret_material(self):
         unsafe_key = self.stripe_binding()
         unsafe_key["stripe"] = {**unsafe_key["stripe"], "apiKey": "synthetic"}
         with self.assertRaises(ValueError):
             self.domain.IntegrationBinding.from_mapping(self.scope, unsafe_key)
 
-        unsafe_value = self.stripe_binding()
-        unsafe_value["stripe"] = {
-            **unsafe_value["stripe"],
-            "taxApprovalId": "_".join(("sk", "live", "synthetic")),
+        unsafe_value = connection_metadata = {
+            "accountReference": "_".join(("ghp", "syntheticcredential"))
         }
         with self.assertRaises(ValueError):
-            self.domain.IntegrationBinding.from_mapping(self.scope, unsafe_value)
+            self.domain.IntegrationConnection(
+                scope=self.scope,
+                connection_id="stripe-primary",
+                provider="stripe",
+                adapter_version="v1",
+                status="active",
+                mode="test",
+                capabilities=frozenset({"checkout"}),
+                provider_metadata=connection_metadata,
+            )
 
-        embedded = self.stripe_binding()
-        embedded["stripe"] = {
-            **embedded["stripe"],
-            "taxApprovalId": "approval." + "_".join(("sk", "live", "synthetic")),
+    def test_resource_mappings_are_closed_and_provider_typed(self):
+        valid = {
+            "accountReference": "acct_synthetic",
+            "resourceMappings": {
+                "product": "prod_synthetic",
+                "price": "price_synthetic",
+                "customer": "cus_synthetic",
+            },
+        }
+        candidate = self.domain.IntegrationConnection(
+            scope=self.scope,
+            connection_id="stripe-primary",
+            provider="stripe",
+            adapter_version="v1",
+            status="active",
+            mode="test",
+            capabilities=frozenset({"checkout"}),
+            provider_metadata=valid,
+        )
+        self.assertEqual(
+            candidate.provider_metadata["resourceMappings"]["price"], "price_synthetic"
+        )
+
+        invalid = {
+            **valid,
+            "resourceMappings": {"price": "_".join(("ghp", "syntheticcredential"))},
         }
         with self.assertRaises(ValueError):
-            self.domain.IntegrationBinding.from_mapping(self.scope, embedded)
+            self.domain.IntegrationConnection(
+                scope=self.scope,
+                connection_id="stripe-primary",
+                provider="stripe",
+                adapter_version="v1",
+                status="active",
+                mode="test",
+                capabilities=frozenset({"checkout"}),
+                provider_metadata=invalid,
+            )
 
     def test_connection_derives_stripe_secret_reference_and_safe_record(self):
         connection = self.domain.IntegrationConnection(

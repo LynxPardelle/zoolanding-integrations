@@ -2,6 +2,7 @@ import importlib
 import io
 import json
 import unittest
+from unittest import mock
 
 
 DOMAIN = "example.com"
@@ -18,7 +19,7 @@ def policy_module():
         ) from exc
 
 
-def descriptor(*, mode="test"):
+def descriptor(*, mode="test", admin_access=None):
     return {
         "version": 1,
         "scope": {
@@ -27,6 +28,7 @@ def descriptor(*, mode="test"):
             "draftId": DRAFT,
             "domain": DOMAIN,
         },
+        "adminAccess": admin_access or {"mode": "none"},
         "bindings": [
             {
                 "id": "stripe-primary",
@@ -77,6 +79,7 @@ class PublishedPolicyTests(unittest.TestCase):
         self.version = "version-1"
         self.prefix = f"sites/{DOMAIN}/versions/{self.version}/"
         self.key = f"{self.prefix}{DOMAIN}/server/integration-bindings.json"
+        self.auth_key = f"{self.prefix}{DOMAIN}/server/auth-profile-registry.json"
         self.table = FakeTable(
             {
                 "pk": f"SITE#{DOMAIN}",
@@ -105,6 +108,8 @@ class PublishedPolicyTests(unittest.TestCase):
         self.assertEqual(resolved.version_id, self.version)
         self.assertEqual(resolved.prefix, self.prefix)
         self.assertEqual(resolved.bindings[0].connection_id, "stripe-primary")
+        self.assertEqual(resolved.admin_access, {"mode": "none"})
+        self.assertEqual(resolved.auth_registry, {})
         self.assertEqual(
             self.table.keys,
             [
@@ -149,6 +154,16 @@ class PublishedPolicyTests(unittest.TestCase):
                 with self.assertRaises(self.policy.PolicyResolutionError):
                     self.resolver().resolve(environment="test", domain=DOMAIN)
 
+        recursive = {}
+        recursive["self"] = recursive
+        with mock.patch(
+            "src.common.published_policy.json.loads",
+            side_effect=RecursionError("synthetic internals"),
+        ):
+            with self.assertRaises(self.policy.PolicyResolutionError) as failure:
+                self.resolver().resolve(environment="test", domain=DOMAIN)
+        self.assertNotIn("synthetic internals", str(failure.exception))
+
     def test_rejects_mode_mismatch_and_secret_material_without_echoing_it(self):
         self.s3.objects[self.key] = descriptor(mode="live")
         with self.assertRaises(self.policy.PolicyResolutionError) as mismatch:
@@ -161,6 +176,52 @@ class PublishedPolicyTests(unittest.TestCase):
         with self.assertRaises(self.policy.PolicyResolutionError) as secret:
             self.resolver().resolve(environment="test", domain=DOMAIN)
         self.assertNotIn("synthetic-private-value", str(secret.exception))
+
+    def test_auth_profile_access_loads_the_same_versioned_auth_registry(self):
+        self.s3.objects[self.key] = descriptor(
+            admin_access={
+                "mode": "auth-profile",
+                "authProfileId": "staff",
+                "capabilities": ["integration:read", "integration:manage"],
+            }
+        )
+        self.s3.objects[self.auth_key] = {
+            "version": 1,
+            "profiles": [
+                {
+                    "authProfileId": "staff",
+                    "status": "active",
+                    "tenantId": TENANT,
+                    "domain": DOMAIN,
+                    "environment": "test",
+                }
+            ],
+        }
+
+        resolved = self.resolver().resolve(environment="test", domain=DOMAIN)
+
+        self.assertEqual(resolved.admin_access["authProfileId"], "staff")
+        self.assertEqual(
+            resolved.admin_access["capabilities"],
+            ("integration:read", "integration:manage"),
+        )
+        self.assertEqual(resolved.auth_registry["profiles"][0]["tenantId"], TENANT)
+        self.assertEqual(self.s3.keys[-1]["Key"], self.auth_key)
+
+    def test_auth_profile_identifier_is_ascii_and_bounded(self):
+        self.s3.objects[self.key] = descriptor(
+            admin_access={
+                "mode": "auth-profile",
+                "authProfileId": "stáff",
+                "capabilities": ["integration:read"],
+            }
+        )
+        self.s3.objects[self.auth_key] = {
+            "version": 1,
+            "profiles": [{"authProfileId": "stáff"}],
+        }
+        with self.assertRaises(self.policy.PolicyResolutionError):
+            self.resolver().resolve(environment="test", domain=DOMAIN)
 
 
 if __name__ == "__main__":
