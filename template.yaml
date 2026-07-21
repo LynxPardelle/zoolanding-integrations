@@ -1,0 +1,268 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: Zoolanding generic draft-scoped Integrations foundation.
+
+Parameters:
+  EnvironmentName:
+    Type: String
+    AllowedValues:
+      - test
+      - prod
+
+Globals:
+  Function:
+    Runtime: python3.12
+    Architectures:
+      - arm64
+    MemorySize: 256
+    Timeout: 10
+    Environment:
+      Variables:
+        ENVIRONMENT_NAME:
+          Ref: EnvironmentName
+
+Resources:
+  IntegrationRegistryTable:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: pk
+          AttributeType: S
+        - AttributeName: sk
+          AttributeType: S
+      KeySchema:
+        - AttributeName: pk
+          KeyType: HASH
+        - AttributeName: sk
+          KeyType: RANGE
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      SSESpecification:
+        SSEEnabled: true
+      Tags:
+        - Key: Project
+          Value: Zoolandingpage
+        - Key: Component
+          Value: IntegrationsRegistry
+        - Key: Environment
+          Value:
+            Ref: EnvironmentName
+
+  WebhookReceiptTable:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: pk
+          AttributeType: S
+        - AttributeName: sk
+          AttributeType: S
+      KeySchema:
+        - AttributeName: pk
+          KeyType: HASH
+        - AttributeName: sk
+          KeyType: RANGE
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      SSESpecification:
+        SSEEnabled: true
+      TimeToLiveSpecification:
+        AttributeName: expiresAt
+        Enabled: true
+      StreamSpecification:
+        StreamViewType: NEW_IMAGE
+      Tags:
+        - Key: Project
+          Value: Zoolandingpage
+        - Key: Component
+          Value: IntegrationWebhookReceipts
+        - Key: Environment
+          Value:
+            Ref: EnvironmentName
+
+  WebhookIngressFailureQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      MessageRetentionPeriod: 1209600
+      SqsManagedSseEnabled: true
+
+  IntegrationOutgoingFailureQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      MessageRetentionPeriod: 1209600
+      SqsManagedSseEnabled: true
+
+  IntegrationEventsTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      Tags:
+        - Key: Project
+          Value: Zoolandingpage
+        - Key: Component
+          Value: IntegrationEvents
+        - Key: Environment
+          Value:
+            Ref: EnvironmentName
+
+  WebhookIngressLogGroup:
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      LogGroupName:
+        Fn::Sub: /aws/lambda/${AWS::StackName}-webhook-ingress-stream
+      RetentionInDays: 30
+
+  IntegrationOutgoingLogGroup:
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      LogGroupName:
+        Fn::Sub: /aws/lambda/${AWS::StackName}-integration-outgoing-stream
+      RetentionInDays: 30
+
+  StreamBoundaryRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: IntegrationsPendingStreamBoundary
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:DescribeStream
+                  - dynamodb:GetRecords
+                  - dynamodb:GetShardIterator
+                  - dynamodb:ListStreams
+                Resource:
+                  Fn::GetAtt:
+                    - WebhookReceiptTable
+                    - StreamArn
+              - Effect: Allow
+                Action:
+                  - sqs:SendMessage
+                Resource:
+                  - Fn::GetAtt:
+                      - WebhookIngressFailureQueue
+                      - Arn
+                  - Fn::GetAtt:
+                      - IntegrationOutgoingFailureQueue
+                      - Arn
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource:
+                  - Fn::Sub: arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/${AWS::StackName}-webhook-ingress-stream:*
+                  - Fn::Sub: arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/${AWS::StackName}-integration-outgoing-stream:*
+
+  WebhookIngressStreamFunction:
+    Type: AWS::Serverless::Function
+    DependsOn:
+      - WebhookIngressLogGroup
+    Properties:
+      FunctionName:
+        Fn::Sub: ${AWS::StackName}-webhook-ingress-stream
+      CodeUri: src/
+      Handler: handlers.pending_stream.lambda_handler
+      Description: Fails closed until verified webhook event processing is implemented.
+      Role:
+        Fn::GetAtt:
+          - StreamBoundaryRole
+          - Arn
+      Environment:
+        Variables:
+          STREAM_KIND: ingress
+      Events:
+        PendingIngress:
+          Type: DynamoDB
+          Properties:
+            Stream:
+              Fn::GetAtt:
+                - WebhookReceiptTable
+                - StreamArn
+            StartingPosition: LATEST
+            BatchSize: 10
+            BisectBatchOnFunctionError: true
+            MaximumRetryAttempts: 5
+            MaximumRecordAgeInSeconds: 3600
+            FunctionResponseTypes:
+              - ReportBatchItemFailures
+            FilterCriteria:
+              Filters:
+                - Pattern: '{"eventName":["INSERT","MODIFY"],"dynamodb":{"NewImage":{"itemType":{"S":["WebhookIngressOutbox"]},"processingStatus":{"S":["pending"]}}}}'
+            DestinationConfig:
+              OnFailure:
+                Type: SQS
+                Destination:
+                  Fn::GetAtt:
+                    - WebhookIngressFailureQueue
+                    - Arn
+
+  IntegrationOutgoingStreamFunction:
+    Type: AWS::Serverless::Function
+    DependsOn:
+      - IntegrationOutgoingLogGroup
+    Properties:
+      FunctionName:
+        Fn::Sub: ${AWS::StackName}-integration-outgoing-stream
+      CodeUri: src/
+      Handler: handlers.pending_stream.lambda_handler
+      Description: Fails closed until verified Integration Events relay is implemented.
+      Role:
+        Fn::GetAtt:
+          - StreamBoundaryRole
+          - Arn
+      Environment:
+        Variables:
+          STREAM_KIND: outgoing
+      Events:
+        PendingOutgoing:
+          Type: DynamoDB
+          Properties:
+            Stream:
+              Fn::GetAtt:
+                - WebhookReceiptTable
+                - StreamArn
+            StartingPosition: LATEST
+            BatchSize: 10
+            BisectBatchOnFunctionError: true
+            MaximumRetryAttempts: 5
+            MaximumRecordAgeInSeconds: 3600
+            FunctionResponseTypes:
+              - ReportBatchItemFailures
+            FilterCriteria:
+              Filters:
+                - Pattern: '{"eventName":["INSERT","MODIFY"],"dynamodb":{"NewImage":{"itemType":{"S":["IntegrationEventOutbox"]},"deliveryStatus":{"S":["pending"]}}}}'
+            DestinationConfig:
+              OnFailure:
+                Type: SQS
+                Destination:
+                  Fn::GetAtt:
+                    - IntegrationOutgoingFailureQueue
+                    - Arn
+
+Outputs:
+  IntegrationRegistryTableName:
+    Value:
+      Ref: IntegrationRegistryTable
+  WebhookReceiptTableName:
+    Value:
+      Ref: WebhookReceiptTable
+  IntegrationEventsTopicArn:
+    Value:
+      Ref: IntegrationEventsTopic
