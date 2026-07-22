@@ -1,6 +1,6 @@
 # Zoolanding Integrations
 
-Generic, server-only connection, provider-mapping, confirmed-provider-event, bulk subscription-migration, and SMTP connection-metadata service for Zoolanding drafts. Phases 5 and 6 are implemented and verified locally; nothing in this repository is deployed or provider-activated.
+Generic, server-only connection, provider-mapping, confirmed-provider-event, bulk subscription-migration, and SMTP connection-metadata service for Zoolanding drafts. Phases 5 and 6 plus the Phase 8 deployment-readiness surface are implemented locally; nothing in this repository is deployed or provider-activated.
 
 ## Implemented local scope
 
@@ -83,6 +83,43 @@ Production subscription mutations require an exact server-owned tax approval bef
 
 Hosted Checkout and Customer Portal URLs are validated ephemeral `no-store` responses. They are not persisted in Registry mappings, receipts, events, logs, examples, or documentation.
 
+## Phase 8 deployment readiness
+
+CI now runs on every pushed branch and every pull request. Promotion remains `dev -> test -> main`; the only deployment profiles and workflows are `test` and `production`. Each deployment workflow proves the exact two-parent merged pull request before building, then repeats that proof before requesting AWS credentials. The validated SAM build is transferred to the deployment job with a closed SHA-256 manifest. OIDC is available only to the environment-protected deployment job; CI and validation jobs have read-only GitHub permissions and no AWS credential step. There is no AWS `dev` profile or workflow.
+
+The deployment fails closed until these existing Config and Auth SSM parameters contain the real cross-service resource names for the target environment:
+
+- `/zoolanding/{environment}/config/registry-table-name`
+- `/zoolanding/{environment}/config/payload-bucket-name`
+- `/zoolanding/{environment}/auth/session-table-name`
+- `/zoolanding/{environment}/auth/user-state-table-name`
+
+The OIDC deployment role needs `ssm:GetParameter` only for those four literal parameter names so the workflow can reject malformed resolved table or bucket values before CloudFormation. The CloudFormation execution role needs `ssm:GetParameters` for those same literal names during SSM parameter resolution. Neither role receives a wildcard SSM read, and Config/Auth writers must not be shared with the deployment roles so the values cannot change across the validation/deployment boundary.
+
+The Integrations stack publishes only its safe composition identifiers at `/zoolanding/{environment}/services/integrations/api-id` and `/zoolanding/{environment}/topics/integration-events-arn`. It does not publish secrets, claim hashes, credentials, provider payloads, or customer data.
+
+Each protected GitHub environment must provide `AWS_ROLE_ARN`, `AWS_CLOUDFORMATION_ROLE_ARN`, `INTERNAL_CALLER_ARNS`, `SMTP_ACTIVATION_CALLER_ARNS`, and `ALARM_TOPIC_ARN` as environment variables, plus `SMTP_TEST_SHARED_ACCOUNT_CLAIM_HASH` as an environment secret. Both caller lists accept only exact comma-separated IAM role ARNs. Runtime STS assumed-role identities are normalized back to their exact configured IAM role ARN; users, federated users, wildcards, malformed sessions, and partially invalid lists are rejected. Do not put any real value from these settings in this repository.
+
+Resolve the cross-service dependency without a permissive placeholder: create the named consumer roles first with no Integrations invoke grant, place their exact IAM role ARNs in the protected environment settings, deploy Integrations, then let each consumer read the published API ID and add only its literal `execute-api:Invoke` routes. If the Commerce, Notifications, Config, Auth, alarm topic, OIDC, or CloudFormation execution-role inputs do not exist, deployment remains blocked. A missing dependency is not replaced by `*`, a temporary principal, or an invented ARN.
+
+The template sends API 5xx, webhook Lambda errors/throttles, migration worker errors/throttles, signed-webhook age, signature failures, test/live mismatches, migration queue age/backlog, and migration dead-letter age/depth to the exact `ALARM_TOPIC_ARN`. Custom metrics use the closed `Zoolanding/Integrations` namespace with only the environment dimension; no draft, account, email, payload, or credential data is emitted.
+
+After a controlled deployment and exact caller-policy bootstrap, the read-only readiness smoke signs `POST /internal/v1/integrations/connection-resolve` through the default AWS credential chain. It never accepts credentials on the command line and prints only status, attempt count, and the closed classifications `ready`, `missing_input`, `auth_failure`, `propagation_delay`, `configuration_failure`, or `provider_failure`.
+
+```powershell
+$env:ZLP_INTEGRATIONS_SMOKE_API_URL = 'https://{api-id}.execute-api.{region}.amazonaws.com/test'
+$env:ZLP_INTEGRATIONS_SMOKE_TENANT_ID = '{safe-tenant-id}'
+$env:ZLP_INTEGRATIONS_SMOKE_DRAFT_ID = '{safe-draft-id}'
+$env:ZLP_INTEGRATIONS_SMOKE_DOMAIN = '{canonical-domain}'
+$env:ZLP_INTEGRATIONS_SMOKE_CONNECTION_ID = '{active-smtp-connection-id}'
+$env:AWS_REGION = '{region}'
+python tools/integration_platform_readiness_smoke.py
+```
+
+An optional `ZLP_INTEGRATIONS_SMOKE_PROPAGATION_UNTIL_EPOCH` may classify an initial 404 as propagation delay for at most 15 minutes. It never turns an authentication or server error into success.
+
+No AWS deployment was performed as part of this implementation. No provider endpoint, secret, OIDC role, alarm destination, or cross-service resource has been claimed as present or working.
+
 ## Runtime dependencies
 
 - `boto3==1.39.13` matches the approved Zoolanding Python service baseline.
@@ -91,15 +128,16 @@ Hosted Checkout and Customer Portal URLs are validated ephemeral `no-store` resp
 
 ## Local verification
 
-The current Phase 6 tree passes 282 unit/contract tests, dependency audit, Python compilation, SAM lint, and an uncached SAM build of all 24 functions. No deployment, SMTP send, secret read, or provider-backed proof is claimed.
+The Phase 8 readiness tree passes 304 unit/contract tests, dependency audit, Python compilation, workflow lint, SAM lint, an uncached build, and import verification for all 24 Lambda handlers. No deployment, SMTP send, secret read, or provider-backed proof is claimed.
 
 ```powershell
 python -m pip install --requirement requirements-dev.txt
 python -m unittest discover -s tests -p "test_*.py" -v
-python -m pip_audit --requirement requirements-dev.txt
-python -m compileall -q src tests
+python -m pip_audit --requirement requirements.txt
+python -m compileall -q src tools tests
 sam validate --lint
 sam build --no-cached
+python tools/verify_sam_build.py
 ```
 
 A local SAM build requires the official Python 3.13 installation, including its `DLLs` and `Scripts` directories, ahead of Windows app aliases on `PATH`. Remove the local `uv` shim from `PATH` for this command if it shadows that interpreter; the declared production runtime is not relaxed to match another workstation interpreter.
@@ -107,7 +145,7 @@ A local SAM build requires the official Python 3.13 installation, including its 
 ## Closed rollout boundary
 
 - Phase 5 bulk subscription migration and the Phase 6 SMTP activation/resolution boundary are locally implemented. Provider-backed behavior and operational scale remain unproven until deployment and controlled environment testing.
-- Phase 8 owns AWS deployment, exact cross-service IAM identities, queues/tables/topics, alarms, quotas, environment credentials, webhook configuration, and provider-backed end-to-end/failure testing.
+- Phase 8 now provides the local CI/CD, exact cross-service input, least-privilege IAM, alarm, metric, and redacted-smoke surfaces. Actual AWS provisioning, environment credentials, webhook configuration, quotas, and provider-backed end-to-end/failure proof remain deployment gates.
 - Phase 9 owns per-draft pilot configuration, production tax/live approval, and activation.
 
-There is no AWS `dev` stack, deployment workflow/profile, live credential, connected account, webhook endpoint, provider call, browser QA, end-to-end Stripe proof, or pilot activation recorded through Phase 5. Deployment and live activation remain NO-GO until their later gates are explicitly approved and verified.
+There is no AWS `dev` stack, deployment workflow/profile, live credential, connected account, webhook endpoint, provider call, browser QA, end-to-end Stripe proof, or pilot activation recorded. Deployment and live activation remain NO-GO until their later gates are explicitly approved and verified.

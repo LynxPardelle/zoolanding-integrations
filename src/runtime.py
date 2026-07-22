@@ -476,6 +476,10 @@ def stripe_webhook_runtime() -> dict[str, Any]:
     except Exception:
         raise RuntimeCompositionError("Runtime dependencies are unavailable") from None
     secret = response.get("SecretString") if isinstance(response, dict) else None
+    try:
+        from common.metrics import emit_metric
+    except ModuleNotFoundError:
+        from src.common.metrics import emit_metric
     return {
         "verifier": StripeWebhookVerifier(secret),
         "registry": _registry(boto3),
@@ -485,6 +489,9 @@ def stripe_webhook_runtime() -> dict[str, Any]:
         ),
         "environment": environment,
         "now_epoch": int(time.time()),
+        "metric_sink": lambda name, value: emit_metric(
+            name, value, environment=environment
+        ),
     }
 
 

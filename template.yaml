@@ -9,27 +9,26 @@ Parameters:
       - test
       - production
   ConfigRegistryTableName:
-    Type: String
-    MinLength: 3
+    Type: AWS::SSM::Parameter::Value<String>
   ConfigPayloadsBucketName:
-    Type: String
-    MinLength: 3
+    Type: AWS::SSM::Parameter::Value<String>
   AuthSessionTableName:
-    Type: String
-    MinLength: 3
+    Type: AWS::SSM::Parameter::Value<String>
   AuthUserStateTableName:
-    Type: String
-    MinLength: 3
+    Type: AWS::SSM::Parameter::Value<String>
   InternalCallerArns:
     Type: String
-    MinLength: 20
+    AllowedPattern: '^arn:(aws|aws-us-gov|aws-cn):iam::[0-9]{12}:role/[A-Za-z0-9+=,.@_/-]+(?:,arn:(aws|aws-us-gov|aws-cn):iam::[0-9]{12}:role/[A-Za-z0-9+=,.@_/-]+)*$'
   SmtpTestSharedAccountClaimHash:
     Type: String
     AllowedPattern: '^[a-f0-9]{64}$'
     NoEcho: true
   SmtpActivationCallerArns:
     Type: String
-    MinLength: 20
+    AllowedPattern: '^arn:(aws|aws-us-gov|aws-cn):iam::[0-9]{12}:role/[A-Za-z0-9+=,.@_/-]+(?:,arn:(aws|aws-us-gov|aws-cn):iam::[0-9]{12}:role/[A-Za-z0-9+=,.@_/-]+)*$'
+  AlarmTopicArn:
+    Type: String
+    AllowedPattern: '^arn:(aws|aws-us-gov|aws-cn):sns:[a-z0-9-]+:[0-9]{12}:[A-Za-z0-9_.-]+$'
 
 Globals:
   Function:
@@ -176,12 +175,34 @@ Resources:
           Value:
             Ref: EnvironmentName
 
+  IntegrationEventsTopicArnParameter:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name:
+        Fn::Sub: /zoolanding/${EnvironmentName}/topics/integration-events-arn
+      Type: String
+      Value:
+        Ref: IntegrationEventsTopic
+      Description: Published ARN for the Integrations event topic.
+
   IntegrationApi:
     Type: AWS::Serverless::Api
     Properties:
+      Name:
+        Fn::Sub: ${AWS::StackName}-api
       StageName:
         Ref: EnvironmentName
       EndpointConfiguration: REGIONAL
+
+  IntegrationApiIdParameter:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name:
+        Fn::Sub: /zoolanding/${EnvironmentName}/services/integrations/api-id
+      Type: String
+      Value:
+        Ref: IntegrationApi
+      Description: Published API identifier for trusted service composition.
 
   ControlPlaneLogGroup:
     Type: AWS::Logs::LogGroup
@@ -218,7 +239,33 @@ Resources:
           - Effect: Allow
             Action: s3:GetObject
             Resource:
-              Fn::Sub: arn:${AWS::Partition}:s3:::${ConfigPayloadsBucketName}/sites/*
+              Fn::Sub: arn:${AWS::Partition}:s3:::${ConfigPayloadsBucketName}/sites/*/versions/*/*/server/integration-bindings.json
+
+  PublishedAuthProfileReadPolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Action: s3:GetObject
+            Resource:
+              Fn::Sub: arn:${AWS::Partition}:s3:::${ConfigPayloadsBucketName}/sites/*/versions/*/*/server/auth-profile-registry.json
+
+  PublishedCommercePolicyReadPolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Action: dynamodb:GetItem
+            Resource:
+              Fn::Sub: arn:${AWS::Partition}:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${ConfigRegistryTableName}
+          - Effect: Allow
+            Action: s3:GetObject
+            Resource:
+              Fn::Sub: arn:${AWS::Partition}:s3:::${ConfigPayloadsBucketName}/sites/*/versions/*/*/server/commerce.json
 
   AuthAdminReadPolicy:
     Type: AWS::IAM::ManagedPolicy
@@ -246,7 +293,6 @@ Resources:
               - Fn::GetAtt:
                   - IntegrationRegistryTable
                   - Arn
-              - Fn::Sub: ${IntegrationRegistryTable.Arn}/index/*
 
   BrowserReadRole:
     Type: AWS::IAM::Role
@@ -261,6 +307,7 @@ Resources:
       ManagedPolicyArns:
         - Ref: ControlPlaneLoggingPolicy
         - Ref: PublishedPolicyReadPolicy
+        - Ref: PublishedAuthProfileReadPolicy
         - Ref: AuthAdminReadPolicy
         - Ref: IntegrationRegistryReadPolicy
 
@@ -277,6 +324,7 @@ Resources:
       ManagedPolicyArns:
         - Ref: ControlPlaneLoggingPolicy
         - Ref: PublishedPolicyReadPolicy
+        - Ref: PublishedAuthProfileReadPolicy
         - Ref: AuthAdminReadPolicy
         - Ref: IntegrationRegistryReadPolicy
       Policies:
@@ -306,6 +354,7 @@ Resources:
       ManagedPolicyArns:
         - Ref: ControlPlaneLoggingPolicy
         - Ref: PublishedPolicyReadPolicy
+        - Ref: PublishedAuthProfileReadPolicy
         - Ref: AuthAdminReadPolicy
         - Ref: IntegrationRegistryReadPolicy
       Policies:
@@ -325,7 +374,7 @@ Resources:
               - Effect: Allow
                 Action: secretsmanager:GetSecretValue
                 Resource:
-                  Fn::Sub: arn:${AWS::Partition}:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:/zoolanding/${EnvironmentName}/integrations/stripe/connect-platform*
+                  Fn::Sub: arn:${AWS::Partition}:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:/zoolanding/${EnvironmentName}/integrations/stripe/connect-platform-??????
 
   ConnectionAdminRole:
     Type: AWS::IAM::Role
@@ -355,8 +404,8 @@ Resources:
               - Effect: Allow
                 Action: secretsmanager:DescribeSecret
                 Resource:
-                  - Fn::Sub: arn:${AWS::Partition}:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:/zoolanding/${EnvironmentName}/integrations/stripe/connect-platform*
-                  - Fn::Sub: arn:${AWS::Partition}:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:/zoolanding/${EnvironmentName}/*/*/notifications/smtp/*
+                  - Fn::Sub: arn:${AWS::Partition}:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:/zoolanding/${EnvironmentName}/integrations/stripe/connect-platform-??????
+                  - Fn::Sub: arn:${AWS::Partition}:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:/zoolanding/${EnvironmentName}/*/*/notifications/smtp/*-??????
 
   InternalConnectionResolveRole:
     Type: AWS::IAM::Role
@@ -400,7 +449,7 @@ Resources:
               - Effect: Allow
                 Action: secretsmanager:DescribeSecret
                 Resource:
-                  Fn::Sub: arn:${AWS::Partition}:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:/zoolanding/${EnvironmentName}/*/*/notifications/smtp/*
+                  Fn::Sub: arn:${AWS::Partition}:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:/zoolanding/${EnvironmentName}/*/*/notifications/smtp/*-??????
 
   InternalProviderCommandRole:
     Type: AWS::IAM::Role
@@ -415,7 +464,7 @@ Resources:
       ManagedPolicyArns:
         - Ref: ControlPlaneLoggingPolicy
         - Ref: IntegrationRegistryReadPolicy
-        - Ref: PublishedPolicyReadPolicy
+        - Ref: PublishedCommercePolicyReadPolicy
       Policies:
         - PolicyName: ScopedProviderCommands
           PolicyDocument:
@@ -433,7 +482,7 @@ Resources:
               - Effect: Allow
                 Action: secretsmanager:GetSecretValue
                 Resource:
-                  Fn::Sub: arn:${AWS::Partition}:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:/zoolanding/${EnvironmentName}/integrations/stripe/connect-platform*
+                  Fn::Sub: arn:${AWS::Partition}:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:/zoolanding/${EnvironmentName}/integrations/stripe/connect-platform-??????
 
   InternalMigrationBoundaryRole:
     Type: AWS::IAM::Role
@@ -447,7 +496,6 @@ Resources:
             Action: sts:AssumeRole
       ManagedPolicyArns:
         - Ref: ControlPlaneLoggingPolicy
-        - Ref: PublishedPolicyReadPolicy
       Policies:
         - PolicyName: ScopedMigrationCommands
           PolicyDocument:
@@ -466,7 +514,7 @@ Resources:
                 Action: dynamodb:Query
                 Resource:
                   - Fn::GetAtt: [IntegrationRegistryTable, Arn]
-                  - Fn::Sub: ${IntegrationRegistryTable.Arn}/index/*
+                  - Fn::Sub: ${IntegrationRegistryTable.Arn}/index/MigrationWorkIndex
               - Effect: Allow
                 Action: sqs:SendMessage
                 Resource:
@@ -498,7 +546,6 @@ Resources:
             Action: sts:AssumeRole
       ManagedPolicyArns:
         - Ref: ControlPlaneLoggingPolicy
-        - Ref: PublishedPolicyReadPolicy
       Policies:
         - PolicyName: ScopedSubscriptionMigrationWork
           PolicyDocument:
@@ -517,7 +564,7 @@ Resources:
                 Action: dynamodb:Query
                 Resource:
                   - Fn::GetAtt: [IntegrationRegistryTable, Arn]
-                  - Fn::Sub: ${IntegrationRegistryTable.Arn}/index/*
+                  - Fn::Sub: ${IntegrationRegistryTable.Arn}/index/MigrationWorkIndex
               - Effect: Allow
                 Action:
                   - sqs:ReceiveMessage
@@ -529,7 +576,7 @@ Resources:
               - Effect: Allow
                 Action: secretsmanager:GetSecretValue
                 Resource:
-                  Fn::Sub: arn:${AWS::Partition}:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:/zoolanding/${EnvironmentName}/integrations/stripe/connect-platform*
+                  Fn::Sub: arn:${AWS::Partition}:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:/zoolanding/${EnvironmentName}/integrations/stripe/connect-platform-??????
 
   WebhookIngressLogGroup:
     Type: AWS::Logs::LogGroup
@@ -592,7 +639,7 @@ Resources:
               - Effect: Allow
                 Action: secretsmanager:GetSecretValue
                 Resource:
-                  Fn::Sub: arn:${AWS::Partition}:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:/zoolanding/${EnvironmentName}/integrations/stripe/connect-webhook*
+                  Fn::Sub: arn:${AWS::Partition}:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:/zoolanding/${EnvironmentName}/integrations/stripe/connect-webhook-??????
 
   WebhookIngressStreamRole:
     Type: AWS::IAM::Role
@@ -640,7 +687,7 @@ Resources:
               - Effect: Allow
                 Action: secretsmanager:GetSecretValue
                 Resource:
-                  Fn::Sub: arn:${AWS::Partition}:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:/zoolanding/${EnvironmentName}/integrations/stripe/connect-platform*
+                  Fn::Sub: arn:${AWS::Partition}:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:/zoolanding/${EnvironmentName}/integrations/stripe/connect-platform-??????
               - Effect: Allow
                 Action:
                   - logs:CreateLogStream
@@ -1258,7 +1305,256 @@ Resources:
                     - IntegrationOutgoingFailureQueue
                     - Arn
 
+  Api5xxAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: Integrations API returned a server error.
+      Namespace: AWS/ApiGateway
+      MetricName: 5XXError
+      Dimensions:
+        - Name: ApiName
+          Value:
+            Fn::Sub: ${AWS::StackName}-api
+        - Name: Stage
+          Value:
+            Ref: EnvironmentName
+      Statistic: Sum
+      Period: 60
+      EvaluationPeriods: 1
+      DatapointsToAlarm: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - Ref: AlarmTopicArn
+
+  StripeWebhookErrorsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: Stripe webhook Lambda returned an error.
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions:
+        - Name: FunctionName
+          Value:
+            Ref: StripeWebhookFunction
+      Statistic: Sum
+      Period: 60
+      EvaluationPeriods: 1
+      DatapointsToAlarm: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - Ref: AlarmTopicArn
+
+  StripeWebhookThrottlesAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: Stripe webhook Lambda was throttled.
+      Namespace: AWS/Lambda
+      MetricName: Throttles
+      Dimensions:
+        - Name: FunctionName
+          Value:
+            Ref: StripeWebhookFunction
+      Statistic: Sum
+      Period: 60
+      EvaluationPeriods: 1
+      DatapointsToAlarm: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - Ref: AlarmTopicArn
+
+  MigrationWorkerErrorsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: Subscription migration worker returned an error.
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions:
+        - Name: FunctionName
+          Value:
+            Ref: SubscriptionMigrationWorkerFunction
+      Statistic: Sum
+      Period: 60
+      EvaluationPeriods: 1
+      DatapointsToAlarm: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - Ref: AlarmTopicArn
+
+  MigrationWorkerThrottlesAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: Subscription migration worker was throttled.
+      Namespace: AWS/Lambda
+      MetricName: Throttles
+      Dimensions:
+        - Name: FunctionName
+          Value:
+            Ref: SubscriptionMigrationWorkerFunction
+      Statistic: Sum
+      Period: 60
+      EvaluationPeriods: 1
+      DatapointsToAlarm: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - Ref: AlarmTopicArn
+
+  WebhookAgeAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: A signed Stripe webhook arrived close to the replay boundary.
+      Namespace: Zoolanding/Integrations
+      MetricName: WebhookAgeSeconds
+      Dimensions:
+        - Name: Environment
+          Value:
+            Ref: EnvironmentName
+      Statistic: Maximum
+      Period: 60
+      EvaluationPeriods: 1
+      DatapointsToAlarm: 1
+      Threshold: 240
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - Ref: AlarmTopicArn
+
+  WebhookSignatureFailuresAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: Stripe webhook signature verification failed.
+      Namespace: Zoolanding/Integrations
+      MetricName: WebhookSignatureFailures
+      Dimensions:
+        - Name: Environment
+          Value:
+            Ref: EnvironmentName
+      Statistic: Sum
+      Period: 60
+      EvaluationPeriods: 1
+      DatapointsToAlarm: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - Ref: AlarmTopicArn
+
+  MigrationQueueAgeAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: Subscription migration work is older than the operational target.
+      Namespace: AWS/SQS
+      MetricName: ApproximateAgeOfOldestMessage
+      Dimensions:
+        - Name: QueueName
+          Value:
+            Fn::GetAtt: [SubscriptionMigrationWorkQueue, QueueName]
+      Statistic: Maximum
+      Period: 60
+      EvaluationPeriods: 2
+      DatapointsToAlarm: 2
+      Threshold: 300
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - Ref: AlarmTopicArn
+
+  MigrationBacklogAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: Subscription migration work queue backlog is elevated.
+      Namespace: AWS/SQS
+      MetricName: ApproximateNumberOfMessagesVisible
+      Dimensions:
+        - Name: QueueName
+          Value:
+            Fn::GetAtt: [SubscriptionMigrationWorkQueue, QueueName]
+      Statistic: Maximum
+      Period: 60
+      EvaluationPeriods: 5
+      DatapointsToAlarm: 3
+      Threshold: 25
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - Ref: AlarmTopicArn
+
+  MigrationDlqAgeAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: A failed subscription migration remains in the dead-letter queue.
+      Namespace: AWS/SQS
+      MetricName: ApproximateAgeOfOldestMessage
+      Dimensions:
+        - Name: QueueName
+          Value:
+            Fn::GetAtt: [SubscriptionMigrationDeadLetterQueue, QueueName]
+      Statistic: Maximum
+      Period: 60
+      EvaluationPeriods: 1
+      DatapointsToAlarm: 1
+      Threshold: 60
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - Ref: AlarmTopicArn
+
+  MigrationDlqDepthAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: A failed subscription migration entered the dead-letter queue.
+      Namespace: AWS/SQS
+      MetricName: ApproximateNumberOfMessagesVisible
+      Dimensions:
+        - Name: QueueName
+          Value:
+            Fn::GetAtt: [SubscriptionMigrationDeadLetterQueue, QueueName]
+      Statistic: Maximum
+      Period: 60
+      EvaluationPeriods: 1
+      DatapointsToAlarm: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - Ref: AlarmTopicArn
+
+  TestLiveMismatchAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: Stripe webhook mode did not match the deployed environment.
+      Namespace: Zoolanding/Integrations
+      MetricName: TestLiveMismatch
+      Dimensions:
+        - Name: Environment
+          Value:
+            Ref: EnvironmentName
+      Statistic: Sum
+      Period: 60
+      EvaluationPeriods: 1
+      DatapointsToAlarm: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - Ref: AlarmTopicArn
+
 Outputs:
+  IntegrationApiId:
+    Value:
+      Ref: IntegrationApi
+  IntegrationApiIdParameterName:
+    Value:
+      Ref: IntegrationApiIdParameter
   IntegrationRegistryTableName:
     Value:
       Ref: IntegrationRegistryTable
@@ -1268,3 +1564,6 @@ Outputs:
   IntegrationEventsTopicArn:
     Value:
       Ref: IntegrationEventsTopic
+  IntegrationEventsTopicArnParameterName:
+    Value:
+      Ref: IntegrationEventsTopicArnParameter

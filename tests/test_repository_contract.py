@@ -131,13 +131,12 @@ class RepositoryContractTests(unittest.TestCase):
         )
         self.assertEqual(runtime_result.returncode, 0, runtime_result.stderr)
 
-    def test_repository_has_no_dev_or_deployment_surface(self):
-        self.assertFalse((ROOT / "samconfig.toml").exists())
+    def test_repository_has_protected_test_and_production_deployment_surfaces_only(self):
+        self.assertTrue((ROOT / "samconfig.toml").exists())
+        self.assertTrue((ROOT / ".github" / "workflows" / "ci.yml").exists())
         self.assertFalse((ROOT / ".github" / "workflows" / "deploy-dev.yml").exists())
-        self.assertFalse((ROOT / ".github" / "workflows" / "deploy-test.yml").exists())
-        self.assertFalse(
-            (ROOT / ".github" / "workflows" / "deploy-production.yml").exists()
-        )
+        self.assertTrue((ROOT / ".github" / "workflows" / "deploy-test.yml").exists())
+        self.assertTrue((ROOT / ".github" / "workflows" / "deploy-production.yml").exists())
         for path in ROOT.rglob("*"):
             if path.is_file() and ".git" not in path.parts:
                 self.assertNotIn("deploy-dev", path.name.lower())

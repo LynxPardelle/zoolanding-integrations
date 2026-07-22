@@ -56,13 +56,21 @@ class Store:
         return {"status": "queued", "duplicate": False}
 
 
+class Metrics:
+    def __init__(self):
+        self.values = []
+
+    def __call__(self, name, value):
+        self.values.append((name, value))
+
+
 class StripeWebhookHandlerTests(unittest.TestCase):
     def handler(self):
         from src.handlers import stripe_webhook
 
         return stripe_webhook
 
-    def call(self, event=None, *, verifier=None, registry=None, store=None):
+    def call(self, event=None, *, verifier=None, registry=None, store=None, metrics=None):
         return self.handler().handle_request(
             event or api_event(),
             verifier=verifier or Verifier(),
@@ -70,6 +78,7 @@ class StripeWebhookHandlerTests(unittest.TestCase):
             store=store or Store(),
             environment="test",
             now_epoch=1_800_000_000,
+            metric_sink=metrics or Metrics(),
         )
 
     def test_supported_event_verifies_exact_raw_bytes_and_persists_only_metadata(self):
@@ -122,6 +131,46 @@ class StripeWebhookHandlerTests(unittest.TestCase):
                 self.assertEqual(response["statusCode"], expected)
                 self.assertNotIn("signature", response["body"])
                 self.assertNotIn("acct_synthetic", response["body"])
+
+    def test_emits_only_redacted_webhook_age_signature_and_mode_metrics(self):
+        accepted_metrics = Metrics()
+        response = self.call(metrics=accepted_metrics)
+        self.assertEqual(response["statusCode"], 200)
+        self.assertEqual(accepted_metrics.values, [("WebhookAgeSeconds", 5)])
+
+        signature_metrics = Metrics()
+        response = self.call(
+            verifier=Verifier(error=ValueError("private signature detail")),
+            metrics=signature_metrics,
+        )
+        self.assertEqual(response["statusCode"], 400)
+        self.assertEqual(signature_metrics.values, [("WebhookSignatureFailures", 1)])
+
+        missing_signature = api_event()
+        missing_signature["headers"] = {}
+        missing_metrics = Metrics()
+        response = self.call(event=missing_signature, metrics=missing_metrics)
+        self.assertEqual(response["statusCode"], 400)
+        self.assertEqual(missing_metrics.values, [("WebhookSignatureFailures", 1)])
+
+        mismatch_metrics = Metrics()
+        response = self.call(
+            verifier=Verifier(result={**json.loads(RAW), "livemode": True}),
+            metrics=mismatch_metrics,
+        )
+        self.assertEqual(response["statusCode"], 409)
+        self.assertEqual(
+            mismatch_metrics.values,
+            [("WebhookAgeSeconds", 5), ("TestLiveMismatch", 1)],
+        )
+
+    def test_metric_transport_failure_never_changes_ingress_result(self):
+        def unavailable_metric_sink(name, value):
+            del name, value
+            raise RuntimeError("metric transport unavailable")
+
+        response = self.call(metrics=unavailable_metric_sink)
+        self.assertEqual(response["statusCode"], 200)
 
 
 if __name__ == "__main__":
