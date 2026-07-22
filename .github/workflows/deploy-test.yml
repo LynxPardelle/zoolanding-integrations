@@ -157,6 +157,9 @@ jobs:
       INTERNAL_CALLER_ARNS: ${{ vars.INTERNAL_CALLER_ARNS }}
       SMTP_ACTIVATION_CALLER_ARNS: ${{ vars.SMTP_ACTIVATION_CALLER_ARNS }}
       ALARM_TOPIC_ARN: ${{ vars.ALARM_TOPIC_ARN }}
+      STRIPE_WEBHOOK_RATE_LIMIT: ${{ vars.STRIPE_WEBHOOK_RATE_LIMIT }}
+      STRIPE_WEBHOOK_BURST_LIMIT: ${{ vars.STRIPE_WEBHOOK_BURST_LIMIT }}
+      STRIPE_WEBHOOK_RESERVED_CONCURRENCY: ${{ vars.STRIPE_WEBHOOK_RESERVED_CONCURRENCY }}
       SMTP_TEST_SHARED_ACCOUNT_CLAIM_HASH: ${{ secrets.SMTP_TEST_SHARED_ACCOUNT_CLAIM_HASH }}
     steps:
       - name: Validate artifact metadata
@@ -261,15 +264,84 @@ jobs:
           topic_pattern='^arn:(aws|aws-us-gov|aws-cn):sns:[a-z0-9-]+:[0-9]{12}:[A-Za-z0-9_.-]+$'
           [[ "$AWS_ROLE_ARN" =~ $role_pattern ]]
           [[ "$AWS_CLOUDFORMATION_ROLE_ARN" =~ $role_pattern ]]
-          [[ "$INTERNAL_CALLER_ARNS" =~ $role_list_pattern ]]
+          [[ -z "$INTERNAL_CALLER_ARNS" || "$INTERNAL_CALLER_ARNS" =~ $role_list_pattern ]]
           [[ "$SMTP_ACTIVATION_CALLER_ARNS" =~ $role_list_pattern ]]
           [[ "$ALARM_TOPIC_ARN" =~ $topic_pattern ]]
           [[ "$SMTP_TEST_SHARED_ACCOUNT_CLAIM_HASH" =~ ^[a-f0-9]{64}$ ]]
+          [[ "$STRIPE_WEBHOOK_RATE_LIMIT" =~ ^[1-9][0-9]{0,2}$ ]]
+          [[ "$STRIPE_WEBHOOK_BURST_LIMIT" =~ ^[1-9][0-9]{0,2}$ ]]
+          [[ "$STRIPE_WEBHOOK_RESERVED_CONCURRENCY" =~ ^[1-9][0-9]?$ ]]
+          (( STRIPE_WEBHOOK_RATE_LIMIT <= 100 ))
+          (( STRIPE_WEBHOOK_BURST_LIMIT <= 200 ))
+          (( STRIPE_WEBHOOK_RESERVED_CONCURRENCY <= 20 ))
 
       - uses: aws-actions/configure-aws-credentials@517a711dbcd0e402f90c77e7e2f81e849156e31d # v6
         with:
           role-to-assume: ${{ env.AWS_ROLE_ARN }}
-          aws-region: us-east-1
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Validate OIDC account and regional ARN scope
+        shell: bash
+        run: |
+          set -euo pipefail
+          fail_scope() {
+            echo "::error::AWS identity or regional resource scope validation failed."
+            exit 1
+          }
+          identity="$(aws sts get-caller-identity --query '[Account,Arn]' --output text --no-cli-pager)"
+          IFS=$'\t' read -r oidc_account oidc_arn oidc_extra <<< "$identity"
+          test -z "$oidc_extra" || fail_scope
+          [[ "$oidc_account" =~ ^[0-9]{12}$ ]] || fail_scope
+          identity_pattern='^arn:(aws|aws-us-gov|aws-cn):sts::([0-9]{12}):assumed-role/[A-Za-z0-9+=,.@_-]{1,64}/[A-Za-z0-9+=,.@_-]{2,64}$'
+          [[ "$oidc_arn" =~ $identity_pattern ]] || fail_scope
+          oidc_partition="${BASH_REMATCH[1]}"
+          oidc_arn_account="${BASH_REMATCH[2]}"
+          test "$oidc_arn_account" = "$oidc_account" || fail_scope
+          [[ "$AWS_REGION" =~ ^[a-z]{2}(-gov)?-[a-z]+-[0-9]$ ]] || fail_scope
+          test "$AWS_DEFAULT_REGION" = "$AWS_REGION" || fail_scope
+          case "$oidc_partition" in
+            aws) [[ "$AWS_REGION" != us-gov-* && "$AWS_REGION" != cn-* ]] || fail_scope ;;
+            aws-us-gov) [[ "$AWS_REGION" == us-gov-* ]] || fail_scope ;;
+            aws-cn) [[ "$AWS_REGION" == cn-* ]] || fail_scope ;;
+            *) fail_scope ;;
+          esac
+          role_scope_pattern="^arn:${oidc_partition}:iam::${oidc_account}:role/[A-Za-z0-9+=,.@_/-]+$"
+          topic_scope_pattern="^arn:${oidc_partition}:sns:${AWS_REGION}:${oidc_account}:[A-Za-z0-9_.-]+$"
+          [[ "$AWS_ROLE_ARN" =~ $role_scope_pattern ]] || fail_scope
+          [[ "$AWS_CLOUDFORMATION_ROLE_ARN" =~ $role_scope_pattern ]] || fail_scope
+          [[ "$ALARM_TOPIC_ARN" =~ $topic_scope_pattern ]] || fail_scope
+          validate_role_list() {
+            local value="$1"
+            local role
+            local -a roles=()
+            [[ -z "$value" ]] && return 0
+            IFS=',' read -r -a roles <<< "$value"
+            for role in "${roles[@]}"; do
+              [[ "$role" =~ $role_scope_pattern ]] || fail_scope
+            done
+          }
+          validate_role_list "$INTERNAL_CALLER_ARNS"
+          validate_role_list "$SMTP_ACTIVATION_CALLER_ARNS"
+
+      - name: Enforce one-time disabled caller bootstrap
+        if: env.INTERNAL_CALLER_ARNS == ''
+        shell: bash
+        env:
+          STACK_NAME: zoolanding-integrations-test
+        run: |
+          set -euo pipefail
+          error_file="$RUNNER_TEMP/integrations-bootstrap-error.txt"
+          if aws cloudformation describe-stacks --stack-name "$STACK_NAME" --no-cli-pager >/dev/null 2>"$error_file"; then
+            rm -f "$error_file"
+            echo "::error::INTERNAL_CALLER_ARNS may be empty only for the first stack creation."
+            exit 1
+          fi
+          if ! grep -Eq 'Stack with id .* does not exist' "$error_file"; then
+            rm -f "$error_file"
+            echo "::error::Unable to prove that this is the first stack creation."
+            exit 1
+          fi
+          rm -f "$error_file"
 
       - name: Validate exact cross-service SSM values
         shell: bash
@@ -286,6 +358,36 @@ jobs:
           [[ "$payload_bucket" =~ ^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$ ]]
           [[ "$auth_session_table" =~ ^[A-Za-z0-9_.-]{3,255}$ ]]
           [[ "$auth_user_state_table" =~ ^[A-Za-z0-9_.-]{3,255}$ ]]
+          if [[ -n "$INTERNAL_CALLER_ARNS" ]]; then
+            role_pattern='^arn:(aws|aws-us-gov|aws-cn):iam::[0-9]{12}:role/[A-Za-z0-9+=,.@_/-]+$'
+            commerce_callers_result="$(aws ssm get-parameter --name "$prefix/services/commerce/integrations-caller-role-arns" --no-with-decryption --query 'Parameter.[Type,Value]' --output text --no-cli-pager)"
+            notifications_caller_result="$(aws ssm get-parameter --name "$prefix/services/notifications/smtp-worker-role-arn" --no-with-decryption --query 'Parameter.[Type,Value]' --output text --no-cli-pager)"
+            IFS=$'\t' read -r commerce_callers_type commerce_callers_value commerce_callers_extra <<< "$commerce_callers_result"
+            IFS=$'\t' read -r notifications_caller_type notifications_caller_value notifications_caller_extra <<< "$notifications_caller_result"
+            test "$commerce_callers_type" = "StringList"
+            test "$notifications_caller_type" = "String"
+            test -z "$commerce_callers_extra"
+            test -z "$notifications_caller_extra"
+            IFS=',' read -r -a commerce_callers <<< "$commerce_callers_value"
+            IFS=',' read -r -a configured_roles <<< "$INTERNAL_CALLER_ARNS"
+            test "${#commerce_callers[@]}" -eq 4
+            declare -A configured_callers=()
+            for role in "${configured_roles[@]}"; do
+              [[ "$role" =~ $role_pattern ]]
+              test -z "${configured_callers[$role]+x}"
+              configured_callers["$role"]=1
+            done
+            declare -A required_callers=()
+            for role in "${commerce_callers[@]}" "$notifications_caller_value"; do
+              [[ "$role" =~ $role_pattern ]]
+              test -z "${required_callers[$role]+x}"
+              required_callers["$role"]=1
+              if [[ -z "${configured_callers[$role]+x}" ]]; then
+                echo "::error::required caller is absent from INTERNAL_CALLER_ARNS"
+                exit 1
+              fi
+            done
+          fi
 
       - name: Deploy test
         shell: bash
@@ -294,7 +396,7 @@ jobs:
           sam deploy \
             --template-file .aws-sam/build/template.yaml \
             --stack-name zoolanding-integrations-test \
-            --region us-east-1 \
+            --region "$AWS_REGION" \
             --resolve-s3 \
             --s3-prefix zoolanding-integrations-test \
             --capabilities CAPABILITY_IAM \
@@ -310,4 +412,7 @@ jobs:
               "InternalCallerArns=$INTERNAL_CALLER_ARNS" \
               "SmtpTestSharedAccountClaimHash=$SMTP_TEST_SHARED_ACCOUNT_CLAIM_HASH" \
               "SmtpActivationCallerArns=$SMTP_ACTIVATION_CALLER_ARNS" \
+              "StripeWebhookRateLimit=$STRIPE_WEBHOOK_RATE_LIMIT" \
+              "StripeWebhookBurstLimit=$STRIPE_WEBHOOK_BURST_LIMIT" \
+              "StripeWebhookReservedConcurrency=$STRIPE_WEBHOOK_RESERVED_CONCURRENCY" \
               "AlarmTopicArn=$ALARM_TOPIC_ARN"

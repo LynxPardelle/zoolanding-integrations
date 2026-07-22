@@ -56,16 +56,41 @@ class ReadinessSmokeTests(unittest.TestCase):
                 self.assertEqual(result["classification"], classification)
                 self.assertEqual(result["ok"], ok)
                 self.assertEqual(result.get("httpStatus"), status)
-                self.assertEqual(set(result).issubset({"ok", "classification", "httpStatus", "attempts"}), True)
+                self.assertIn("environment", result)
+                self.assertIn("observedAtEpoch", result)
+                self.assertEqual(result["environment"], "test")
+                self.assertEqual(result["observedAtEpoch"], 1_800_000_000)
+                self.assertEqual(
+                    set(result),
+                    {
+                        "ok",
+                        "classification",
+                        "httpStatus",
+                        "attempts",
+                        "environment",
+                        "observedAtEpoch",
+                    },
+                )
 
     def test_missing_input_fails_before_transport(self):
         smoke = self.smoke()
         called = []
         values = environment()
         del values["ZLP_INTEGRATIONS_SMOKE_DOMAIN"]
-        result = smoke.run(values, sender=lambda request: called.append(request))
+        result = smoke.run(
+            values,
+            sender=lambda request: called.append(request),
+            now_epoch=lambda: 1_800_000_000,
+        )
         self.assertEqual(
-            result, {"ok": False, "classification": "missing_input", "attempts": 0}
+            result,
+            {
+                "ok": False,
+                "classification": "missing_input",
+                "attempts": 0,
+                "environment": None,
+                "observedAtEpoch": 1_800_000_000,
+            },
         )
         self.assertEqual(called, [])
 
@@ -79,22 +104,49 @@ class ReadinessSmokeTests(unittest.TestCase):
             ),
         }
         self.assertEqual(
-            smoke.run(values, sender=lambda request: called.append(request)),
-            {"ok": False, "classification": "missing_input", "attempts": 0},
+            smoke.run(
+                values,
+                sender=lambda request: called.append(request),
+                now_epoch=lambda: 1_800_000_000,
+            ),
+            {
+                "ok": False,
+                "classification": "missing_input",
+                "attempts": 0,
+                "environment": None,
+                "observedAtEpoch": 1_800_000_000,
+            },
         )
         self.assertEqual(called, [])
 
         self.assertEqual(
-            smoke.run(environment(), sender=lambda request: object()),
-            {"ok": False, "classification": "provider_failure", "attempts": 1},
+            smoke.run(
+                environment(),
+                sender=lambda request: object(),
+                now_epoch=lambda: 1_800_000_000,
+            ),
+            {
+                "ok": False,
+                "classification": "provider_failure",
+                "attempts": 1,
+                "environment": "test",
+                "observedAtEpoch": 1_800_000_000,
+            },
         )
 
         self.assertEqual(
             smoke.run(
                 environment(),
                 sender=lambda request: (_ for _ in ()).throw(smoke.SmokeAuthError()),
+                now_epoch=lambda: 1_800_000_000,
             ),
-            {"ok": False, "classification": "auth_failure", "attempts": 1},
+            {
+                "ok": False,
+                "classification": "auth_failure",
+                "attempts": 1,
+                "environment": "test",
+                "observedAtEpoch": 1_800_000_000,
+            },
         )
 
         huge_deadline = {
@@ -125,6 +177,10 @@ class ReadinessSmokeTests(unittest.TestCase):
             now_epoch=lambda: 1_800_000_000,
         )
         self.assertTrue(result["ok"])
+        self.assertIn("environment", result)
+        self.assertIn("observedAtEpoch", result)
+        self.assertEqual(result["environment"], "test")
+        self.assertEqual(result["observedAtEpoch"], 1_800_000_000)
         self.assertEqual(len(captured), 1)
         request = captured[0]
         self.assertEqual(
@@ -141,6 +197,49 @@ class ReadinessSmokeTests(unittest.TestCase):
         ):
             self.assertNotIn(secret, rendered)
 
+    def test_environment_comes_only_from_validated_stage_and_clock_runs_once(self):
+        smoke = self.smoke()
+        clock_calls = []
+        values = {
+            **environment(),
+            "ZLP_INTEGRATIONS_SMOKE_API_URL": (
+                "https://abcdefghij.execute-api.us-east-1.amazonaws.com/production"
+            ),
+            "ENVIRONMENT_NAME": "test",
+        }
+
+        def clock():
+            clock_calls.append(True)
+            return 1_800_000_123
+
+        result = smoke.run(
+            values,
+            sender=lambda request: smoke.SmokeResponse(200),
+            now_epoch=clock,
+        )
+
+        self.assertIn("environment", result)
+        self.assertIn("observedAtEpoch", result)
+        self.assertEqual(result["environment"], "production")
+        self.assertEqual(result["observedAtEpoch"], 1_800_000_123)
+        self.assertEqual(clock_calls, [True])
+
+        invalid = {
+            **values,
+            "ZLP_INTEGRATIONS_SMOKE_API_URL": (
+                "https://abcdefghij.execute-api.us-east-1.amazonaws.com/preview"
+            ),
+        }
+        invalid_result = smoke.run(
+            invalid,
+            sender=lambda request: self.fail("transport must not run"),
+            now_epoch=lambda: 1_800_000_124,
+        )
+        self.assertIn("environment", invalid_result)
+        self.assertIn("observedAtEpoch", invalid_result)
+        self.assertIsNone(invalid_result["environment"])
+        self.assertEqual(invalid_result["observedAtEpoch"], 1_800_000_124)
+
     def test_cli_emits_only_redacted_missing_input_result(self):
         environment_values = dict(os.environ)
         environment_values.pop("ZLP_INTEGRATIONS_SMOKE_API_URL", None)
@@ -155,9 +254,23 @@ class ReadinessSmokeTests(unittest.TestCase):
             timeout=10,
         )
         self.assertEqual(result.returncode, 2)
+        output = json.loads(result.stdout)
+        self.assertEqual(output["attempts"], 0)
+        self.assertEqual(output["classification"], "missing_input")
+        self.assertFalse(output["ok"])
+        self.assertIn("environment", output)
+        self.assertIn("observedAtEpoch", output)
+        self.assertIsNone(output["environment"])
+        self.assertIs(type(output["observedAtEpoch"]), int)
         self.assertEqual(
-            json.loads(result.stdout),
-            {"attempts": 0, "classification": "missing_input", "ok": False},
+            set(output),
+            {
+                "attempts",
+                "classification",
+                "environment",
+                "observedAtEpoch",
+                "ok",
+            },
         )
         self.assertNotIn("DO-NOT-PRINT-SECRET", result.stdout + result.stderr)
 

@@ -18,7 +18,8 @@ Parameters:
     Type: AWS::SSM::Parameter::Value<String>
   InternalCallerArns:
     Type: String
-    AllowedPattern: '^arn:(aws|aws-us-gov|aws-cn):iam::[0-9]{12}:role/[A-Za-z0-9+=,.@_/-]+(?:,arn:(aws|aws-us-gov|aws-cn):iam::[0-9]{12}:role/[A-Za-z0-9+=,.@_/-]+)*$'
+    Default: ''
+    AllowedPattern: '^(?:arn:(aws|aws-us-gov|aws-cn):iam::[0-9]{12}:role/[A-Za-z0-9+=,.@_/-]+(?:,arn:(aws|aws-us-gov|aws-cn):iam::[0-9]{12}:role/[A-Za-z0-9+=,.@_/-]+)*)?$'
   SmtpTestSharedAccountClaimHash:
     Type: String
     AllowedPattern: '^[a-f0-9]{64}$'
@@ -29,6 +30,18 @@ Parameters:
   AlarmTopicArn:
     Type: String
     AllowedPattern: '^arn:(aws|aws-us-gov|aws-cn):sns:[a-z0-9-]+:[0-9]{12}:[A-Za-z0-9_.-]+$'
+  StripeWebhookRateLimit:
+    Type: Number
+    MinValue: 1
+    MaxValue: 100
+  StripeWebhookBurstLimit:
+    Type: Number
+    MinValue: 1
+    MaxValue: 200
+  StripeWebhookReservedConcurrency:
+    Type: Number
+    MinValue: 1
+    MaxValue: 20
 
 Globals:
   Function:
@@ -193,6 +206,14 @@ Resources:
       StageName:
         Ref: EnvironmentName
       EndpointConfiguration: REGIONAL
+      MethodSettings:
+        - ResourcePath: /~1webhooks~1stripe~1connect
+          HttpMethod: POST
+          MetricsEnabled: true
+          ThrottlingRateLimit:
+            Ref: StripeWebhookRateLimit
+          ThrottlingBurstLimit:
+            Ref: StripeWebhookBurstLimit
 
   IntegrationApiIdParameter:
     Type: AWS::SSM::Parameter
@@ -1161,6 +1182,8 @@ Resources:
       CodeUri: src/
       Handler: handlers.stripe_webhook.lambda_handler
       Description: Verifies and durably admits allowlisted Stripe Connect events.
+      ReservedConcurrentExecutions:
+        Ref: StripeWebhookReservedConcurrency
       Role:
         Fn::GetAtt: [StripeWebhookRole, Arn]
       LoggingConfig:
@@ -1348,10 +1371,37 @@ Resources:
       AlarmActions:
         - Ref: AlarmTopicArn
 
+  StripeWebhookApi4xxAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: Stripe webhook API rejected a request with a 4xx response, including possible rate limiting.
+      Namespace: AWS/ApiGateway
+      MetricName: 4XXError
+      Dimensions:
+        - Name: ApiName
+          Value:
+            Fn::Sub: ${AWS::StackName}-api
+        - Name: Stage
+          Value:
+            Ref: EnvironmentName
+        - Name: Resource
+          Value: /webhooks/stripe/connect
+        - Name: Method
+          Value: POST
+      Statistic: Sum
+      Period: 60
+      EvaluationPeriods: 1
+      DatapointsToAlarm: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - Ref: AlarmTopicArn
+
   StripeWebhookThrottlesAlarm:
     Type: AWS::CloudWatch::Alarm
     Properties:
-      AlarmDescription: Stripe webhook Lambda was throttled.
+      AlarmDescription: Stripe webhook Lambda reached its reserved-concurrency limit.
       Namespace: AWS/Lambda
       MetricName: Throttles
       Dimensions:
