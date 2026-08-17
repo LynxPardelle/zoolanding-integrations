@@ -6,9 +6,10 @@
 - Ramas base publicadas: `main`, `test` y `dev`; promoción `dev -> test -> main`.
 - CI y Environments usan permisos mínimos y ramas exactas. Roles
   OIDC/CloudFormation y topic de alarmas están copiados a secretos de cada
-  Environment, sin claves AWS estáticas; las variables duplicadas se eliminarán
-  sólo después de verificar este workflow en GitHub. Todos los demás valores
-  live del despliegue también se leen exclusivamente desde `secrets.*`.
+  Environment, sin claves AWS estáticas; las variables duplicadas fueron
+  eliminadas tras verificar correctamente la CI del commit `b7ec35d`. Todos los
+  demás valores live del despliegue también se leen exclusivamente desde
+  `secrets.*`.
 - `.gitleaks.toml` conserva reglas por defecto y exceptúa únicamente dos valores
   sintéticos exactos dentro de un archivo de pruebas; no excluye archivos ni
   reglas completas.
