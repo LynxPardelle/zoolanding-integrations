@@ -21,7 +21,7 @@
   SHA sobre el historial completo.
 - `dev`, `test` y `main` exigen PR y CI estricto, incluyen a administradores,
   resuelven conversaciones y bloquean force-push y borrado. Secret scanning,
-  push protection, patrones no-proveedor y validación de credenciales están activos.
+  push protection y actualizaciones de seguridad de Dependabot están activos.
 - Validación local: 312/312 pruebas, compilación, SAM, Actionlint y Gitleaks.
 
 ## Despliegue pendiente
