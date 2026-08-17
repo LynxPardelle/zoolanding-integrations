@@ -1,0 +1,9 @@
+[extend]
+useDefault = true
+
+[[allowlists]]
+description = "Synthetic Stripe keys used to verify test/live credential validation"
+condition = "AND"
+paths = ['''^tests/test_stripe_adapter\.py$''']
+regexTarget = "secret"
+regexes = ['''^sk_(test|live)_syntheticsecret123456$''']

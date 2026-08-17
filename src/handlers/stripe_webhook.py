@@ -11,10 +11,12 @@ try:
     from common.http import _response
     from domain.integrations import technical_expiry
     from domain.operations import STRIPE_WEBHOOK_EVENT_TYPES
+    from providers.stripe_adapter import StripeWebhookVerifierUnavailable
 except ModuleNotFoundError:
     from src.common.http import _response
     from src.domain.integrations import technical_expiry
     from src.domain.operations import STRIPE_WEBHOOK_EVENT_TYPES
+    from src.providers.stripe_adapter import StripeWebhookVerifierUnavailable
 
 
 PATH = "/webhooks/stripe/connect"
@@ -32,6 +34,7 @@ def handle_request(
     store: Any,
     environment: str,
     now_epoch: int,
+    metric_sink: Any,
 ) -> dict[str, Any]:
     request_id = _request_id(event)
     try:
@@ -48,18 +51,28 @@ def handle_request(
         raw = _raw_body(event)
         signature = _header(event, "stripe-signature")
         if not signature:
+            _safe_metric(metric_sink, "WebhookSignatureFailures", 1)
             raise _IngressError(400)
         try:
             signed = verifier.verify(raw, signature)
+        except StripeWebhookVerifierUnavailable:
+            raise
         except Exception:
+            _safe_metric(metric_sink, "WebhookSignatureFailures", 1)
             raise _IngressError(400) from None
         selected = _signed_metadata(signed)
+        _safe_metric(
+            metric_sink,
+            "WebhookAgeSeconds",
+            max(0, now_epoch - selected["created"]),
+        )
         if selected["event_type"] not in STRIPE_WEBHOOK_EVENT_TYPES:
             return _response(200, {"data": {"status": "ignored"}}, request_id)
         if environment not in {"test", "production"}:
             raise RuntimeError
         expected_mode = "test" if environment == "test" else "live"
         if selected["mode"] != expected_mode:
+            _safe_metric(metric_sink, "TestLiveMismatch", 1)
             raise _IngressError(409)
         connection = registry.stripe_webhook_connection(
             environment=environment,
@@ -207,3 +220,10 @@ def _error(status: int, request_id: str) -> dict[str, Any]:
     }
     code, message = values.get(status, values[503])
     return _response(status, {"error": {"code": code, "message": message}}, request_id)
+
+
+def _safe_metric(metric_sink: Any, name: str, value: int) -> None:
+    try:
+        metric_sink(name, value)
+    except Exception:
+        pass

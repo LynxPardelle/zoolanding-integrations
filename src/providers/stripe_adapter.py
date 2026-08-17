@@ -69,13 +69,7 @@ class StripeWebhookVerifier:
         self._secret = secret
 
     def verify(self, raw: object, signature: object) -> Any:
-        if (
-            type(raw) is not bytes
-            or not raw
-            or len(raw) > 1024 * 1024
-            or type(signature) is not str
-            or not 1 <= len(signature) <= 4096
-        ):
+        if not _valid_webhook_verification_input(raw, signature):
             raise StripeAdapterError("Stripe webhook verification failed")
         try:
             import stripe  # type: ignore
@@ -88,6 +82,56 @@ class StripeWebhookVerifier:
             )
         except Exception:
             raise StripeAdapterError("Stripe webhook verification failed") from None
+
+
+class SecretsManagerStripeWebhookVerifier:
+    """Load the scoped signing secret only after rejecting malformed input."""
+
+    _SECRET_ID = re.compile(
+        r"/zoolanding/(test|production)/integrations/stripe/connect-webhook",
+        re.ASCII,
+    )
+
+    def __init__(self, secrets_client: Any, secret_id: object):
+        if (
+            secrets_client is None
+            or type(secret_id) is not str
+            or self._SECRET_ID.fullmatch(secret_id) is None
+        ):
+            raise StripeAdapterError("Stripe webhook verification is unavailable")
+        self._secrets = secrets_client
+        self._secret_id = secret_id
+
+    def verify(self, raw: object, signature: object) -> Any:
+        if not _valid_webhook_verification_input(raw, signature):
+            raise StripeAdapterError("Stripe webhook verification failed")
+        try:
+            response = self._secrets.get_secret_value(SecretId=self._secret_id)
+        except Exception:
+            raise StripeWebhookVerifierUnavailable(
+                "Stripe webhook verification is unavailable"
+            ) from None
+        secret = response.get("SecretString") if isinstance(response, dict) else None
+        try:
+            verifier = StripeWebhookVerifier(secret)
+        except StripeAdapterError:
+            raise StripeWebhookVerifierUnavailable(
+                "Stripe webhook verification is unavailable"
+            ) from None
+        return verifier.verify(raw, signature)
+
+
+class StripeWebhookVerifierUnavailable(StripeAdapterError):
+    """The server-owned webhook verification dependency is unavailable."""
+
+
+def _valid_webhook_verification_input(raw: object, signature: object) -> bool:
+    return (
+        type(raw) is bytes
+        and 1 <= len(raw) <= 1024 * 1024
+        and type(signature) is str
+        and 1 <= len(signature) <= 4096
+    )
 
 
 class StripeClient(Protocol):

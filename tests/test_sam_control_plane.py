@@ -80,11 +80,11 @@ class SamControlPlaneTests(unittest.TestCase):
         )
         connection_admin_role = self._role("ConnectionAdminRole")
         self.assertIn(
-            "/zoolanding/${EnvironmentName}/integrations/stripe/connect-platform*",
+            "/zoolanding/${EnvironmentName}/integrations/stripe/connect-platform-??????",
             connection_admin_role,
         )
         self.assertIn(
-            "/zoolanding/${EnvironmentName}/*/*/notifications/smtp/*",
+            "/zoolanding/${EnvironmentName}/*/*/notifications/smtp/*-??????",
             connection_admin_role,
         )
         self.assertIn(
@@ -142,7 +142,7 @@ class SamControlPlaneTests(unittest.TestCase):
             rendered = self._role(role)
             self.assertIn("${AWS::Partition}", rendered)
             self.assertIn(
-                "/zoolanding/${EnvironmentName}/integrations/stripe/connect-platform*",
+                "/zoolanding/${EnvironmentName}/integrations/stripe/connect-platform-??????",
                 rendered,
             )
             self.assertNotIn("integrations/*/*/stripe", rendered)
@@ -318,7 +318,7 @@ class SamControlPlaneTests(unittest.TestCase):
         self.assertIn("WebhookReceiptTable", role)
         self.assertIn("SubscriptionMigrationWorkQueue", role)
         self.assertIn(
-            "/zoolanding/${EnvironmentName}/integrations/stripe/connect-platform*",
+            "/zoolanding/${EnvironmentName}/integrations/stripe/connect-platform-??????",
             role,
         )
         self.assertNotIn("sns:Publish", role)
@@ -340,7 +340,11 @@ class SamControlPlaneTests(unittest.TestCase):
             item["AttributeName"] for item in table["AttributeDefinitions"]
         }
         self.assertTrue({"migrationWorkPk", "migrationWorkSk"}.issubset(attributes))
-        self.assertIn("/index/*", self._role("SubscriptionMigrationWorkerRole"))
+        self.assertIn(
+            "/index/MigrationWorkIndex",
+            self._role("SubscriptionMigrationWorkerRole"),
+        )
+        self.assertNotIn("/index/*", self.text)
 
     def test_migration_apis_have_command_and_read_only_status_roles(self):
         for logical_id in (

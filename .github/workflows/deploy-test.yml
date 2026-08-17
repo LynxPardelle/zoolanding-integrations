@@ -1,0 +1,419 @@
+name: Deploy Test
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [test]
+
+permissions:
+  contents: read
+  pull-requests: read
+
+env:
+  AWS_DEFAULT_REGION: us-east-1
+  AWS_REGION: us-east-1
+  PYTHONDONTWRITEBYTECODE: 1
+  SAM_CLI_TELEMETRY: 0
+
+concurrency:
+  group: integrations-test-${{ github.repository }}-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    outputs:
+      artifact_id: ${{ steps.upload.outputs.artifact-id }}
+      artifact_name: ${{ steps.metadata.outputs.artifact_name }}
+      manifest_digest: ${{ steps.metadata.outputs.manifest_digest }}
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Verify exact clean test commit
+        shell: bash
+        env:
+          EXPECTED_SHA: ${{ github.sha }}
+          CURRENT_REF: ${{ github.ref }}
+        run: |
+          set -euo pipefail
+          test "$CURRENT_REF" = "refs/heads/test"
+          test "$(git rev-parse HEAD)" = "$EXPECTED_SHA"
+          test -z "$(git status --porcelain)"
+
+      - name: Verify exact dev-to-test merged PR
+        uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8
+        env:
+          EXPECTED_SHA: ${{ github.sha }}
+          SOURCE_BRANCH: dev
+          TARGET_BRANCH: test
+        with:
+          github-token: ${{ github.token }}
+          script: |
+            const fail = code => { throw new Error(code); };
+            const isSha = value => /^[a-f0-9]{40}$/.test(value ?? '');
+            const repository = process.env.GITHUB_REPOSITORY;
+            const sha = process.env.EXPECTED_SHA;
+            const sourceBranch = process.env.SOURCE_BRANCH;
+            const targetBranch = process.env.TARGET_BRANCH;
+            if (!repository || !isSha(sha) || process.env.GITHUB_REF !== `refs/heads/${targetBranch}`) fail('promotion_context_invalid');
+            const [owner, repo] = repository.split('/');
+            const { data: commit } = await github.rest.git.getCommit({ owner, repo, commit_sha: sha });
+            const parents = Array.isArray(commit.parents) ? commit.parents.map(parent => parent.sha) : [];
+            if (parents.length !== 2 || parents.some(parent => !isSha(parent))) fail('promotion_merge_commit_required');
+            let pullRequests = [];
+            for (let attempt = 1; attempt <= 3; attempt += 1) {
+              const response = await github.request('GET /repos/{owner}/{repo}/commits/{commit_sha}/pulls', {
+                owner, repo, commit_sha: sha, per_page: 100,
+                headers: { accept: 'application/vnd.github+json', 'X-GitHub-Api-Version': '2026-03-10' },
+              });
+              pullRequests = response.data;
+              if (!Array.isArray(pullRequests) || pullRequests.length > 100) fail('promotion_api_invalid_response');
+              if (pullRequests.length > 0 || attempt === 3) break;
+              await new Promise(resolve => setTimeout(resolve, 1500));
+            }
+            const matches = pullRequests.filter(pr => (
+              pr?.state === 'closed' && pr.merged_at && (pr.merge_commit_sha == null || pr.merge_commit_sha === sha)
+              && pr.base?.ref === targetBranch && pr.base?.repo?.full_name === repository && isSha(pr.base?.sha)
+              && pr.head?.ref === sourceBranch && pr.head?.repo?.full_name === repository && isSha(pr.head?.sha)
+            ));
+            if (matches.length !== 1) fail(matches.length ? 'promotion_pr_ambiguous' : 'promotion_pr_not_found');
+            const pr = matches[0];
+            if (parents[0] !== pr.base.sha) fail('promotion_first_parent_mismatch');
+            if (parents[1] !== pr.head.sha) fail('promotion_second_parent_mismatch');
+            if (context.eventName === 'push') {
+              const event = context.payload;
+              if (event.forced === true || event.created === true || event.deleted === true || event.after !== sha
+                || !isSha(event.before) || /^0+$/.test(event.before) || parents[0] !== event.before) fail('promotion_push_not_allowed');
+            } else if (context.eventName !== 'workflow_dispatch') fail('promotion_event_not_allowed');
+            const { data: branch } = await github.rest.repos.getBranch({ owner, repo, branch: targetBranch });
+            if (branch.commit.sha !== sha) fail('promotion_target_tip_mismatch');
+
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: '3.13'
+
+      - name: Install pinned runtime and test tooling
+        run: |
+          python -m pip install --disable-pip-version-check -r requirements-dev.txt pip-audit==2.10.1
+          python -m pip_audit -r requirements.txt
+
+      - uses: aws-actions/setup-sam@89ddb14d60e682855e3fea4be85b3c56485de310 # v3
+        with:
+          version: 1.163.0
+          use-installer: true
+          token: ${{ github.token }}
+
+      - name: Test, validate, and build exact candidate
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m unittest discover -s tests -p "test_*.py"
+          python -m compileall -q src tools tests
+          sam validate --lint
+          sam build --no-cached
+          test -f .aws-sam/build/template.yaml
+          test -z "$(find .aws-sam/build -type l -print -quit)"
+          python tools/verify_sam_build.py
+
+      - name: Write validated build manifest
+        id: metadata
+        shell: bash
+        run: |
+          set -euo pipefail
+          (cd .aws-sam/build && LC_ALL=C find . -type f -print0 | LC_ALL=C sort -z | xargs -0 sha256sum) > .aws-sam/build-manifest.sha256
+          artifact_name="integrations-test-build-${{ github.run_id }}-${{ github.run_attempt }}-${{ github.sha }}"
+          manifest_digest="$(sha256sum .aws-sam/build-manifest.sha256 | cut -d ' ' -f1)"
+          [[ "$artifact_name" =~ ^integrations-test-build-[1-9][0-9]*-[1-9][0-9]*-[a-f0-9]{40}$ ]]
+          [[ "$manifest_digest" =~ ^[a-f0-9]{64}$ ]]
+          printf 'artifact_name=%s\nmanifest_digest=%s\n' "$artifact_name" "$manifest_digest" >> "$GITHUB_OUTPUT"
+
+      - name: Upload exact validated artifact
+        id: upload
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ${{ steps.metadata.outputs.artifact_name }}
+          path: |
+            .aws-sam/build
+            .aws-sam/build-manifest.sha256
+          if-no-files-found: error
+          include-hidden-files: true
+          retention-days: 1
+
+  deploy:
+    runs-on: ubuntu-latest
+    needs: validate
+    environment: test
+    permissions:
+      contents: read
+      id-token: write
+      pull-requests: read
+    env:
+      AWS_ROLE_ARN: ${{ secrets.AWS_ROLE_ARN }}
+      AWS_CLOUDFORMATION_ROLE_ARN: ${{ secrets.AWS_CLOUDFORMATION_ROLE_ARN }}
+      INTERNAL_CALLER_ARNS: ${{ secrets.INTERNAL_CALLER_ARNS }}
+      SMTP_ACTIVATION_CALLER_ARNS: ${{ secrets.SMTP_ACTIVATION_CALLER_ARNS }}
+      ALARM_TOPIC_ARN: ${{ secrets.ALARM_TOPIC_ARN }}
+      STRIPE_WEBHOOK_RATE_LIMIT: ${{ secrets.STRIPE_WEBHOOK_RATE_LIMIT }}
+      STRIPE_WEBHOOK_BURST_LIMIT: ${{ secrets.STRIPE_WEBHOOK_BURST_LIMIT }}
+      STRIPE_WEBHOOK_RESERVED_CONCURRENCY: ${{ secrets.STRIPE_WEBHOOK_RESERVED_CONCURRENCY }}
+      SMTP_TEST_SHARED_ACCOUNT_CLAIM_HASH: ${{ secrets.SMTP_TEST_SHARED_ACCOUNT_CLAIM_HASH }}
+    steps:
+      - name: Validate artifact metadata
+        id: artifact
+        shell: bash
+        env:
+          RAW_ARTIFACT_ID: ${{ needs.validate.outputs.artifact_id }}
+          RAW_ARTIFACT_NAME: ${{ needs.validate.outputs.artifact_name }}
+          RAW_MANIFEST_DIGEST: ${{ needs.validate.outputs.manifest_digest }}
+          EXPECTED_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          [[ "$EXPECTED_SHA" =~ ^[a-f0-9]{40}$ ]]
+          [[ "$RAW_ARTIFACT_ID" =~ ^[1-9][0-9]*$ ]]
+          [[ "$RAW_ARTIFACT_ID" != *","* ]]
+          [[ "$RAW_ARTIFACT_NAME" =~ ^integrations-test-build-[1-9][0-9]*-[1-9][0-9]*-${EXPECTED_SHA}$ ]]
+          [[ "$RAW_MANIFEST_DIGEST" =~ ^[a-f0-9]{64}$ ]]
+          printf 'id=%s\nname=%s\ndigest=%s\n' "$RAW_ARTIFACT_ID" "$RAW_ARTIFACT_NAME" "$RAW_MANIFEST_DIGEST" >> "$GITHUB_OUTPUT"
+
+      - name: Download exact artifact from this run
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+        with:
+          artifact-ids: ${{ steps.artifact.outputs.id }}
+          path: .aws-sam
+          merge-multiple: true
+
+      - name: Verify artifact integrity and closed file set
+        shell: bash
+        env:
+          EXPECTED_MANIFEST_DIGEST: ${{ steps.artifact.outputs.digest }}
+        run: |
+          set -euo pipefail
+          test -f .aws-sam/build/template.yaml
+          test -f .aws-sam/build-manifest.sha256
+          test -z "$(find .aws-sam/build -type l -print -quit)"
+          test "$(sha256sum .aws-sam/build-manifest.sha256 | cut -d ' ' -f1)" = "$EXPECTED_MANIFEST_DIGEST"
+          (cd .aws-sam/build && sha256sum --check --strict ../build-manifest.sha256)
+          cut -c67- .aws-sam/build-manifest.sha256 | LC_ALL=C sort > "$RUNNER_TEMP/manifest-paths.txt"
+          (cd .aws-sam/build && LC_ALL=C find . -type f -print | LC_ALL=C sort) > "$RUNNER_TEMP/artifact-paths.txt"
+          diff -u "$RUNNER_TEMP/manifest-paths.txt" "$RUNNER_TEMP/artifact-paths.txt"
+
+      - name: Reverify exact dev-to-test merged PR before AWS credentials
+        uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8
+        env:
+          EXPECTED_SHA: ${{ github.sha }}
+          SOURCE_BRANCH: dev
+          TARGET_BRANCH: test
+        with:
+          github-token: ${{ github.token }}
+          script: |
+            const fail = code => { throw new Error(code); };
+            const isSha = value => /^[a-f0-9]{40}$/.test(value ?? '');
+            const repository = process.env.GITHUB_REPOSITORY;
+            const sha = process.env.EXPECTED_SHA;
+            const sourceBranch = process.env.SOURCE_BRANCH;
+            const targetBranch = process.env.TARGET_BRANCH;
+            if (!repository || !isSha(sha) || process.env.GITHUB_REF !== `refs/heads/${targetBranch}`) fail('promotion_context_invalid');
+            const [owner, repo] = repository.split('/');
+            const { data: commit } = await github.rest.git.getCommit({ owner, repo, commit_sha: sha });
+            const parents = Array.isArray(commit.parents) ? commit.parents.map(parent => parent.sha) : [];
+            if (parents.length !== 2 || parents.some(parent => !isSha(parent))) fail('promotion_merge_commit_required');
+            let pullRequests = [];
+            for (let attempt = 1; attempt <= 3; attempt += 1) {
+              const response = await github.request('GET /repos/{owner}/{repo}/commits/{commit_sha}/pulls', {
+                owner, repo, commit_sha: sha, per_page: 100,
+                headers: { accept: 'application/vnd.github+json', 'X-GitHub-Api-Version': '2026-03-10' },
+              });
+              pullRequests = response.data;
+              if (!Array.isArray(pullRequests) || pullRequests.length > 100) fail('promotion_api_invalid_response');
+              if (pullRequests.length > 0 || attempt === 3) break;
+              await new Promise(resolve => setTimeout(resolve, 1500));
+            }
+            const matches = pullRequests.filter(pr => (
+              pr?.state === 'closed' && pr.merged_at && (pr.merge_commit_sha == null || pr.merge_commit_sha === sha)
+              && pr.base?.ref === targetBranch && pr.base?.repo?.full_name === repository && isSha(pr.base?.sha)
+              && pr.head?.ref === sourceBranch && pr.head?.repo?.full_name === repository && isSha(pr.head?.sha)
+            ));
+            if (matches.length !== 1) fail(matches.length ? 'promotion_pr_ambiguous' : 'promotion_pr_not_found');
+            const pr = matches[0];
+            if (parents[0] !== pr.base.sha) fail('promotion_first_parent_mismatch');
+            if (parents[1] !== pr.head.sha) fail('promotion_second_parent_mismatch');
+            if (context.eventName === 'push') {
+              const event = context.payload;
+              if (event.forced === true || event.created === true || event.deleted === true || event.after !== sha
+                || !isSha(event.before) || /^0+$/.test(event.before) || parents[0] !== event.before) fail('promotion_push_not_allowed');
+            } else if (context.eventName !== 'workflow_dispatch') fail('promotion_event_not_allowed');
+            const { data: branch } = await github.rest.repos.getBranch({ owner, repo, branch: targetBranch });
+            if (branch.commit.sha !== sha) fail('promotion_target_tip_mismatch');
+
+      - uses: aws-actions/setup-sam@89ddb14d60e682855e3fea4be85b3c56485de310 # v3
+        with:
+          version: 1.163.0
+          use-installer: true
+          token: ${{ github.token }}
+
+      - name: Validate deployment configuration
+        shell: bash
+        run: |
+          set -euo pipefail
+          role_pattern='^arn:(aws|aws-us-gov|aws-cn):iam::[0-9]{12}:role/[A-Za-z0-9+=,.@_/-]+$'
+          role_list_pattern='^arn:(aws|aws-us-gov|aws-cn):iam::[0-9]{12}:role/[A-Za-z0-9+=,.@_/-]+(,arn:(aws|aws-us-gov|aws-cn):iam::[0-9]{12}:role/[A-Za-z0-9+=,.@_/-]+)*$'
+          topic_pattern='^arn:(aws|aws-us-gov|aws-cn):sns:[a-z0-9-]+:[0-9]{12}:[A-Za-z0-9_.-]+$'
+          [[ "$AWS_ROLE_ARN" =~ $role_pattern ]]
+          [[ "$AWS_CLOUDFORMATION_ROLE_ARN" =~ $role_pattern ]]
+          [[ -z "$INTERNAL_CALLER_ARNS" || "$INTERNAL_CALLER_ARNS" =~ $role_list_pattern ]]
+          [[ "$SMTP_ACTIVATION_CALLER_ARNS" =~ $role_list_pattern ]]
+          [[ "$ALARM_TOPIC_ARN" =~ $topic_pattern ]]
+          [[ "$SMTP_TEST_SHARED_ACCOUNT_CLAIM_HASH" =~ ^[a-f0-9]{64}$ ]]
+          [[ "$STRIPE_WEBHOOK_RATE_LIMIT" =~ ^[1-9][0-9]{0,2}$ ]]
+          [[ "$STRIPE_WEBHOOK_BURST_LIMIT" =~ ^[1-9][0-9]{0,2}$ ]]
+          [[ "$STRIPE_WEBHOOK_RESERVED_CONCURRENCY" =~ ^[1-9][0-9]?$ ]]
+          (( STRIPE_WEBHOOK_RATE_LIMIT <= 100 ))
+          (( STRIPE_WEBHOOK_BURST_LIMIT <= 200 ))
+          (( STRIPE_WEBHOOK_RESERVED_CONCURRENCY <= 20 ))
+
+      - uses: aws-actions/configure-aws-credentials@517a711dbcd0e402f90c77e7e2f81e849156e31d # v6
+        with:
+          role-to-assume: ${{ env.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+          mask-aws-account-id: true
+
+      - name: Validate OIDC account and regional ARN scope
+        shell: bash
+        run: |
+          set -euo pipefail
+          fail_scope() {
+            echo "::error::AWS identity or regional resource scope validation failed."
+            exit 1
+          }
+          identity="$(aws sts get-caller-identity --query '[Account,Arn]' --output text --no-cli-pager)"
+          IFS=$'\t' read -r oidc_account oidc_arn oidc_extra <<< "$identity"
+          test -z "$oidc_extra" || fail_scope
+          [[ "$oidc_account" =~ ^[0-9]{12}$ ]] || fail_scope
+          identity_pattern='^arn:(aws|aws-us-gov|aws-cn):sts::([0-9]{12}):assumed-role/[A-Za-z0-9+=,.@_-]{1,64}/[A-Za-z0-9+=,.@_-]{2,64}$'
+          [[ "$oidc_arn" =~ $identity_pattern ]] || fail_scope
+          oidc_partition="${BASH_REMATCH[1]}"
+          oidc_arn_account="${BASH_REMATCH[2]}"
+          test "$oidc_arn_account" = "$oidc_account" || fail_scope
+          [[ "$AWS_REGION" =~ ^[a-z]{2}(-gov)?-[a-z]+-[0-9]$ ]] || fail_scope
+          test "$AWS_DEFAULT_REGION" = "$AWS_REGION" || fail_scope
+          case "$oidc_partition" in
+            aws) [[ "$AWS_REGION" != us-gov-* && "$AWS_REGION" != cn-* ]] || fail_scope ;;
+            aws-us-gov) [[ "$AWS_REGION" == us-gov-* ]] || fail_scope ;;
+            aws-cn) [[ "$AWS_REGION" == cn-* ]] || fail_scope ;;
+            *) fail_scope ;;
+          esac
+          role_scope_pattern="^arn:${oidc_partition}:iam::${oidc_account}:role/[A-Za-z0-9+=,.@_/-]+$"
+          topic_scope_pattern="^arn:${oidc_partition}:sns:${AWS_REGION}:${oidc_account}:[A-Za-z0-9_.-]+$"
+          [[ "$AWS_ROLE_ARN" =~ $role_scope_pattern ]] || fail_scope
+          [[ "$AWS_CLOUDFORMATION_ROLE_ARN" =~ $role_scope_pattern ]] || fail_scope
+          [[ "$ALARM_TOPIC_ARN" =~ $topic_scope_pattern ]] || fail_scope
+          validate_role_list() {
+            local value="$1"
+            local role
+            local -a roles=()
+            [[ -z "$value" ]] && return 0
+            IFS=',' read -r -a roles <<< "$value"
+            for role in "${roles[@]}"; do
+              [[ "$role" =~ $role_scope_pattern ]] || fail_scope
+            done
+          }
+          validate_role_list "$INTERNAL_CALLER_ARNS"
+          validate_role_list "$SMTP_ACTIVATION_CALLER_ARNS"
+
+      - name: Enforce one-time disabled caller bootstrap
+        if: env.INTERNAL_CALLER_ARNS == ''
+        shell: bash
+        env:
+          STACK_NAME: zoolanding-integrations-test
+        run: |
+          set -euo pipefail
+          error_file="$RUNNER_TEMP/integrations-bootstrap-error.txt"
+          if aws cloudformation describe-stacks --stack-name "$STACK_NAME" --no-cli-pager >/dev/null 2>"$error_file"; then
+            rm -f "$error_file"
+            echo "::error::INTERNAL_CALLER_ARNS may be empty only for the first stack creation."
+            exit 1
+          fi
+          if ! grep -Eq 'Stack with id .* does not exist' "$error_file"; then
+            rm -f "$error_file"
+            echo "::error::Unable to prove that this is the first stack creation."
+            exit 1
+          fi
+          rm -f "$error_file"
+
+      - name: Validate exact cross-service SSM values
+        shell: bash
+        env:
+          ENVIRONMENT_NAME: test
+        run: |
+          set -euo pipefail
+          prefix="/zoolanding/${ENVIRONMENT_NAME}"
+          registry_table="$(aws ssm get-parameter --name "$prefix/config/registry-table-name" --query 'Parameter.Value' --output text --no-cli-pager)"
+          payload_bucket="$(aws ssm get-parameter --name "$prefix/config/payload-bucket-name" --query 'Parameter.Value' --output text --no-cli-pager)"
+          auth_session_table="$(aws ssm get-parameter --name "$prefix/auth/session-table-name" --query 'Parameter.Value' --output text --no-cli-pager)"
+          auth_user_state_table="$(aws ssm get-parameter --name "$prefix/auth/user-state-table-name" --query 'Parameter.Value' --output text --no-cli-pager)"
+          [[ "$registry_table" =~ ^[A-Za-z0-9_.-]{3,255}$ ]]
+          [[ "$payload_bucket" =~ ^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$ ]]
+          [[ "$auth_session_table" =~ ^[A-Za-z0-9_.-]{3,255}$ ]]
+          [[ "$auth_user_state_table" =~ ^[A-Za-z0-9_.-]{3,255}$ ]]
+          if [[ -n "$INTERNAL_CALLER_ARNS" ]]; then
+            role_pattern='^arn:(aws|aws-us-gov|aws-cn):iam::[0-9]{12}:role/[A-Za-z0-9+=,.@_/-]+$'
+            commerce_callers_result="$(aws ssm get-parameter --name "$prefix/services/commerce/integrations-caller-role-arns" --no-with-decryption --query 'Parameter.[Type,Value]' --output text --no-cli-pager)"
+            notifications_caller_result="$(aws ssm get-parameter --name "$prefix/services/notifications/smtp-worker-role-arn" --no-with-decryption --query 'Parameter.[Type,Value]' --output text --no-cli-pager)"
+            IFS=$'\t' read -r commerce_callers_type commerce_callers_value commerce_callers_extra <<< "$commerce_callers_result"
+            IFS=$'\t' read -r notifications_caller_type notifications_caller_value notifications_caller_extra <<< "$notifications_caller_result"
+            test "$commerce_callers_type" = "StringList"
+            test "$notifications_caller_type" = "String"
+            test -z "$commerce_callers_extra"
+            test -z "$notifications_caller_extra"
+            IFS=',' read -r -a commerce_callers <<< "$commerce_callers_value"
+            IFS=',' read -r -a configured_roles <<< "$INTERNAL_CALLER_ARNS"
+            test "${#commerce_callers[@]}" -eq 4
+            declare -A configured_callers=()
+            for role in "${configured_roles[@]}"; do
+              [[ "$role" =~ $role_pattern ]]
+              test -z "${configured_callers[$role]+x}"
+              configured_callers["$role"]=1
+            done
+            declare -A required_callers=()
+            for role in "${commerce_callers[@]}" "$notifications_caller_value"; do
+              [[ "$role" =~ $role_pattern ]]
+              test -z "${required_callers[$role]+x}"
+              required_callers["$role"]=1
+              if [[ -z "${configured_callers[$role]+x}" ]]; then
+                echo "::error::required caller is absent from INTERNAL_CALLER_ARNS"
+                exit 1
+              fi
+            done
+          fi
+
+      - name: Deploy test
+        shell: bash
+        run: |
+          set -euo pipefail
+          sam deploy \
+            --template-file .aws-sam/build/template.yaml \
+            --stack-name zoolanding-integrations-test \
+            --region "$AWS_REGION" \
+            --resolve-s3 \
+            --s3-prefix zoolanding-integrations-test \
+            --capabilities CAPABILITY_IAM \
+            --role-arn "$AWS_CLOUDFORMATION_ROLE_ARN" \
+            --no-confirm-changeset \
+            --no-fail-on-empty-changeset \
+            --parameter-overrides \
+              "EnvironmentName=test" \
+              "ConfigRegistryTableName=/zoolanding/test/config/registry-table-name" \
+              "ConfigPayloadsBucketName=/zoolanding/test/config/payload-bucket-name" \
+              "AuthSessionTableName=/zoolanding/test/auth/session-table-name" \
+              "AuthUserStateTableName=/zoolanding/test/auth/user-state-table-name" \
+              "InternalCallerArns=$INTERNAL_CALLER_ARNS" \
+              "SmtpTestSharedAccountClaimHash=$SMTP_TEST_SHARED_ACCOUNT_CLAIM_HASH" \
+              "SmtpActivationCallerArns=$SMTP_ACTIVATION_CALLER_ARNS" \
+              "StripeWebhookRateLimit=$STRIPE_WEBHOOK_RATE_LIMIT" \
+              "StripeWebhookBurstLimit=$STRIPE_WEBHOOK_BURST_LIMIT" \
+              "StripeWebhookReservedConcurrency=$STRIPE_WEBHOOK_RESERVED_CONCURRENCY" \
+              "AlarmTopicArn=$ALARM_TOPIC_ARN"

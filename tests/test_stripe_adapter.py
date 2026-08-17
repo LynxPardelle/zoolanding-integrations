@@ -886,6 +886,51 @@ class StripeAdapterTests(unittest.TestCase):
         with self.assertRaises(stripe.StripeAdapterError):
             stripe.StripeWebhookVerifier("sk_test_not_a_webhook_secret")
 
+    def test_webhook_secret_is_read_only_after_bounded_verification_input(self):
+        stripe = stripe_module(self)
+        verifier_type = getattr(stripe, "SecretsManagerStripeWebhookVerifier", None)
+        self.assertTrue(callable(verifier_type))
+        if verifier_type is None:
+            return
+
+        class Secrets:
+            def __init__(self):
+                self.calls = []
+
+            def get_secret_value(self, **kwargs):
+                self.calls.append(kwargs)
+                return {"SecretString": "whsec_" + "syntheticsecret1234"}
+
+        calls = []
+
+        class Webhook:
+            @staticmethod
+            def construct_event(payload, sig_header, secret, tolerance):
+                calls.append((payload, sig_header, secret, tolerance))
+                return {"id": "evt-1"}
+
+        secrets = Secrets()
+        verifier = verifier_type(
+            secrets, "/zoolanding/test/integrations/stripe/connect-webhook"
+        )
+        with self.assertRaises(stripe.StripeAdapterError):
+            verifier.verify(b"", "t=1,v1=signature")
+        self.assertEqual(secrets.calls, [])
+
+        with patch.dict(sys.modules, {"stripe": SimpleNamespace(Webhook=Webhook)}):
+            result = verifier.verify(b'{"id":"evt-1"}', "t=1,v1=signature")
+
+        self.assertEqual(result, {"id": "evt-1"})
+        self.assertEqual(
+            secrets.calls,
+            [
+                {
+                    "SecretId": "/zoolanding/test/integrations/stripe/connect-webhook"
+                }
+            ],
+        )
+        self.assertEqual(len(calls), 1)
+
     def test_webhook_state_refetches_event_then_every_referenced_checkout_object(self):
         stripe = stripe_module(self)
 
