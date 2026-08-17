@@ -289,6 +289,18 @@ class Phase8InfrastructureTests(unittest.TestCase):
         )
         self.assertIn("GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}", ci)
         self.assertNotIn("continue-on-error", ci)
+        self.assertRegex(
+            ci,
+            r"(?m)^permissions:\n  contents: read\n  pull-requests: read$",
+        )
+        self.assertLess(
+            ci.index("Verify exact clean commit"),
+            ci.index("Scan repository history for secrets"),
+        )
+        self.assertLess(
+            ci.index("Validate exact SAM build"),
+            ci.index("Scan repository history for secrets"),
+        )
 
         for filename, branch, source, environment in (
             ("deploy-test.yml", "test", "dev", "test"),
