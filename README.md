@@ -108,6 +108,10 @@ The template sends API 5xx, method-scoped webhook API 4xx, webhook Lambda errors
 
 The public Stripe webhook has a route-specific API Gateway rate/burst target and a Lambda reserved-concurrency cap. Deployment values are required rather than guessed: the code-owned ceilings are 100 requests/second, burst 200, and concurrency 20, but they are safety bounds—not recommended operating values. Test activation remains blocked until Stripe retry behavior, webhook bursts, downstream latency, account concurrency, and cost are measured and the lower environment-specific values are approved. API Gateway throttling is best-effort, so signature/replay checks and the existing alarms remain mandatory; this does not add WAF.
 
+The three browser routes also have pre-auth cost ceilings: each API method is limited to 10 requests/second with burst 20, and each backing Lambda reserves at most five concurrent executions. These are conservative code-owned safety limits, not a throughput claim. They bound anonymous policy/Auth reads before authorization; later load evidence must justify any reviewed increase.
+
+The outgoing Integration Events topic uses the AWS-managed SNS encryption key. Both DynamoDB Stream failure destinations alarm on message arrival and on records older than five minutes, in addition to the migration queue alarms. A confirmed human-operated subscriber on `ALARM_TOPIC_ARN` remains a deployment gate.
+
 After a controlled deployment and exact caller-policy bootstrap, the read-only readiness smoke signs `POST /internal/v1/integrations/connection-resolve` through the default AWS credential chain. It never accepts credentials on the command line and prints only status, attempt count, the closed classifications `ready`, `missing_input`, `auth_failure`, `propagation_delay`, `configuration_failure`, or `provider_failure`, plus a redacted evidence envelope. Every result includes `environment`, derived only from a fully validated API stage (`test` or `production`, otherwise `null`), and integer `observedAtEpoch`, captured exactly once from the current or injected clock. This lets an external aggregator reject mixed-environment or stale evidence without exposing the URL, domain, connection, AWS identity, request, or response.
 
 ```powershell
@@ -132,7 +136,7 @@ No AWS deployment was performed as part of this implementation. No provider endp
 
 ## Local verification
 
-The Phase 8 readiness tree passes 306 unit/contract tests, dependency audit, Python compilation, workflow lint, SAM lint, an uncached build, and import verification for all 24 Lambda handlers. No deployment, SMTP send, secret read, or provider-backed proof is claimed.
+The Phase 8 readiness tree passes 312 unit/contract tests, dependency audit, Python compilation, workflow lint, SAM lint, an uncached build, and import verification for all 24 Lambda handlers. CI also scans full Git history with the commit-pinned Gitleaks action and the repository's narrow synthetic-test allowlist. No deployment, SMTP send, secret read, or provider-backed proof is claimed.
 
 ```powershell
 python -m pip install --requirement requirements-dev.txt

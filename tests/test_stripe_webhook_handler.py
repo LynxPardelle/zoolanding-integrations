@@ -3,6 +3,7 @@ import hashlib
 import json
 import unittest
 
+from src.providers.stripe_adapter import StripeWebhookVerifierUnavailable
 from src.stripe_store import WebhookReplayConflict
 from tests.test_registry import connection, scope
 
@@ -131,6 +132,18 @@ class StripeWebhookHandlerTests(unittest.TestCase):
                 self.assertEqual(response["statusCode"], expected)
                 self.assertNotIn("signature", response["body"])
                 self.assertNotIn("acct_synthetic", response["body"])
+
+    def test_unavailable_server_owned_verifier_returns_retryable_service_error(self):
+        response = self.call(
+            verifier=Verifier(
+                error=StripeWebhookVerifierUnavailable(
+                    "private dependency detail"
+                )
+            )
+        )
+
+        self.assertEqual(response["statusCode"], 503)
+        self.assertNotIn("private dependency detail", response["body"])
 
     def test_emits_only_redacted_webhook_age_signature_and_mode_metrics(self):
         accepted_metrics = Metrics()

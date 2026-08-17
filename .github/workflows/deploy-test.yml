@@ -152,14 +152,14 @@ jobs:
       id-token: write
       pull-requests: read
     env:
-      AWS_ROLE_ARN: ${{ vars.AWS_ROLE_ARN }}
-      AWS_CLOUDFORMATION_ROLE_ARN: ${{ vars.AWS_CLOUDFORMATION_ROLE_ARN }}
-      INTERNAL_CALLER_ARNS: ${{ vars.INTERNAL_CALLER_ARNS }}
-      SMTP_ACTIVATION_CALLER_ARNS: ${{ vars.SMTP_ACTIVATION_CALLER_ARNS }}
-      ALARM_TOPIC_ARN: ${{ vars.ALARM_TOPIC_ARN }}
-      STRIPE_WEBHOOK_RATE_LIMIT: ${{ vars.STRIPE_WEBHOOK_RATE_LIMIT }}
-      STRIPE_WEBHOOK_BURST_LIMIT: ${{ vars.STRIPE_WEBHOOK_BURST_LIMIT }}
-      STRIPE_WEBHOOK_RESERVED_CONCURRENCY: ${{ vars.STRIPE_WEBHOOK_RESERVED_CONCURRENCY }}
+      AWS_ROLE_ARN: ${{ secrets.AWS_ROLE_ARN }}
+      AWS_CLOUDFORMATION_ROLE_ARN: ${{ secrets.AWS_CLOUDFORMATION_ROLE_ARN }}
+      INTERNAL_CALLER_ARNS: ${{ secrets.INTERNAL_CALLER_ARNS }}
+      SMTP_ACTIVATION_CALLER_ARNS: ${{ secrets.SMTP_ACTIVATION_CALLER_ARNS }}
+      ALARM_TOPIC_ARN: ${{ secrets.ALARM_TOPIC_ARN }}
+      STRIPE_WEBHOOK_RATE_LIMIT: ${{ secrets.STRIPE_WEBHOOK_RATE_LIMIT }}
+      STRIPE_WEBHOOK_BURST_LIMIT: ${{ secrets.STRIPE_WEBHOOK_BURST_LIMIT }}
+      STRIPE_WEBHOOK_RESERVED_CONCURRENCY: ${{ secrets.STRIPE_WEBHOOK_RESERVED_CONCURRENCY }}
       SMTP_TEST_SHARED_ACCOUNT_CLAIM_HASH: ${{ secrets.SMTP_TEST_SHARED_ACCOUNT_CLAIM_HASH }}
     steps:
       - name: Validate artifact metadata
@@ -279,6 +279,7 @@ jobs:
         with:
           role-to-assume: ${{ env.AWS_ROLE_ARN }}
           aws-region: ${{ env.AWS_REGION }}
+          mask-aws-account-id: true
 
       - name: Validate OIDC account and regional ARN scope
         shell: bash

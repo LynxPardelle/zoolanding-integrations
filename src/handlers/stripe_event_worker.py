@@ -289,6 +289,10 @@ class StripeEventWorker:
                 mapping.get("resourceType") != "checkout"
                 or mapping.get("resourceId") != hint
                 or mapping.get("paymentAttemptId") != hint
+                or (
+                    state["objectType"] == "checkout-session"
+                    and mapping.get("sessionId") != state["objectId"]
+                )
             ):
                 raise RuntimeError("Stripe object mapping is invalid")
         return mapping

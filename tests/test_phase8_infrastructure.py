@@ -75,6 +75,13 @@ class Phase8InfrastructureTests(unittest.TestCase):
         for forbidden in ("secret", "credential", "token", "claimhash"):
             self.assertNotIn(forbidden, rendered_outputs)
 
+    def test_integration_event_topic_uses_aws_managed_sse(self):
+        topic = self.resources["IntegrationEventsTopic"]
+        self.assertEqual(topic["Type"], "AWS::SNS::Topic")
+        self.assertEqual(
+            topic["Properties"].get("KmsMasterKeyId"), "alias/aws/sns"
+        )
+
     def test_public_webhook_has_configurable_platform_cost_bounds(self):
         parameters = self.template["Parameters"]
         for name, maximum in (
@@ -87,17 +94,15 @@ class Phase8InfrastructureTests(unittest.TestCase):
             self.assertEqual(parameters[name]["MaxValue"], maximum)
             self.assertNotIn("Default", parameters[name])
 
-        self.assertEqual(
+        self.assertIn(
+            {
+                "ResourcePath": "/~1webhooks~1stripe~1connect",
+                "HttpMethod": "POST",
+                "MetricsEnabled": True,
+                "ThrottlingRateLimit": {"Ref": "StripeWebhookRateLimit"},
+                "ThrottlingBurstLimit": {"Ref": "StripeWebhookBurstLimit"},
+            },
             self.resources["IntegrationApi"]["Properties"]["MethodSettings"],
-            [
-                {
-                    "ResourcePath": "/~1webhooks~1stripe~1connect",
-                    "HttpMethod": "POST",
-                    "MetricsEnabled": True,
-                    "ThrottlingRateLimit": {"Ref": "StripeWebhookRateLimit"},
-                    "ThrottlingBurstLimit": {"Ref": "StripeWebhookBurstLimit"},
-                }
-            ],
         )
         self.assertEqual(
             self.resources["StripeWebhookFunction"]["Properties"][
@@ -117,6 +122,35 @@ class Phase8InfrastructureTests(unittest.TestCase):
                 {"Name": "Method", "Value": "POST"},
             ],
         )
+
+    def test_browser_routes_have_code_owned_preauth_cost_bounds(self):
+        settings = self.resources["IntegrationApi"]["Properties"]["MethodSettings"]
+        for path in (
+            "/~1features~1integrations~1read",
+            "/~1features~1integrations~1action",
+            "/~1features~1integrations~1stripe~1onboarding",
+        ):
+            self.assertIn(
+                {
+                    "ResourcePath": path,
+                    "HttpMethod": "POST",
+                    "MetricsEnabled": True,
+                    "ThrottlingRateLimit": 10,
+                    "ThrottlingBurstLimit": 20,
+                },
+                settings,
+            )
+        for logical_id in (
+            "ConnectionReadFunction",
+            "ConnectionActionFunction",
+            "StripeOnboardingFunction",
+        ):
+            self.assertEqual(
+                self.resources[logical_id]["Properties"][
+                    "ReservedConcurrentExecutions"
+                ],
+                5,
+            )
 
     def test_published_policy_and_secret_iam_are_exact(self):
         self.assertNotIn(
@@ -174,6 +208,10 @@ class Phase8InfrastructureTests(unittest.TestCase):
             "MigrationDlqAgeAlarm",
             "MigrationDlqDepthAlarm",
             "TestLiveMismatchAlarm",
+            "WebhookIngressFailureQueueAgeAlarm",
+            "WebhookIngressFailureQueueDepthAlarm",
+            "IntegrationOutgoingFailureQueueAgeAlarm",
+            "IntegrationOutgoingFailureQueueDepthAlarm",
         }
         self.assertTrue(required.issubset(self.resources))
         for logical_id in required:
@@ -206,6 +244,33 @@ class Phase8InfrastructureTests(unittest.TestCase):
                 "Zoolanding/Integrations",
             )
 
+    def test_stream_failure_queues_alarm_on_age_and_depth(self):
+        for queue_id, alarm_prefix in (
+            ("WebhookIngressFailureQueue", "WebhookIngressFailureQueue"),
+            ("IntegrationOutgoingFailureQueue", "IntegrationOutgoingFailureQueue"),
+        ):
+            for suffix, metric, threshold in (
+                ("AgeAlarm", "ApproximateAgeOfOldestMessage", 300),
+                ("DepthAlarm", "ApproximateNumberOfMessagesVisible", 1),
+            ):
+                logical_id = f"{alarm_prefix}{suffix}"
+                self.assertIn(logical_id, self.resources)
+                if logical_id not in self.resources:
+                    continue
+                properties = self.resources[logical_id]["Properties"]
+                self.assertEqual(properties["Namespace"], "AWS/SQS")
+                self.assertEqual(properties["MetricName"], metric)
+                self.assertEqual(properties["Threshold"], threshold)
+                self.assertEqual(
+                    properties["Dimensions"],
+                    [
+                        {
+                            "Name": "QueueName",
+                            "Value": {"Fn::GetAtt": [queue_id, "QueueName"]},
+                        }
+                    ],
+                )
+
     def test_ci_runs_on_every_branch_and_deploys_use_protected_artifacts(self):
         ci = (WORKFLOWS / "ci.yml").read_text(encoding="utf-8")
         self.assertRegex(ci, r"(?m)^on:\n  push:\s*$\n  pull_request:\s*$")
@@ -214,6 +279,16 @@ class Phase8InfrastructureTests(unittest.TestCase):
         self.assertIn("python -m unittest discover", ci)
         self.assertIn("sam build --no-cached", ci)
         self.assertIn("python tools/verify_sam_build.py", ci)
+        self.assertIn("group: ci-${{ github.workflow }}-${{ github.ref }}", ci)
+        self.assertIn("cancel-in-progress: true", ci)
+        self.assertEqual(ci.count("timeout-minutes:"), 2)
+        self.assertIn("fetch-depth: 0", ci)
+        self.assertIn(
+            "gitleaks/gitleaks-action@ff98106e4c7b2bc287b24eaf42907196329070c7",
+            ci,
+        )
+        self.assertIn("GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}", ci)
+        self.assertNotIn("continue-on-error", ci)
 
         for filename, branch, source, environment in (
             ("deploy-test.yml", "test", "dev", "test"),
@@ -308,8 +383,10 @@ class Phase8InfrastructureTests(unittest.TestCase):
                     "StripeWebhookReservedConcurrency",
                 ),
             ):
-                self.assertIn(f"{variable}: ${{{{ vars.{variable} }}}}", text)
+                self.assertIn(f"{variable}: ${{{{ secrets.{variable} }}}}", text)
                 self.assertIn(f'"{parameter}=${variable}"', text)
+            self.assertNotIn("${{ vars.", text)
+            self.assertIn("mask-aws-account-id: true", text)
             self.assertIn(
                 f'"ConfigRegistryTableName=/zoolanding/{environment}/config/registry-table-name"',
                 text,

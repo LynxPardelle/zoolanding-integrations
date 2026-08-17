@@ -565,6 +565,36 @@ class StripeEventWorkerTests(unittest.TestCase):
         self.assertEqual(mapping["paymentAttemptId"], "attempt-1")
         self.assertEqual(mappings.lookup[2:], ("checkout", "attempt-1"))
 
+    def test_checkout_hint_rejects_mapping_bound_to_another_session(self):
+        module = self.module()
+
+        class Mappings:
+            def object_owner(self, *args):
+                return None
+
+            def get_mapping(self, *args):
+                return {
+                    "resourceType": "checkout",
+                    "resourceId": "attempt-1",
+                    "paymentAttemptId": "attempt-1",
+                    "sessionId": "cs_test_foreign",
+                }
+
+        worker = module.StripeEventWorker(object(), object(), Mappings(), object())
+        with self.assertRaisesRegex(
+            RuntimeError, "Stripe object mapping is invalid"
+        ):
+            worker._mapping(
+                scope(),
+                "stripe-primary",
+                {
+                    "objectType": "checkout-session",
+                    "objectId": "cs_test_canonical",
+                    "mappingHint": "attempt-1",
+                    "canonical": {"sessionId": "cs_test_canonical"},
+                },
+            )
+
     def test_migration_overlay_never_authorizes_target_after_rollback_or_review(self):
         module = self.module()
 

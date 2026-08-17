@@ -11,10 +11,12 @@ try:
     from common.http import _response
     from domain.integrations import technical_expiry
     from domain.operations import STRIPE_WEBHOOK_EVENT_TYPES
+    from providers.stripe_adapter import StripeWebhookVerifierUnavailable
 except ModuleNotFoundError:
     from src.common.http import _response
     from src.domain.integrations import technical_expiry
     from src.domain.operations import STRIPE_WEBHOOK_EVENT_TYPES
+    from src.providers.stripe_adapter import StripeWebhookVerifierUnavailable
 
 
 PATH = "/webhooks/stripe/connect"
@@ -53,6 +55,8 @@ def handle_request(
             raise _IngressError(400)
         try:
             signed = verifier.verify(raw, signature)
+        except StripeWebhookVerifierUnavailable:
+            raise
         except Exception:
             _safe_metric(metric_sink, "WebhookSignatureFailures", 1)
             raise _IngressError(400) from None

@@ -36,9 +36,9 @@ try:
         SqsMigrationQueue,
     )
     from providers.stripe_adapter import (
+        SecretsManagerStripeWebhookVerifier,
         SecretsManagerStripeClientFactory,
         StripeAdapter,
-        StripeWebhookVerifier,
     )
     from stripe_commands import StripeCommandService
     from stripe_store import DynamoStripeCommandStore, DynamoStripeWebhookStore
@@ -74,9 +74,9 @@ except ModuleNotFoundError:
         SqsMigrationQueue,
     )
     from src.providers.stripe_adapter import (
+        SecretsManagerStripeWebhookVerifier,
         SecretsManagerStripeClientFactory,
         StripeAdapter,
-        StripeWebhookVerifier,
     )
     from src.stripe_commands import StripeCommandService
     from src.stripe_store import DynamoStripeCommandStore, DynamoStripeWebhookStore
@@ -472,16 +472,13 @@ def stripe_webhook_runtime() -> dict[str, Any]:
     environment = _environment()
     secret_id = f"/zoolanding/{environment}/integrations/stripe/connect-webhook"
     try:
-        response = boto3.client("secretsmanager").get_secret_value(SecretId=secret_id)
-    except Exception:
-        raise RuntimeCompositionError("Runtime dependencies are unavailable") from None
-    secret = response.get("SecretString") if isinstance(response, dict) else None
-    try:
         from common.metrics import emit_metric
     except ModuleNotFoundError:
         from src.common.metrics import emit_metric
     return {
-        "verifier": StripeWebhookVerifier(secret),
+        "verifier": SecretsManagerStripeWebhookVerifier(
+            boto3.client("secretsmanager"), secret_id
+        ),
         "registry": _registry(boto3),
         "store": DynamoStripeWebhookStore(
             _required("WEBHOOK_RECEIPT_TABLE_NAME"),

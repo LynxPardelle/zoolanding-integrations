@@ -179,6 +179,7 @@ Resources:
   IntegrationEventsTopic:
     Type: AWS::SNS::Topic
     Properties:
+      KmsMasterKeyId: alias/aws/sns
       Tags:
         - Key: Project
           Value: Zoolandingpage
@@ -214,6 +215,21 @@ Resources:
             Ref: StripeWebhookRateLimit
           ThrottlingBurstLimit:
             Ref: StripeWebhookBurstLimit
+        - ResourcePath: /~1features~1integrations~1read
+          HttpMethod: POST
+          MetricsEnabled: true
+          ThrottlingRateLimit: 10
+          ThrottlingBurstLimit: 20
+        - ResourcePath: /~1features~1integrations~1action
+          HttpMethod: POST
+          MetricsEnabled: true
+          ThrottlingRateLimit: 10
+          ThrottlingBurstLimit: 20
+        - ResourcePath: /~1features~1integrations~1stripe~1onboarding
+          HttpMethod: POST
+          MetricsEnabled: true
+          ThrottlingRateLimit: 10
+          ThrottlingBurstLimit: 20
 
   IntegrationApiIdParameter:
     Type: AWS::SSM::Parameter
@@ -769,6 +785,7 @@ Resources:
     Properties:
       CodeUri: src/
       Handler: handlers.connection_read.lambda_handler
+      ReservedConcurrentExecutions: 5
       Role:
         Fn::GetAtt:
           - BrowserReadRole
@@ -791,6 +808,7 @@ Resources:
     Properties:
       CodeUri: src/
       Handler: handlers.connection_action.lambda_handler
+      ReservedConcurrentExecutions: 5
       Role:
         Fn::GetAtt:
           - BrowserActionRole
@@ -813,6 +831,7 @@ Resources:
     Properties:
       CodeUri: src/
       Handler: handlers.stripe_onboarding.lambda_handler
+      ReservedConcurrentExecutions: 5
       Role:
         Fn::GetAtt:
           - StripeOnboardingRole
@@ -1327,6 +1346,86 @@ Resources:
                   Fn::GetAtt:
                     - IntegrationOutgoingFailureQueue
                     - Arn
+
+  WebhookIngressFailureQueueAgeAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: A failed webhook ingress record remains queued for operator review.
+      Namespace: AWS/SQS
+      MetricName: ApproximateAgeOfOldestMessage
+      Dimensions:
+        - Name: QueueName
+          Value:
+            Fn::GetAtt: [WebhookIngressFailureQueue, QueueName]
+      Statistic: Maximum
+      Period: 60
+      EvaluationPeriods: 1
+      DatapointsToAlarm: 1
+      Threshold: 300
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - Ref: AlarmTopicArn
+
+  WebhookIngressFailureQueueDepthAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: A failed webhook ingress record entered the failure queue.
+      Namespace: AWS/SQS
+      MetricName: ApproximateNumberOfMessagesVisible
+      Dimensions:
+        - Name: QueueName
+          Value:
+            Fn::GetAtt: [WebhookIngressFailureQueue, QueueName]
+      Statistic: Maximum
+      Period: 60
+      EvaluationPeriods: 1
+      DatapointsToAlarm: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - Ref: AlarmTopicArn
+
+  IntegrationOutgoingFailureQueueAgeAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: A failed integration event remains queued for operator review.
+      Namespace: AWS/SQS
+      MetricName: ApproximateAgeOfOldestMessage
+      Dimensions:
+        - Name: QueueName
+          Value:
+            Fn::GetAtt: [IntegrationOutgoingFailureQueue, QueueName]
+      Statistic: Maximum
+      Period: 60
+      EvaluationPeriods: 1
+      DatapointsToAlarm: 1
+      Threshold: 300
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - Ref: AlarmTopicArn
+
+  IntegrationOutgoingFailureQueueDepthAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: A failed integration event entered the failure queue.
+      Namespace: AWS/SQS
+      MetricName: ApproximateNumberOfMessagesVisible
+      Dimensions:
+        - Name: QueueName
+          Value:
+            Fn::GetAtt: [IntegrationOutgoingFailureQueue, QueueName]
+      Statistic: Maximum
+      Period: 60
+      EvaluationPeriods: 1
+      DatapointsToAlarm: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - Ref: AlarmTopicArn
 
   Api5xxAlarm:
     Type: AWS::CloudWatch::Alarm
