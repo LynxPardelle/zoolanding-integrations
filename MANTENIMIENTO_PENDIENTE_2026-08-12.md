@@ -1,23 +1,27 @@
-# Mantenimiento pendiente — 2026-08-12
+# Mantenimiento del repositorio — actualizado 2026-08-17
 
-## Publicación bloqueada de forma segura
+## Publicación y automatización
 
-Este repositorio no tiene remoto configurado. Se preservaron la historia y las
-ramas locales sin crear un repositorio GitHub ni adivinar su visibilidad.
+- Origen canónico privado: `https://github.com/LynxPardelle/zoolanding-integrations`.
+- Ramas base publicadas: `main`, `test` y `dev`; promoción `dev -> test -> main`.
+- CI y Environments usan permisos mínimos y ramas exactas. Los roles
+  OIDC/CloudFormation y el topic de alarmas ya están configurados sin claves AWS
+  estáticas.
+- `.gitleaks.toml` conserva reglas por defecto y exceptúa únicamente dos valores
+  sintéticos exactos dentro de un archivo de pruebas; no excluye archivos ni
+  reglas completas.
+- Validación local: 306/306 pruebas, compilación, SAM, Actionlint y Gitleaks.
 
-- Destino candidato, sujeto a aprobación: `LynxPardelle/zoolanding-integrations`.
-- Visibilidad recomendada hasta la revisión de secretos/proveedores: **privada**.
-- Rama actual: `codex/phase8-infrastructure-readiness`.
-- Validación local: 306/306 pruebas, compilación Python y
-  `sam validate --lint` correctos.
-- Despliegue/proveedores: **NO-GO**; no se llamó AWS, Stripe, SMTP ni otro
-  proveedor y no se leyó ningún secreto.
+## Despliegue pendiente
 
-Tras aprobar propietario y visibilidad, agregue el `origin` exacto y publique
-esta rama con un push normal. Mantenga la promoción `dev -> test -> main` y no
-fuerce historia. Las ramas locales de fases anteriores deben conservarse hasta
-comprobar su alcance desde el remoto creado.
+**NO-GO para desplegar la aplicación.** Sólo existen las identidades retenidas.
+Faltan los parámetros SSM y stacks de servicios, callers SMTP aprobados, hash de
+claim compartido y límites Stripe respaldados por evidencia. Esos valores no se
+inventaron. El topic de alarmas tiene cero suscriptores confirmados.
 
-Para trasladar el repositorio, excluya `.env`, credenciales, secretos SMTP o de
-Stripe, payloads de proveedor, URLs alojadas, PII, artefactos SAM y entornos
-virtuales. Los valores operativos pertenecen al gestor de secretos aprobado.
+La protección de ramas privadas requiere un plan GitHub superior o hacer el
+repositorio público; se preservó la privacidad. Use pull requests, CI y pushes
+normales; nunca fuerce historia.
+
+No transfiera `.env`, secretos SMTP/Stripe, payloads, URLs alojadas, PII,
+`.aws-sam`, bytecode, cachés ni entornos virtuales. Clone el código desde GitHub.
