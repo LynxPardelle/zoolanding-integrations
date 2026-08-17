@@ -2,7 +2,7 @@
 
 ## Publicación y automatización
 
-- Origen canónico: `https://github.com/LynxPardelle/zoolanding-integrations`.
+- Origen canónico público: `https://github.com/LynxPardelle/zoolanding-integrations`.
 - Ramas base publicadas: `main`, `test` y `dev`; promoción `dev -> test -> main`.
 - CI y Environments usan permisos mínimos y ramas exactas. Roles
   OIDC/CloudFormation y topic de alarmas están copiados a secretos de cada
@@ -19,6 +19,9 @@
   las colas de fallo tienen alarmas de edad/profundidad.
 - CI cancela ejecuciones obsoletas, tiene timeouts y ejecuta Gitleaks fijado por
   SHA sobre el historial completo.
+- `dev`, `test` y `main` exigen PR y CI estricto, incluyen a administradores,
+  resuelven conversaciones y bloquean force-push y borrado. Secret scanning,
+  push protection, patrones no-proveedor y validación de credenciales están activos.
 - Validación local: 312/312 pruebas, compilación, SAM, Actionlint y Gitleaks.
 
 ## Despliegue pendiente
@@ -34,9 +37,8 @@ de `pip` por archivos lock con hashes compatibles con Python 3.13/SAM. Las
 dependencias directas sí están fijadas; no se generó un lock amplio sin validar
 su portabilidad Linux/arm64.
 
-La protección mediante rulesets y la visibilidad pública se configuran sólo
-después de verificar esta rama. Use pull requests, CI y pushes normales; nunca
-fuerce historia.
+La visibilidad pública y las protecciones ya están configuradas. Aún falta un
+aprobador independiente en los Environments; nunca fuerce historia.
 
 No transfiera `.env`, secretos SMTP/Stripe, payloads, URLs alojadas, PII,
 `.aws-sam`, bytecode, cachés ni entornos virtuales. Clone el código desde GitHub.
